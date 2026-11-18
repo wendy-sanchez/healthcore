@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar
 from typing import Any
 
 from mcpauth import AuthServerConfig, MCPAuth
@@ -34,6 +35,26 @@ from mcpauth.types import AuthInfo
 from mcps import config
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────
+# Context Var para pasar auth_info a través de async context
+# ─────────────────────────────────────────────────────────────────────
+# Esto permite que las funciones de tool accedan al auth_info del request
+# actual sin necesidad de pasar el request explícitamente.
+
+_auth_info_context: ContextVar[AuthInfo | None] = ContextVar(
+    'auth_info', default=None
+)
+
+
+def set_auth_info(auth_info: AuthInfo | None) -> None:
+    """Establece el auth_info en el contexto actual."""
+    _auth_info_context.set(auth_info)
+
+
+def get_auth_info() -> AuthInfo | None:
+    """Obtiene el auth_info del contexto actual."""
+    return _auth_info_context.get()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -157,12 +178,16 @@ def build_bearer_middleware(mcp_auth: MCPAuth) -> type:
 #
 # Envuelve el FastMCP app directamente a nivel ASGI.  Las rutas públicas
 # (/.well-known/, /health) pasan directo; el resto pasa por el middleware
-# Bearer Auth de mcpauth.  Así el lifespan del FastMCP se preserva porque
-# seguimos siendo una sola capa ASGI.
+# Bearer Auth de mcpauth.  El middleware de mcpauth coloca auth_info en
+# scope["state"], que capturamos y propagamos a través de un ContextVar
+# para que sea accesible en las funciones de tool de FastMCP.
+#
+# Así el lifespan del FastMCP se preserva porque seguimos siendo una sola
+# capa ASGI.
 
 
 class SelectiveBearerASGI:
-    """ASGI wrapper que aplica bearer auth solo en paths no-públicos."""
+    """ASGI wrapper que aplica bearer auth solo en paths no-públicos y propaga auth_info via ContextVar."""
 
     EXCLUDED_PREFIXES = ("/.well-known/", "/health", "/openapi")
 
@@ -186,7 +211,21 @@ class SelectiveBearerASGI:
         if any(path.startswith(prefix) for prefix in self.EXCLUDED_PREFIXES):
             await self._public_app(scope, receive, send)
         else:
-            await self._protected_app(scope, receive, send)
+            # Protegido: usar el middleware de mcpauth
+            # El middleware colocará auth_info en scope["state"]["auth_info"]
+            async def send_wrapper(message: dict) -> None:
+                # Propagar auth_info a ContextVar cuando la respuesta inicia
+                if message["type"] == "http.response.start":
+                    auth_info = scope.get("state", {}).get("auth_info")
+                    if auth_info:
+                        set_auth_info(auth_info)
+                await send(message)
+
+            try:
+                await self._protected_app(scope, receive, send_wrapper)
+            finally:
+                # Limpiar después de completar
+                set_auth_info(None)
 
 
 # ═══════════════════════════════════════════════════════════════════════

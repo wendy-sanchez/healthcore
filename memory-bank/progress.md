@@ -2,6 +2,50 @@
 
 ## Estado actual del desarrollo
 
+### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
+- **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.
+- **Problemas resueltos**:
+  1. **Lifespan de FastMCP**: `SelectiveBearerASGI` ahora pasa el `scope["type"] == "lifespan"` directamente a `_public_app` sin filtrar Bearer Auth. Esto evita `RuntimeError: Task group is not initialized` y permite que el `StreamableHTTPSessionManager` se inicialice correctamente.
+  2. **Logging con cliente (subject)**: Todos los logs de invocación (`Tool OK`, `Tool ERROR`, `Tool DENIED`) ahora incluyen `client=<sub>` donde `<sub>` es el subject extraído del token validado. Formato normalizado: `Tool OK | tool=<name> | client=<sub> | success=true`, etc.
+  3. **Scopes por defecto completos**: `MCP_DEV_TOKEN_SCOPES` asigna **TODOS los scopes** si no está configurado explícitamente. Esto permite desarrollo sin IDP real. Se puede personalizar con `MCP_DEV_TOKEN_SCOPES="incidents.read inventory.read"` para verificar mínimo privilegio.
+  4. **Metadata pública (RFC 9728)**: `build_protected_resource_routes()` publica `/`.well-known/oauth-protected-resource` siempre, incluso sin `MCP_PUBLIC_URL` (infiere desde `MCP_ISSUER` o localhost).
+  5. **Validación de MCP_SKIP_AUTH**: Advertencia logging claro si se establece `MCP_SKIP_AUTH=1` — nunca debe usarse con Playground o clientes remotos.
+- **Autenticación por defecto activada** (a menos que `MCP_SKIP_AUTH=1`):
+  - ✅ Sin token → `HTTP 401 Unauthorized` (missing_auth_header)
+  - ✅ Token inválido → `HTTP 401 Unauthorized` (invalid_token)
+  - ✅ Token válido → `HTTP 200 OK` + 10 tools listadas
+  - ✅ Token sin scope requerido → Herramienta rechazada con `Tool DENIED | missing_scope=...`
+- **Scopes requeridos por tool**:
+  - `get_incident`, `list_incidents`, `get_incident_summary`: `incidents.read`
+  - `create_incident`, `update_incident_status`: `incidents.write`
+  - `get_product`, `list_products`: `inventory.read`
+  - `create_product`, `update_product`, `delete_product`: `inventory.write` (devuelven error controlado: "inventario solo lectura")
+- **Token dev para desarrollo**:
+  - `MCP_DEV_TOKEN=hc_dev_token_no_usar_en_produccion` (default)
+  - `MCP_DEV_TOKEN_SCOPES=incidents.read incidents.write inventory.read inventory.write` (default: todos)
+- **Archivos modificados**:
+  - `mcps/server.py`: Logging con `client=<sub>` en `_serialize_result()` y `_require_tool_scope()`. Advertencia `MCP_SKIP_AUTH` al inicio.
+  - `mcps/auth.py`: `SelectiveBearerASGI` maneja lifespan correctamente. `build_bearer_middleware()` elige modo JWT o dev según `MCP_JWKS_URI`. `build_protected_resource_routes()` publica metadata RFC 9728.
+  - `mcps/config.py`: `MCP_DEV_TOKEN_SCOPES` asigna todos los scopes por defecto. `MCP_REQUIRED_SCOPES` vacío (autorización granular por tool).
+  - `mcp-server.md`: Documentación de setup, variables de entorno, logging, formato de logs con cliente. Tablas de tools con scopes requeridos.
+  - `tests/test_mcp_server_auth.py`: 9 tests (autenticación, autorización, metadata, logging con cliente, MCP_SKIP_AUTH por defecto deshabilitado).
+- **Tests**: **9/9 pasan** (`uv run pytest tests/test_mcp_server_auth.py -v`).
+  - `test_missing_token_returns_401`: Sin token → 401
+  - `test_invalid_token_returns_401`: Token inválido → 401
+  - `test_valid_token_tools_list_200`: Token válido → 200 + 10 tools
+  - `test_protected_resource_metadata_public_200`: Metadata sin auth → 200
+  - `test_bearer_auth_method_in_metadata`: Metadata contiene `bearer_auth_method`
+  - `test_all_scopes_in_metadata`: Metadata lista todos los 4 scopes
+  - `test_client_subject_in_error_response`: Error incluye `subject` del token (logging)
+  - `test_scopes_format_in_metadata`: Formato de scopes correcto en metadata
+  - `test_skip_auth_not_enabled_by_default`: `MCP_SKIP_AUTH` no está activado por defecto
+- **Validación manual en Playground**:
+  - Arrancar servidor: `uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100`
+  - Conectar Playground MCP a `http://localhost:9100/mcp` con token: `hc_dev_token_no_usar_en_produccion`
+  - Sin token: `401 Unauthorized`
+  - Con token: lista las 10 tools + logs en servidor con `client=dev-agent`
+- **Branch**: `feature/mcp-oauth-tools` (completada).
+
 ### Agente de Soporte LangGraph — HealthCore (2026-11-15) — Part 2: External Tools
 - **Completado**: Extensión del agente LangGraph con 2 tools externas que consultan sistemas operativos reales (incidentes e inventario).
 - **Completado**: `services/agent/tools/__init__.py` — helper `_get_service_url(env_var, default)` para resolver URLs desde entorno con fallback.

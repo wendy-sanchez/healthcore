@@ -100,8 +100,11 @@ uv run python services/telemetry/server_standalone.py
 # RAG standalone server (port 8000 — avoids SQLModel)
 uv run python services/api/routes/rag_standalone.py
 
-# MCP Server (port 9100) — OAuth-protected tools
-MCP_SKIP_AUTH=1 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# MCP Server (port 9100) — OAuth-protected tools with dev token
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# MCP Server will start with authentication ENABLED by default.
+# Use the dev token: hc_dev_token_no_usar_en_produccion
+# To connect via MCP Playground or CLI: add Authorization header with this token.
 ```
 
 ### Run Frontends
@@ -126,6 +129,9 @@ uv run python -m pytest tests/pipelines/test_rag.py -v
 
 # Sales forecast (19 tests)
 uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
+
+# MCP Server auth (9 tests)
+uv run pytest tests/test_mcp_server_auth.py -v
 
 # Nightly job (30 tests)
 .venv-nightly/bin/python -m pytest tests/nightly -q
@@ -159,7 +165,9 @@ Model Context Protocol server exposing internal tools as MCP resources, protecte
 
 - **10 tools:** Incidents (5 — CRUD + summary) and Inventory (5 — 2 read + 3 explicit write rejection).
 - **OAuth enforcement:** `SelectiveBearerASGI` wrapper — public routes (`/.well-known/`, `/health`) bypass auth; `/mcp` requires Bearer JWT.
-- **Scopes:** Minimum privilege — `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`.
+- **Authentication enabled by default:** Dev mode uses token `hc_dev_token_no_usar_en_produccion` with all scopes. Production uses JWKS endpoint (`MCP_JWKS_URI`).
+- **Scopes:** Minimum privilege — `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`. Each tool enforces its required scope.
+- **Logging:** All tool invocations logged with client subject (`client=<sub>`), tool name, success/error status, and error details.
 - **Write rejection (RETO 2):** `create_product`, `update_product`, `delete_product` exist and are discoverable but return `{"error": "read_only", "success": false, "code": "INVENTORY_READ_ONLY"}`.
 - **LangGraph integration:** Agent migrated from direct HTTP to MCP Client via `langchain-mcp-adapters` (`load_mcp_tools()`). Nodes are `async def` with `await tool.ainvoke()`.
 - **Transport:** Streamable HTTP (`stateless_http=True`). DNS rebinding protection disabled for tunnel compatibility.

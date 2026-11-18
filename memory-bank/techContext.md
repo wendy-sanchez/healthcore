@@ -517,8 +517,8 @@ La API principal (`services/api/main.py`) no arranca en Python 3.14 por incompat
 mcps/
 ├── __init__.py              # Paquete
 ├── server.py                # FastMCP app + SelectiveBearerASGI composition
-├── auth.py                  # build_auth_server_config(), build_bearer_middleware(), SelectiveBearerASGI
-├── config.py                # Config Pydantic (mcp_settings, McpMode enum, compute_required_scopes)
+├── auth.py                  # build_auth_server_config(), build_bearer_middleware(), SelectiveBearerASGI, ContextVar auth_info
+├── config.py                # Configuración de entorno (MCP_DEV_TOKEN_SCOPES por defecto)
 ├── tools.py                 # 10 tools MCP (5 incidents + 5 inventory)
 ├── README.md                # EN documentation
 └── README.es.md             # ES documentation
@@ -539,9 +539,10 @@ docs/
 |---|---|---|
 | **FastMCP v1** | `mcps/server.py` | Servidor MCP con `stateless_http=True`, Streamable HTTP. 10 tools registradas con `@mcp.tool()`. |
 | **mcpauth** | `mcps/auth.py` | `MCPAuth(server=AuthServerConfig)` en modo Resource Server. `bearer_auth_middleware()` para validación JWT. |
-| **SelectiveBearerASGI** | `mcps/auth.py` | Wrapper ASGI que aplica Bearer solo en rutas protegidas. `EXCLUDED_PREFIXES = ("/.well-known/", "/health", "/openapi")`. |
-| **Config** | `mcps/config.py` | `mcp_settings` con variables de entorno. `McpMode` enum (production, dev_token, skip). `compute_required_scopes()` con bug corregido. |
-| **Tools** | `mcps/tools.py` | 10 funciones decoradas con `@mcp.tool()`. Incidencias (5): consulta real a `incidents-backend:8010`. Inventario (5): 2 lectura (consulta real a `backend:8000`) + 3 rechazo explícito. |
+| **SelectiveBearerASGI** | `mcps/auth.py` | Wrapper ASGI que aplica Bearer solo en rutas protegidas y propaga auth_info via ContextVar. |
+| **ContextVar auth_info** | `mcps/auth.py` | `get_auth_info()` / `set_auth_info()` — permite acceso al auth_info desde funciones de tool de FastMCP. |
+| **Config** | `mcps/config.py` | Variables de entorno. `MCP_DEV_TOKEN_SCOPES` asigna TODOS los scopes por defecto si no está configurado. |
+| **Tools** | `mcps/tools.py` | 10 funciones decoradas con `@mcp.tool()`. Incidencias (5): consulta real. Inventario (5): 2 lectura + 3 rechazo explícito. |
 | **MCP Client** | `services/agent/tools/mcp_client.py` | `load_mcp_tools(session=session)` → `_tools_cache`. 6 funciones asíncronas que envuelven tools MCP. |
 
 ### Variables de entorno
@@ -551,12 +552,12 @@ docs/
 | `MCP_HOST` | `0.0.0.0` | Host de escucha |
 | `MCP_PORT` | `9100` | Puerto |
 | `MCP_TRANSPORT` | `streamable-http` | Transporte MCP |
-| `MCP_PUBLIC_URL` | — | URL pública para el issuer |
+| `MCP_PUBLIC_URL` | — | URL pública para el issuer (se infiere desde MCP_ISSUER o localhost si falta) |
 | `MCP_ISSUER` | `MCP_PUBLIC_URL` o `http://localhost:9100` | Issuer esperado en JWT |
-| `MCP_JWKS_URI` | — | URI del JWKS endpoint (producción) |
-| `MCP_SKIP_AUTH` | — | `1` para deshabilitar OAuth (solo dev) |
+| `MCP_JWKS_URI` | — | URI del JWKS endpoint (producción con validación JWT) |
+| `MCP_SKIP_AUTH` | — | ⚠️ `1` para deshabilitar OAuth (NUNCA en producción ni con clientes remotos). Log WARNING si está activado. |
 | `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo |
-| `MCP_REQUIRED_SCOPES` | `["incidents.read"]` | Scopes globales requeridos |
+| `MCP_DEV_TOKEN_SCOPES` | (todos los scopes) | Scopes del token dev. Si no está configurado, se asignan todos (modo permisivo para desarrollo). |
 | `INCIDENTS_API_URL` | `http://incidents-backend:8010` | Incidents API |
 | `INVENTORY_API_URL` | `http://backend:8000` | Inventory API |
 | `AGENT_JWT_TOKEN` | — | JWT para inventario interno |
@@ -566,45 +567,40 @@ docs/
 ### OAuth Flow
 
 ```
-Cliente MCP → GET /.well-known/oauth-protected-resource (público)
+Cliente MCP → GET /.well-known/oauth-protected-resource (público, sin auth)
             ← authorization_servers, scopes_supported
 Cliente MCP → POST /mcp + Authorization: Bearer <JWT>
             → SelectiveBearerASGI → mcpauth.bearer_auth_middleware()
             → valida: issuer, signature (JWKS), exp, scopes
+            → auth_info se propaga a ContextVar (get_auth_info())
             → FastMCP (stateless_http) → tool execution
+            → Log: Tool OK/ERROR/DENIED | tool=... | client=<sub> | ...
 ```
 
 ### Comandos
 
 ```bash
-# Arranque local (sin auth)
-MCP_SKIP_AUTH=1 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# Arranque local (autenticación activada, token dev)
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
 
-# Arranque local (con auth — token fijo)
-MCP_ISSUER="https://oidc.example.com" MCP_PUBLIC_URL="http://localhost:9100" \
-  uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
-
-# Arranque producción (con JWKS)
-MCP_PUBLIC_URL=https://mcp.healthcore.ai MCP_ISSUER=https://auth.healthcore.ai \
-  MCP_JWKS_URI=https://auth.healthcore.ai/.well-known/jwks.json \
-  uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
-
-# Probar tools/list
+# Probar tools/list (con token dev)
 curl -X POST http://localhost:9100/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Authorization: Bearer hc_dev_token_no_usar_en_produccion" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-# Probar rechazo de escritura
+# Probar sin token (401 Unauthorized)
 curl -X POST http://localhost:9100/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "Authorization: Bearer hc_dev_token_no_usar_en_produccion" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_product","arguments":{"name":"Test","sku":"T-001","category":"supplies","unit":"unit","current_stock":10,"expiry_date":"2026-12-31","country":"US"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-# Tests del grafo migrado
-uv run pytest tests/pipelines/test_agent_graph.py -v
+# Metadata RFC 9728 (público, sin auth)
+curl http://localhost:9100/.well-known/oauth-protected-resource
+
+# Tests de autenticación
+uv run pytest tests/test_mcp_server_auth.py -v
 ```
 
 ### Decisiones técnicas clave
@@ -614,7 +610,10 @@ uv run pytest tests/pipelines/test_agent_graph.py -v
 | **OAuth** | MCP Auth (mcpauth) modo Resource Server | Alineado con especificación MCP Auth; desacoplado de FastMCP; soporta OIDC; scopes por tool |
 | **Transporte** | Streamable HTTP (`stateless_http=True`) | Un solo endpoint HTTP; múltiples clientes simultáneos; sin estado de sesión |
 | **Auth wrapper** | SelectiveBearerASGI (ASGI puro) | Preserva lifespan de FastMCP; evita Starlette Mount que rompe session manager |
+| **ContextVar auth_info** | `get_auth_info()` / `set_auth_info()` | Las funciones de tool pueden acceder al auth_info del request actual sin pasar request explícitamente |
+| **Scopes por defecto** | Todos si `MCP_DEV_TOKEN_SCOPES` vacío | Desarrollo fluido sin IDP real; se personaliza en producción |
+| **Logging** | `Tool OK/ERROR/DENIED \| tool=... \| client=<sub> \| ...` | Auditoría completa con subject del token validado |
 | **Rechazo escritura** | Tools existen + error controlado | RETO 2: el cliente no debe recibir "tool not found" |
 | **Integración LangGraph** | langchain-mcp-adapters | Convierte tools MCP a BaseTool de LangChain; integración nativa con LangGraph |
 | **DNS Rebinding** | `TransportSecuritySettings(enable_dns_rebinding_protection=False)` | FastMCP bloquea Host headers de túneles por defecto; se deshabilita para proxies reversos legítimos |
-| **Logging** | `_serialize_result()` | Cada invocación registra tool, success/failure y error truncado a 120 chars |
+

@@ -100,8 +100,11 @@ uv run python services/telemetry/server_standalone.py
 # Servidor RAG standalone (puerto 8000 — evita SQLModel)
 uv run python services/api/routes/rag_standalone.py
 
-# Servidor MCP (puerto 9100) — tools protegidas con OAuth
-MCP_SKIP_AUTH=1 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# Servidor MCP (puerto 9100) — tools protegidas con OAuth y token dev
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# El servidor MCP arranca con autenticación ACTIVADA por defecto.
+# Usa el token dev: hc_dev_token_no_usar_en_produccion
+# Para conectar vía MCP Playground o CLI: añade el header Authorization con este token.
 ```
 
 ### Ejecutar Frontends
@@ -126,6 +129,9 @@ uv run python -m pytest tests/pipelines/test_rag.py -v
 
 # Tests de pronóstico de ventas (19 tests)
 uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
+
+# Tests de autenticación del servidor MCP (9 tests)
+uv run pytest tests/test_mcp_server_auth.py -v
 
 # Tests del job nocturno (30 tests)
 .venv-nightly/bin/python -m pytest tests/nightly -q
@@ -159,7 +165,9 @@ Servidor Model Context Protocol que expone herramientas internas como recursos M
 
 - **10 tools:** Incidencias (5 — CRUD + resumen) e Inventario (5 — 2 lectura + 3 rechazo explícito de escritura).
 - **OAuth enforcement:** Wrapper `SelectiveBearerASGI` — rutas públicas (`/.well-known/`, `/health`) sin auth; `/mcp` requiere Bearer JWT.
-- **Scopes:** Mínimo privilegio — `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`.
+- **Autenticación activada por defecto:** Modo dev usa token `hc_dev_token_no_usar_en_produccion` con todos los scopes. Producción usa JWKS (`MCP_JWKS_URI`).
+- **Scopes:** Mínimo privilegio — `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`. Cada tool verifica su scope requerido.
+- **Logging:** Todas las invocaciones de tools registradas con subject del cliente (`client=<sub>`), nombre de la tool, estado (éxito/error) y detalles.
 - **Rechazo de escritura (RETO 2):** `create_product`, `update_product`, `delete_product` existen y son descubribles pero devuelven `{"error": "read_only", "success": false, "code": "INVENTORY_READ_ONLY"}`.
 - **Integración LangGraph:** Agente migrado de HTTP directo a MCP Client vía `langchain-mcp-adapters` (`load_mcp_tools()`). Nodos son `async def` con `await tool.ainvoke()`.
 - **Transporte:** Streamable HTTP (`stateless_http=True`). Protección anti-DNS rebinding deshabilitada para compatibilidad con túneles.

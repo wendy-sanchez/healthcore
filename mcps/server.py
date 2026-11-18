@@ -427,16 +427,20 @@ def delete_product(product_id: int) -> str:
 
 def _current_client() -> str:
     """Devuelve el subject validado de la petición, nunca el token."""
-    auth_info = mcp_auth.auth_info if mcp_auth is not None else None
+    from mcps.auth import get_auth_info
+    
+    auth_info = get_auth_info()
     return str(auth_info.subject) if auth_info and auth_info.subject else "unknown"
 
 
 def _require_tool_scope(required_scope: str, tool_name: str) -> None:
     """Aplica autorización granular antes de ejecutar cualquier efecto lateral."""
+    from mcps.auth import get_auth_info
+    
     if SKIP_AUTH:
         return
 
-    auth_info = mcp_auth.auth_info if mcp_auth is not None else None
+    auth_info = get_auth_info()
     if auth_info is None:
         raise PermissionError("Autenticación requerida")
     if required_scope not in auth_info.scopes:

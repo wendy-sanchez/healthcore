@@ -588,7 +588,7 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 - **Completado**: OAuth 2.1 funcional — JWKS (producción), token fijo (dev), skip (testing).
 - **Completado**: Bug corregido en `config.py` — lógica de scopes invertida (`if os.getenv("MCP_SKIP_AUTH")` → `if not`).
 - **Completado**: `update_incident_status` usa endpoint de ciclo de vida específico (`PATCH /api/incidents/{id}/status`).
-- **Completado**: Logging por invocación con `_serialize_result()` — formato `"Tool OK | tool=... | success=true"`.
+- **Completado**: Logging por invocación con `_serialize_result()` — formato `"Tool OK | tool=... | client=<sub> | success=true"`.
 - **Completado**: Códigos de error diferenciados (HTTP 401 missing_auth_header, invalid_token; HTTP 403 missing_required_scopes; HTTP 500 server_error).
 - **Completado**: Integración LangGraph con langchain-mcp-adapters — `services/agent/tools/mcp_client.py` con cache, 6 funciones async.
 - **Completado**: Migración del grafo a async — nodos `async def`, `load_mcp_tools(session=session)`, `await tool.ainvoke()`.
@@ -596,11 +596,18 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 - **Completado**: MCP Playground conectado exitosamente — `tools/list` (10 tools), `tools/call` (rechazo escritura), CORS preflight (204).
 - **Completado**: Documentación en `mcp-server.md` — arquitectura, setup, tools, OAuth flow, migración, testing.
 - **Completado**: Archivos legacy deprecados con `DeprecationWarning` (`services/agent/tools/incidents.py`, `inventory.py`).
+- **Completado (v1.0.0)**: ContextVar-based auth_info propagation — `get_auth_info()` / `set_auth_info()` para acceso al cliente (`sub`) desde funciones de tool de FastMCP.
+- **Completado (v1.0.0)**: Logging con identificación de cliente — format `"Tool OK/ERROR/DENIED | tool=... | client=<sub> | ..."` para auditoría completa.
+- **Completado (v1.0.0)**: Scopes por defecto — `MCP_DEV_TOKEN_SCOPES` asigna TODOS los scopes en desarrollo si no está configurado (permisivo para dev sin IDP real).
+- **Completado (v1.0.0)**: Validación de inicio — warnings claros si `MCP_SKIP_AUTH=1` está activado en producción con clientes remotos.
+- **Completado (v1.0.0)**: Verificación completa — 9/9 tests de autenticación pasan; auth_info accesible en contexto de tool; logging incluye cliente.
 
 ### Bugs encontrados y corregidos
 1. **Scopes invertidos** (`mcps/config.py`): `if os.getenv("MCP_SKIP_AUTH")` en lugar de `if not os.getenv("MCP_SKIP_AUTH")`. En producción (sin `MCP_SKIP_AUTH`), `required_scopes` quedaba vacío y el middleware aceptaba cualquier request sin token. Corregido.
 2. **DNS Rebinding** (`mcps/server.py`): FastMCP activa protección anti-DNS rebinding para localhost por defecto, lo que rechaza Host headers de túneles (localtunnel). Corregido con `TransportSecuritySettings(enable_dns_rebinding_protection=False)`.
 3. **CORS preflight** (`mcps/server.py`): FastMCP no respondía OPTIONS correctamente. Corregido asegurando que SelectiveBearerASGI pase requests OPTIONS sin intervención del middleware Bearer.
+4. **Auth_info context propagation** (`mcps/auth.py`, `mcps/server.py`): FastMCP ejecuta funciones de tool en contexto async profundo donde el request no es accesible. Corregido con Python `contextvars.ContextVar` que captura auth_info en SelectiveBearerASGI y lo propaga a través del async stack. Funciones `_current_client()` y `_require_tool_scope()` usan `get_auth_info()`.
+5. **Logging sin cliente** (`mcps/server.py`): El formato de log original `"Tool OK | tool=... | success=..."` no incluía el cliente (sub del token). Actualizado a `"Tool OK/ERROR/DENIED | tool=... | client=<sub> | ..."` para auditoría completa.
 
 ### Acceptance criteria (9/9)
 - AC-1: Paquete `mcps/` existe con `__init__.py`, `server.py`, `auth.py`, `config.py`, `tools.py` ✅
