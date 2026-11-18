@@ -43,8 +43,22 @@ from mcps.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Inicializar mcp_auth como None; se asigna después si no se salta auth
+# Se usa en _current_client() y _require_tool_scope() dentro del contexto de request
 mcp_auth = None
+
 SKIP_AUTH = os.getenv("MCP_SKIP_AUTH", "").strip().lower() in {"1", "true", "yes"}
+
+# ⚠️ ADVERTENCIA: MCP_SKIP_AUTH=1 SOLO para tests locales aislados sin cliente MCP.
+#    NO usar en desarrollo compartido ni con el Playground MCP.
+#    El Playground debe conectar con un token real (dev o producción).
+if SKIP_AUTH:
+    logger.warning(
+        "⚠️  MCP_SKIP_AUTH=1 — Autenticación DESHABILITADA. "
+        "Esto solo es seguro para tests completamente locales sin clientes remotos. "
+        "NUNCA usar en entornos compartidos (dev, staging, prod) ni con el Playground."
+    )
 
 # ── Atajo para desarrollo local: cargar .env si existe ──────────────
 _env_file = config.ENV_FILE

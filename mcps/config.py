@@ -64,11 +64,19 @@ MCP_REQUIRED_SCOPES: list[str] = []
 
 # Scopes del token fijo para pruebas locales. Permite verificar mínimo
 # privilegio sin depender de un Authorization Server real.
-MCP_DEV_TOKEN_SCOPES = [
-  scope.strip()
-  for scope in os.getenv("MCP_DEV_TOKEN_SCOPES", "").split()
-  if scope.strip() in MCP_SCOPES_SUPPORTED
-]
+# Si MCP_DEV_TOKEN_SCOPES no está configurado, se asignan TODOS los scopes
+# (comportamiento permisivo para desarrollo). En producción, usa MCP_JWKS_URI.
+_dev_token_scopes_env = os.getenv("MCP_DEV_TOKEN_SCOPES", "")
+if _dev_token_scopes_env.strip():
+    # Configuración explícita: solo los scopes especificados
+    MCP_DEV_TOKEN_SCOPES = [
+        scope.strip()
+        for scope in _dev_token_scopes_env.split()
+        if scope.strip() in MCP_SCOPES_SUPPORTED
+    ]
+else:
+    # Default: todos los scopes (desarrollo permisivo)
+    MCP_DEV_TOKEN_SCOPES = MCP_SCOPES_SUPPORTED
 
 # ── Propiedades del servidor ─────────────────────────────────────────
 SERVER_NAME = "healthcore-mcp"

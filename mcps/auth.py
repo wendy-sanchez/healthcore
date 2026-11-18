@@ -172,6 +172,12 @@ class SelectiveBearerASGI:
         self._protected_app = bearer_mw_class(mcp_asgi_app)
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        # ⚠️ CRÍTICO: Pasar el lifespan directamente al app interno sin filtrar
+        # para que el session_manager de FastMCP se inicialice correctamente
+        if scope["type"] == "lifespan":
+            await self._public_app(scope, receive, send)
+            return
+
         if scope["type"] != "http":
             await self._public_app(scope, receive, send)
             return
@@ -213,14 +219,17 @@ def build_protected_resource_routes() -> list:
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
-    # Si no hay public URL, esta metadata no tiene sentido
+    # Si no hay public URL, usar localhost (para desarrollo)
     public_url = config.MCP_PUBLIC_URL
     if not public_url:
-        logger.warning(
+        # Inferir desde MCP_ISSUER (que siempre tiene un valor default)
+        # o usar http://localhost:{MCP_PORT}
+        public_url = config.MCP_ISSUER or f"http://localhost:{config.MCP_PORT}"
+        logger.info(
             "MCP_PUBLIC_URL no está configurado. "
-            "La Protected Resource Metadata no se publicará."
+            "Usando %s para Protected Resource Metadata.",
+            public_url
         )
-        return []
 
     # La URL canónica de este resource server
     resource_url = public_url.rstrip("/")
@@ -234,8 +243,8 @@ def build_protected_resource_routes() -> list:
     else:
         # Sin JWKS configurada, no podemos anunciar un AS.
         # En desarrollo con token fijo, esto es aceptable.
-        logger.warning(
-            "No hay authorization_servers configurados. "
+        logger.info(
+            "No hay authorization_servers configurados (esperado en desarrollo). "
             "La Protected Resource Metadata se publicará con lista vacía."
         )
 
@@ -291,6 +300,12 @@ class CORSAsgiMiddleware:
         self._app = app
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        # ⚠️ CRÍTICO: Pasar el lifespan directamente al app interno sin filtrar
+        # para que FastMCP gestione su inicialización correctamente
+        if scope["type"] == "lifespan":
+            await self._app(scope, receive, send)
+            return
+
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return

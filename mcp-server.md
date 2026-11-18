@@ -67,30 +67,19 @@ uv add "mcp>=1.24.0,<2" "mcpauth>=0.1.0" "fastmcp>=1.0.0"
 | `MCP_PUBLIC_URL` | — | URL pública (ej. `https://<codespace>-9100.app.github.dev`) |
 | `MCP_ISSUER` | `MCP_PUBLIC_URL` o `http://localhost:9100` | Issuer esperado en JWT |
 | `MCP_JWKS_URI` | — | URI del JWKS endpoint del AS (para validación asimétrica en producción) |
-| `MCP_SKIP_AUTH` | — | `1` deshabilita autenticación. Exclusivamente para pruebas aisladas; nunca para Playground ni entornos compartidos. Por defecto la autenticación está activa. |
-| `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo autenticado (usa `_verify_dev_token()`); no es un token de producción/OAuth. |
-| `MCP_DEV_TOKEN_SCOPES` | Todos los scopes soportados | Scopes asignados al token dev, separados por espacios (ej. `inventory.read`). Permite verificar mínimo privilegio localmente. |
+| `MCP_SKIP_AUTH` | — | ⚠️ **NUNCA usar en producción ni en entornos compartidos.** Si se establece `1`, deshabilita toda validación Bearer Auth. Solo para tests locales completamente aislados sin clientes remotos. Por defecto está deshabilitada (autenticación activa). |
+| `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo autenticado (usa `_verify_dev_token()`); no es un token de producción/OAuth. Se valida en el middleware Bearer para desarrollo local. |
+| `MCP_DEV_TOKEN_SCOPES` | (todos los scopes) | Scopes asignados al token dev, separados por espacios (ej. `incidents.read inventory.read`). Si no se configura, se asignan TODOS los scopes (modo permisivo para desarrollo). Permite verificar mínimo privilegio localmente sin un IDP. |
 | `MCP_REQUIRED_SCOPES` | ninguno | No hay scope global: cada tool verifica su scope específico. El middleware sigue exigiendo Bearer válido para toda ruta `/mcp`, incluyendo `tools/list`. |
 | `INCIDENTS_API_URL` | `http://incidents-backend:8010` | URL del Incidents Manager |
 | `INVENTORY_API_URL` | `http://backend:8000` | URL del módulo de inventario |
 | `AGENT_JWT_TOKEN` | — | JWT backend-a-backend que usa el MCP Server internamente para consultar inventario |
 
-### Arranque local autenticado (token dev)
+### Arranque local autenticado (token dev — RECOMENDADO)
 
 ```bash
-MCP_SKIP_AUTH=0 MCP_JWKS_URI="" \
-MCP_DEV_TOKEN="hc_local_test_token" \
-MCP_DEV_TOKEN_SCOPES="incidents.read incidents.write inventory.read inventory.write" \
-uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
-```
-
-No establecer `MCP_SKIP_AUTH=1` al conectar Playground: el middleware debe rechazar sin token tanto `tools/list` como `tools/call`.
-
-### Arranque local (con auth — token fijo de desarrollo)
-
-```bash
-MCP_ISSUER="https://oidc.example.com" \
-MCP_PUBLIC_URL="http://localhost:9100" \
+# Desarrollo con autenticación activada (token fijo)
+# El Playground MCP o cliente debe usar el token dev
 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
 
 # En otra terminal, probar con el token por defecto:
@@ -100,6 +89,24 @@ curl -X POST http://localhost:9100/mcp \
   -H "Authorization: Bearer hc_dev_token_no_usar_en_produccion" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
+
+**Verificar autenticación:**
+- Sin token → `HTTP 401 Unauthorized` ✓
+- Token inválido → `HTTP 401 Unauthorized` ✓
+- Token válido → `HTTP 200 OK` con tools ✓
+- Token sin scope requerido → Herramienta rechazada con error de scope ✓
+
+### Arranque sin auth (SOLO para tests aislados locales)
+
+```bash
+# ⚠️ NO RECOMENDADO — Solo para debug sin clientes remotos
+MCP_SKIP_AUTH=1 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+
+# NUNCA esto para Playground o agente LangGraph — el middleware Bearer
+# debe validar tokens antes de exponer tools.
+```
+
+### Arranque local (con auth — token dev personalizado)
 
 ### Arranque producción (con JWKS)
 
@@ -424,19 +431,30 @@ app = SelectiveBearerASGI(
 
 ### Logging por invocación de tool
 
-Cada llamada a una tool registra un log estructurado vía `_serialize_result()`:
+Cada llamada a una tool registra un log estructurado vía `_serialize_result()` que incluye:
 
-```python
-logger.info("Tool OK | tool=%(label)s | success=true", {"label": label})
-logger.warning("Tool ERROR | tool=%(label)s | success=false | error=%(error)s",
-    {"label": label, "error": error_msg[:120]})
+- **tool**: Nombre de la herramienta
+- **client**: Subject (sub) del token validado — identifica al cliente MCP
+- **success**: `true` si la tool ejecutó sin error, `false` si falló
+- **error**: Mensaje de error si `success=false` (truncado a 120 caracteres)
+
+**Formato del log:**
+
+```
+Tool OK | tool=<tool_name> | client=<client_subject> | success=true
+Tool ERROR | tool=<tool_name> | client=<client_subject> | success=false | error=<error_msg>
+Tool DENIED | tool=<tool_name> | client=<client_subject> | missing_scope=<scope> | success=false
 ```
 
-Ejemplo de salida:
+**Ejemplos:**
+
 ```
-Tool OK | tool=incidente creado | success=true
-Tool ERROR | tool=productos | success=false | error=HTTP 401: Invalid token
+Tool OK | tool=get_incident_summary | client=dev-agent | success=true
+Tool ERROR | tool=get_incident_summary | client=dev-agent | success=false | error=Error de conexión con incidentes: [Errno -2] Name or service not known
+Tool DENIED | tool=get_incident_summary | client=dev-agent | missing_scope=incidents.read | success=false
 ```
+
+Estos logs permiten auditar quién accedió a qué herramienta, con qué resultado, facilitando la conformidad y la depuración.
 
 ---
 
