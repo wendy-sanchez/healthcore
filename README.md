@@ -159,7 +159,7 @@ The support agent is implemented as a LangGraph `StateGraph` with **10 nodes** a
 
 ---
 
-## MCP Server — OAuth-Protected Tools — Key Details
+## 🔧 MCP Server — OAuth-Protected Tools — Key Details
 
 Model Context Protocol server exposing internal tools as MCP resources, protected with **OAuth 2.1 Resource Server** via **mcpauth**. Designed for the LangGraph agent to consume via `langchain-mcp-adapters`.
 

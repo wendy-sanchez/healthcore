@@ -159,7 +159,7 @@ El agente de soporte está implementado como un `StateGraph` de LangGraph con **
 
 ---
 
-## Servidor MCP — Tools Protegidas con OAuth — Detalles Clave
+## 🔧 Servidor MCP — Tools Protegidas con OAuth — Detalles Clave
 
 Servidor Model Context Protocol que expone herramientas internas como recursos MCP, protegidas con **OAuth 2.1 Resource Server** vía **mcpauth**. Diseñado para que el agente LangGraph las consuma mediante `langchain-mcp-adapters`.
 
@@ -175,7 +175,7 @@ Servidor Model Context Protocol que expone herramientas internas como recursos M
 
 ---
 
-## � Modelo de Pronóstico de Ventas — Detalles Clave
+## 📊 Modelo de Pronóstico de Ventas — Detalles Clave
 
 Regresión XGBoost entrenada con 84 meses (2016–2023), probada en 24 meses no vistos (2024–2025). Sin fuga de datos. Validación walk-forward.
 
