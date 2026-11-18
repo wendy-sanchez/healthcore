@@ -125,10 +125,11 @@ class TestAuthenticationAndAuthorization:
         for scope in expected_scopes:
             assert scope in metadata['scopes_supported']
 
-    def test_client_subject_in_error_response(self, client):
-        """Los errores de tool incluyen información del cliente en la respuesta."""
-        # Este test simplemente verifica que se puede llamar una tool con token válido
-        # Los logs se verifican en las pruebas manually de integración
+    def test_tool_call_with_valid_token_returns_result(self, client, caplog):
+        """tools/call con token válido ejecuta la tool y retorna resultado, no error de auth.
+        Además verifica que el log incluya el subject del cliente."""
+        import logging
+        caplog.set_level(logging.INFO)
         
         dev_token = 'hc_dev_token_no_usar_en_produccion'
         r = client.post(
@@ -145,8 +146,58 @@ class TestAuthenticationAndAuthorization:
                 'Content-Type': 'application/json'
             }
         )
-        # Debe completar sin error de autenticación
-        assert r.status_code == 200
+        # HTTP 200 indica que la tool se ejecutó (puede fallar por backend
+        # pero NO por autenticación)
+        assert r.status_code == 200, f"Esperado 200, obtenido {r.status_code}: {r.text[:300]}"
+
+        # Parsear respuesta SSE
+        lines = r.text.strip().split('\n')
+        json_data = None
+        for line in lines:
+            if line.startswith('data:'):
+                try:
+                    json_data = json.loads(line[5:])
+                    break
+                except Exception:
+                    pass
+
+        assert json_data is not None, f"No se encontró data: en la respuesta: {r.text[:500]}"
+        # El resultado puede tener un error de backend (no hay incidents API),
+        # pero NUNCA debe ser un error de autenticación
+        assert 'error' not in json_data, \
+            f"La tool retornó error en lugar de resultado: {json_data}"
+        assert 'result' in json_data, \
+            f"No hay 'result' en la respuesta: {json_data}"
+
+        # Verificar que el log contiene el subject del cliente (dev-agent)
+        tool_logs = [
+            rec for rec in caplog.records
+            if rec.name == 'mcps.server' and 'Tool' in rec.getMessage()
+        ]
+        assert len(tool_logs) > 0, \
+            f"No se encontraron logs de tool en caplog. Records: {[r.getMessage() for r in caplog.records]}"
+        log_msg = tool_logs[0].getMessage()
+        assert 'client=dev-agent' in log_msg, \
+            f"El log debe contener 'client=dev-agent': {log_msg}"
+
+    def test_tool_call_fails_without_token(self, client):
+        """tools/call sin token devuelve 401, no "Autenticación requerida" del PermissionError."""
+        r = client.post(
+            '/mcp',
+            json={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'tools/call',
+                'params': {'name': 'get_incident_summary', 'arguments': {}}
+            },
+            headers={
+                'Accept': 'application/json, text/event-stream',
+                'Content-Type': 'application/json'
+            }
+        )
+        assert r.status_code == 401, f"Esperado 401, obtenido {r.status_code}: {r.text[:300]}"
+        error = r.json()
+        assert error['error'] == 'missing_auth_header'
 
     def test_scopes_format_in_metadata(self, client):
         """Los scopes en la metadata deben estar en formato 'dominio.acción'."""

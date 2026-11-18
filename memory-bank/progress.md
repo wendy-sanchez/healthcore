@@ -396,9 +396,12 @@
 - **Completado**: CORS preflight — OPTIONS requests pasan sin middleware Bearer.
 - **Completado**: MCP Playground conectado — `tools/list` (10 tools), `tools/call` (write rejection: `{"error": "read_only", "success": false}`), CORS preflight (204 con `access-control-allow-origin: *`).
 - **Completado**: Documentación en `mcp-server.md` (~550 líneas) — arquitectura, setup, tools, OAuth flow, migración del agente, testing.
+- **Completado (2026-11-18)**: Bugfix ContextVar desincronizado — mcpauth guardaba AuthInfo en su propio ContextVar y `_require_tool_scope()` leía de otro. Fix: pasar `_auth_info_context` como `context_var` a `MCPAuth`. Se eliminó `send_wrapper` obsoleto en `SelectiveBearerASGI`.
+- **Completado (2026-11-18)**: Test robusto `test_tool_call_with_valid_token_returns_result` que verifica resultado real de la tool + log `client=dev-agent` via caplog. `test_tool_call_fails_without_token` añadido para verificar 401 real.
 - **Completado**: Archivos legacy deprecados con `DeprecationWarning` (incidents.py, inventory.py).
 - **Completado**: 9/9 acceptance criteria verificados contra código fuente + Playground.
 - **Completado**: README.md y README.es.md revisados — ya contienen información completa, no requieren cambios.
+- **Tests**: **10/10 pasan** (`uv run pytest tests/test_mcp_server_auth.py -v`). Se agregó verificación de resultado real de tool y log de cliente.
 - **Branch**: `feature/mcp-oauth-tools`.
 
 ### Bugs encontrados y corregidos durante el desarrollo
@@ -408,6 +411,7 @@
 | Scopes invertidos | `mcps/config.py` | En producción, `required_scopes` vacío → middleware aceptaba requests sin token | `if os.getenv("MCP_SKIP_AUTH"):` en lugar de `if not os.getenv("MCP_SKIP_AUTH"):` | Invertir condición |
 | DNS Rebinding | `mcps/server.py` | Localtunnel/Codespaces rechazados con 400 Bad Request | FastMCP activa protección anti-DNS rebinding para localhost por defecto | `transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)` |
 | CORS preflight | `mcps/server.py` | `tools/call` desde Playground fallaba con error CORS | FastMCP no respondía OPTIONS; el middleware Bearer interceptaba y rechazaba | SelectiveBearerASGI pasa OPTIONS sin middleware Bearer |
+| ContextVar desincronizado (2026-11-18) | `mcps/server.py`, `mcps/auth.py` | `tools/list` funciona con token válido, `tools/call` falla con `PermissionError("Autenticación requerida")`. Tests existentes no lo detectan (solo verifican HTTP 200). | mcpauth guarda `AuthInfo` en su propio `ContextVar` interno (`mcp_auth_context`). `_require_tool_scope()` lee desde `_auth_info_context` — dos ContextVars distintos. El `send_wrapper` que intentaba leer `scope["state"]["auth_info"]` nunca funciona porque mcpauth no escribe ahí. | Pasar `_auth_info_context` como `context_var` a `MCPAuth(server=..., context_var=_auth_info_context)`. Eliminar `send_wrapper`. Test nuevo verifica resultado real de la tool + log con `client=dev-agent`. 10/10 tests. |
 
 ### Archivos creados/modificados
 - `mcps/__init__.py` — Paquete

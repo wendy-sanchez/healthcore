@@ -1,5 +1,23 @@
 # Active Context
 
+## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
+- **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
+- **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.
+- **Corrección**: Al construir `MCPAuth`, pasar nuestro `_auth_info_context` como `context_var`:
+  ```python
+  from mcps.auth import _auth_info_context as _mcp_auth_ctx
+  mcp_auth = MCPAuth(server=auth_server_config, context_var=_mcp_auth_ctx)
+  ```
+  Así mcpauth escribe en el mismo ContextVar que leen nuestras funciones.
+- **Limpieza**: Se eliminó el `send_wrapper` en `SelectiveBearerASGI` que intentaba (sin éxito) leer `scope["state"]["auth_info"]` para propagarlo al ContextVar — mcpauth nunca escribe en `scope["state"]`, solo en su ContextVar.
+- **Tests**: Se reemplazó `test_client_subject_in_error_response` (que solo verificaba HTTP 200) por `test_tool_call_with_valid_token_returns_result` que:
+  - Verifica HTTP 200 real con `result` en el body SSE (no error de auth)
+  - Verifica que el log contenga `client=dev-agent` via `caplog`
+  - Se agregó `test_tool_call_fails_without_token` para verificar 401 real
+  - **10/10 tests pasan**
+- **Archivos modificados**: `mcps/server.py` (pasar context_var a MCPAuth), `mcps/auth.py` (eliminar send_wrapper, actualizar docstring), `tests/test_mcp_server_auth.py` (test robusto con caplog).
+- **Branch**: `feature/mcp-oauth-tools`.
+
 ## Agente de Soporte LangGraph — HealthCore — Part 2: External Tools (2026-11-15)
 - **Entregable**: Extensión del agente de soporte LangGraph con **tools externas** que consultan datos operativos en tiempo real (gestor de incidentes + gestor de inventario). El agente decide automáticamente si necesita RAG, tool(s) o ambos, sin que el usuario lo especifique.
 - **Stack**: `langgraph v1.2.22`, `langgraph-checkpoint v4.3.2`, Python 3.14, `uv 0.13.5`, `httpx 0.28.1`. La lógica RAG existente se reutiliza sin modificar.

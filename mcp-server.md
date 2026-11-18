@@ -775,6 +775,7 @@ Durante la implementación se corrigieron los siguientes bugs / desviaciones del
 | 3 | **Write rejection solo en comentarios** (RETO 2) | `create_product`, `update_product`, `delete_product` no existían como tools; el cliente recibiría "tool not found" | Implementar las 3 tools como rejection explícito con error controlado |
 | 4 | **Invalid Host header con túneles** | localtunnel, Codespaces proxy y cualquier reverse proxy recibían HTTP 421 | Añadir `transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)` al constructor de FastMCP |
 | 5 | **Puerto Codespaces en modo Private** | URL pública de Codespaces devolvía HTTP 502 porque el proxy no reenviaba al puerto | `gh codespace ports visibility 9100:public` |
+| 6 | **ContextVar de auth desincronizado (2026-11-18)** | `tools/list` funcionaba con token válido, pero `tools/call` siempre fallaba con "Autenticación requerida". `mcpauth` guardaba `AuthInfo` en su propio `ContextVar` interno (`mcp_auth_context`), pero `_require_tool_scope()` leía desde `mcps/auth.py`'s `_auth_info_context` — dos ContextVars distintos. Tests existentes no lo detectaban porque validaban solo HTTP 200, no el resultado de la tool. | Pasar `_auth_info_context` como `context_var` al constructor `MCPAuth(server=..., context_var=_auth_info_context)` en `server.py`. Eliminar `send_wrapper` obsoleto de `SelectiveBearerASGI`. Añadir test `test_tool_call_with_valid_token_returns_result` que verifica el resultado real de la tool y el log con `client=dev-agent`. |
 
 ---
 

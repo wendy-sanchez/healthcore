@@ -520,7 +520,10 @@ else:
 
     # ── 1. Construir config del Authorization Server remoto ──────────
     auth_server_config = build_auth_server_config()
-    mcp_auth = MCPAuth(server=auth_server_config)
+    # Usar el ContextVar de mcps.auth para que get_auth_info() lea
+    # el mismo AuthInfo que mcpauth escribe durante la autenticación.
+    from mcps.auth import _auth_info_context as _mcp_auth_ctx
+    mcp_auth = MCPAuth(server=auth_server_config, context_var=_mcp_auth_ctx)
 
     # ── 2. Crear middleware Bearer Auth (mcpauth) ────────────────────
     bearer_mw_class = build_bearer_middleware(mcp_auth)

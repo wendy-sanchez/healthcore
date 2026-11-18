@@ -130,7 +130,7 @@ uv run python -m pytest tests/pipelines/test_rag.py -v
 # Tests de pronóstico de ventas (19 tests)
 uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
 
-# Tests de autenticación del servidor MCP (9 tests)
+# Tests de autenticación del servidor MCP (10 tests)
 uv run pytest tests/test_mcp_server_auth.py -v
 
 # Tests del job nocturno (30 tests)

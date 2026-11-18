@@ -130,7 +130,7 @@ uv run python -m pytest tests/pipelines/test_rag.py -v
 # Sales forecast (19 tests)
 uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
 
-# MCP Server auth (9 tests)
+# MCP Server auth (10 tests)
 uv run pytest tests/test_mcp_server_auth.py -v
 
 # Nightly job (30 tests)

@@ -178,9 +178,12 @@ def build_bearer_middleware(mcp_auth: MCPAuth) -> type:
 #
 # Envuelve el FastMCP app directamente a nivel ASGI.  Las rutas públicas
 # (/.well-known/, /health) pasan directo; el resto pasa por el middleware
-# Bearer Auth de mcpauth.  El middleware de mcpauth coloca auth_info en
-# scope["state"], que capturamos y propagamos a través de un ContextVar
-# para que sea accesible en las funciones de tool de FastMCP.
+# Bearer Auth de mcpauth.
+#
+# mcpauth guarda AuthInfo en un ContextVar compartido (configurado desde
+# server.py como MCPAuth(server=..., context_var=_auth_info_context)).
+# _require_tool_scope() y _current_client() leen del mismo ContextVar y
+# obtienen el subject validado sin necesidad de parsear scope["state"].
 #
 # Así el lifespan del FastMCP se preserva porque seguimos siendo una sola
 # capa ASGI.
@@ -211,21 +214,12 @@ class SelectiveBearerASGI:
         if any(path.startswith(prefix) for prefix in self.EXCLUDED_PREFIXES):
             await self._public_app(scope, receive, send)
         else:
-            # Protegido: usar el middleware de mcpauth
-            # El middleware colocará auth_info en scope["state"]["auth_info"]
-            async def send_wrapper(message: dict) -> None:
-                # Propagar auth_info a ContextVar cuando la respuesta inicia
-                if message["type"] == "http.response.start":
-                    auth_info = scope.get("state", {}).get("auth_info")
-                    if auth_info:
-                        set_auth_info(auth_info)
-                await send(message)
-
-            try:
-                await self._protected_app(scope, receive, send_wrapper)
-            finally:
-                # Limpiar después de completar
-                set_auth_info(None)
+            # Protegido: usar el middleware de mcpauth.
+            # mcpauth guarda AuthInfo en su ContextVar compartido
+            # (configurado en server.py), accesible por get_auth_info().
+            # No necesita send_wrapper porque el ContextVar ya fue
+            # seteado por el middleware antes de llegar al handler.
+            await self._protected_app(scope, receive, send)
 
 
 # ═══════════════════════════════════════════════════════════════════════
