@@ -43,6 +43,8 @@ from mcps.tools import (
 )
 
 logger = logging.getLogger(__name__)
+mcp_auth = None
+SKIP_AUTH = os.getenv("MCP_SKIP_AUTH", "").strip().lower() in {"1", "true", "yes"}
 
 # ── Atajo para desarrollo local: cargar .env si existe ──────────────
 _env_file = config.ENV_FILE
@@ -114,6 +116,7 @@ def create_incident(
     Returns:
         El incidente creado como JSON.
     """
+    _require_tool_scope("incidents.write", "create_incident")
     result = _create_incident(
         title=title,
         description=description,
@@ -122,7 +125,7 @@ def create_incident(
         branch=branch,
         reported_by=reported_by,
     )
-    return _serialize_result(result, label="incidente creado")
+    return _serialize_result(result, label="create_incident")
 
 
 @mcp.tool(
@@ -138,8 +141,9 @@ def get_incident(ticket_id: int) -> str:
     Returns:
         Datos completos del incidente como JSON.
     """
+    _require_tool_scope("incidents.read", "get_incident")
     result = _get_incident(ticket_id)
-    return _serialize_result(result, label="incidente")
+    return _serialize_result(result, label="get_incident")
 
 
 @mcp.tool(
@@ -167,6 +171,7 @@ def list_incidents(
     Returns:
         Lista de incidentes como JSON.
     """
+    _require_tool_scope("incidents.read", "list_incidents")
     result = _list_incidents(
         status=status,
         category=category,
@@ -175,7 +180,7 @@ def list_incidents(
         limit=limit,
         offset=offset,
     )
-    return _serialize_result(result, label="incidentes")
+    return _serialize_result(result, label="list_incidents")
 
 
 @mcp.tool(
@@ -208,12 +213,13 @@ def update_incident_status(
     Returns:
         El incidente actualizado como JSON.
     """
+    _require_tool_scope("incidents.write", "update_incident_status")
     result = _update_incident_status(
         ticket_id=ticket_id,
         status=status,
         comment=comment,
     )
-    return _serialize_result(result, label="estado actualizado")
+    return _serialize_result(result, label="update_incident_status")
 
 
 @mcp.tool(
@@ -226,8 +232,9 @@ def get_incident_summary() -> str:
     Returns:
         Resumen como JSON.
     """
+    _require_tool_scope("incidents.read", "get_incident_summary")
     result = _get_summary()
-    return _serialize_result(result, label="resumen")
+    return _serialize_result(result, label="get_incident_summary")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -253,8 +260,9 @@ def get_product(product_id: int) -> str:
     Returns:
         Datos del producto como JSON (nombre, SKU, categoría, stock, unidad).
     """
+    _require_tool_scope("inventory.read", "get_product")
     result = _get_product(product_id)
-    return _serialize_result(result, label="producto")
+    return _serialize_result(result, label="get_product")
 
 
 @mcp.tool(
@@ -278,13 +286,14 @@ def list_products(
     Returns:
         Lista de productos como JSON.
     """
+    _require_tool_scope("inventory.read", "list_products")
     result = _list_products(
         category=category,
         name_search=name_search,
         limit=limit,
         offset=offset,
     )
-    return _serialize_result(result, label="productos")
+    return _serialize_result(result, label="list_products")
 
 
 @mcp.tool(
@@ -318,6 +327,7 @@ def create_product(
     Returns:
         Siempre un error indicando que el inventario es solo lectura.
     """
+    _require_tool_scope("inventory.write", "create_product")
     result = _create_product(
         name=name,
         category=category,
@@ -325,7 +335,7 @@ def create_product(
         stock=stock,
         sku=sku,
     )
-    return _serialize_result(result, label="create_product (read-only)")
+    return _serialize_result(result, label="create_product")
 
 
 @mcp.tool(
@@ -359,6 +369,7 @@ def update_product(
     Returns:
         Siempre un error indicando que el inventario es solo lectura.
     """
+    _require_tool_scope("inventory.write", "update_product")
     result = _update_product(
         product_id=product_id,
         name=name,
@@ -366,7 +377,7 @@ def update_product(
         unit=unit,
         stock=stock,
     )
-    return _serialize_result(result, label="update_product (read-only)")
+    return _serialize_result(result, label="update_product")
 
 
 @mcp.tool(
@@ -390,13 +401,38 @@ def delete_product(product_id: int) -> str:
     Returns:
         Siempre un error indicando que el inventario es solo lectura.
     """
+    _require_tool_scope("inventory.write", "delete_product")
     result = _delete_product(product_id=product_id)
-    return _serialize_result(result, label="delete_product (read-only)")
+    return _serialize_result(result, label="delete_product")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Helpers
 # ═══════════════════════════════════════════════════════════════════════
+
+
+def _current_client() -> str:
+    """Devuelve el subject validado de la petición, nunca el token."""
+    auth_info = mcp_auth.auth_info if mcp_auth is not None else None
+    return str(auth_info.subject) if auth_info and auth_info.subject else "unknown"
+
+
+def _require_tool_scope(required_scope: str, tool_name: str) -> None:
+    """Aplica autorización granular antes de ejecutar cualquier efecto lateral."""
+    if SKIP_AUTH:
+        return
+
+    auth_info = mcp_auth.auth_info if mcp_auth is not None else None
+    if auth_info is None:
+        raise PermissionError("Autenticación requerida")
+    if required_scope not in auth_info.scopes:
+        logger.warning(
+            "Tool DENIED | tool=%s | client=%s | missing_scope=%s | success=false",
+            tool_name,
+            _current_client(),
+            required_scope,
+        )
+        raise PermissionError(f"Scope requerido: {required_scope}")
 
 
 def _serialize_result(result: dict, label: str = "resultado") -> str:
@@ -406,17 +442,21 @@ def _serialize_result(result: dict, label: str = "resultado") -> str:
     """
     import json
 
+    client = _current_client()
     if result.get("success"):
         logger.info(
-            "Tool OK | tool=%(label)s | success=true",
-            {"label": label},
+            "Tool OK | tool=%s | client=%s | success=true",
+            label,
+            client,
         )
         return json.dumps(result, ensure_ascii=False, default=str)
     else:
         error_msg = result.get("error", "Error desconocido")
         logger.warning(
-            "Tool ERROR | tool=%(label)s | success=false | error=%(error)s",
-            {"label": label, "error": error_msg[:120]},
+            "Tool ERROR | tool=%s | client=%s | success=false | error=%s",
+            label,
+            client,
+            error_msg[:120],
         )
         return json.dumps(
             {"error": error_msg, "success": False},
@@ -444,8 +484,6 @@ def _serialize_result(result: dict, label: str = "resultado") -> str:
 #   - mcpauth: https://pypi.org/project/mcpauth/
 #
 # Si MCP_SKIP_AUTH=1, se omite toda la capa OAuth (solo desarrollo local).
-
-SKIP_AUTH = os.getenv("MCP_SKIP_AUTH", "").strip() in ("1", "true", "yes")
 
 if SKIP_AUTH:
     # Modo desarrollo: app sin auth

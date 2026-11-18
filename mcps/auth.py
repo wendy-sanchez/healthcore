@@ -102,7 +102,7 @@ def _verify_dev_token(token: str) -> AuthInfo:
     return AuthInfo(
         token=token,
         issuer=config.MCP_ISSUER,
-        scopes=config.MCP_SCOPES_SUPPORTED,
+        scopes=config.MCP_DEV_TOKEN_SCOPES,
         subject="dev-agent",
         audience=None,
         claims={"sub": "dev-agent", "iss": config.MCP_ISSUER},

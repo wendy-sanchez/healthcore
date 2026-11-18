@@ -67,18 +67,24 @@ uv add "mcp>=1.24.0,<2" "mcpauth>=0.1.0" "fastmcp>=1.0.0"
 | `MCP_PUBLIC_URL` | — | URL pública (ej. `https://<codespace>-9100.app.github.dev`) |
 | `MCP_ISSUER` | `MCP_PUBLIC_URL` o `http://localhost:9100` | Issuer esperado en JWT |
 | `MCP_JWKS_URI` | — | URI del JWKS endpoint del AS (para validación asimétrica en producción) |
-| `MCP_SKIP_AUTH` | — | `1` para deshabilitar toda la capa OAuth (solo desarrollo local) |
-| `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo (usa `_verify_dev_token()`) |
-| `MCP_REQUIRED_SCOPES` | `["incidents.read"]` | Scopes globales requeridos. Se calcula automáticamente: cuando `MCP_SKIP_AUTH=1` → vacío (sin scope mínimo); sin `MCP_SKIP_AUTH` → aplica el scope base para que un token sin ningún scope sea rechazado. **Bug corregido**: inicialmente la lógica estaba invertida (`if os.getenv("MCP_SKIP_AUTH")` en lugar de `if not`), lo que dejaba los scopes vacíos en modo producción y el middleware aceptaba cualquier request sin token. |
+| `MCP_SKIP_AUTH` | — | `1` deshabilita autenticación. Exclusivamente para pruebas aisladas; nunca para Playground ni entornos compartidos. Por defecto la autenticación está activa. |
+| `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo autenticado (usa `_verify_dev_token()`); no es un token de producción/OAuth. |
+| `MCP_DEV_TOKEN_SCOPES` | Todos los scopes soportados | Scopes asignados al token dev, separados por espacios (ej. `inventory.read`). Permite verificar mínimo privilegio localmente. |
+| `MCP_REQUIRED_SCOPES` | ninguno | No hay scope global: cada tool verifica su scope específico. El middleware sigue exigiendo Bearer válido para toda ruta `/mcp`, incluyendo `tools/list`. |
 | `INCIDENTS_API_URL` | `http://incidents-backend:8010` | URL del Incidents Manager |
 | `INVENTORY_API_URL` | `http://backend:8000` | URL del módulo de inventario |
 | `AGENT_JWT_TOKEN` | — | JWT backend-a-backend que usa el MCP Server internamente para consultar inventario |
 
-### Arranque local (sin auth)
+### Arranque local autenticado (token dev)
 
 ```bash
-MCP_SKIP_AUTH=1 uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+MCP_SKIP_AUTH=0 MCP_JWKS_URI="" \
+MCP_DEV_TOKEN="hc_local_test_token" \
+MCP_DEV_TOKEN_SCOPES="incidents.read incidents.write inventory.read inventory.write" \
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
 ```
+
+No establecer `MCP_SKIP_AUTH=1` al conectar Playground: el middleware debe rechazar sin token tanto `tools/list` como `tools/call`.
 
 ### Arranque local (con auth — token fijo de desarrollo)
 
@@ -346,8 +352,8 @@ Content-Type: application/json
 
 | Modo | Configuración | Comportamiento |
 |------|--------------|----------------|
-| **JWKS** (producción) | `MCP_JWKS_URI` configurado | Valida JWT asimétricamente (RS256/ES256) contra el JWKS del AS. Scopes opcionales vía `MCP_REQUIRED_SCOPES` |
-| **Token fijo** (desarrollo) | Sin `MCP_JWKS_URI` | Usa `MCP_DEV_TOKEN` (default `hc_dev_token_no_usar_en_produccion`) como secreto compartido. `show_error_details=True` para debug |
+| **JWKS** (producción) | `MCP_JWKS_URI` configurado | Valida JWT asimétricamente (RS256/ES256) contra el JWKS del AS. El scope se autoriza por tool. |
+| **Token fijo** (desarrollo) | Sin `MCP_JWKS_URI` | Usa `MCP_DEV_TOKEN` como secreto compartido. Los scopes se limitan con `MCP_DEV_TOKEN_SCOPES`. `show_error_details=True` para debug |
 | **Skip** (desarrollo) | `MCP_SKIP_AUTH=1` | Sin validación. El servidor arranca sin middleware Bearer. Solo para tests locales |
 
 ### Códigos de error (Bearer Auth)
@@ -527,14 +533,17 @@ with patch("services.agent.graph.query_incident_by_id", return_value=mock_data):
 ### Tests del MCP Server
 
 ```bash
-# 1. Arrancar servidor con auth en modo dev
-MCP_SKIP_AUTH=0 MCP_JWKS_URI="" MCP_ISSUER="https://oidc.example.com" \
+# 1. Arrancar servidor con auth en modo dev. No configurar MCP_SKIP_AUTH=1.
+MCP_SKIP_AUTH=0 MCP_JWKS_URI="" MCP_ISSUER="http://localhost:9100" \
   MCP_PUBLIC_URL="http://localhost:9100" \
+  MCP_DEV_TOKEN="hc_local_test_token" \
+  MCP_DEV_TOKEN_SCOPES="incidents.read incidents.write inventory.read inventory.write" \
   uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
 
 # 2. Sin token → 401
 curl -s -w "\nHTTP_CODE: %{http_code}\n" http://localhost:9100/mcp \
   -X POST -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # 3. Con token válido → 200 + tools list
@@ -542,8 +551,15 @@ curl -s -w "\nHTTP_CODE: %{http_code}\n" http://localhost:9100/mcp \
   -X POST \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -H "Authorization: Bearer hc_dev_token_no_usar_en_produccion" \
+  -H "Authorization: Bearer hc_local_test_token" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# 4. Llamada con token (tools/call); el token debe tener el scope de la tool
+curl -s -w "\nHTTP_CODE: %{http_code}\n" http://localhost:9100/mcp \
+  -X POST -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer hc_local_test_token" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_product","arguments":{"name":"Test","category":"supply","unit":"unit"}}}'
 
 # 4. Protected Resource Metadata (público)
 curl -s http://localhost:9100/.well-known/oauth-protected-resource
@@ -612,12 +628,12 @@ mcps/
 | # | Criterio | Estado | Detalle |
 |---|----------|--------|---------|
 | 1 | Package `mcps/` existe | ✅ | `mcps/__init__.py`, `config.py`, `server.py`, `tools.py`, `auth.py`. Servidor levanta correctamente y expone tools vía `tools/list`. |
-| 2 | Sin OAuth no se ejecutan tools | ✅ (REPARADO) | **ESTABA ROTO**: `config.py` tenía lógica inversa (`MCP_REQUIRED_SCOPES = ["incidents.read"] if os.getenv("MCP_SKIP_AUTH")`). Sin `MCP_SKIP_AUTH` los scopes quedaban vacíos → middleware no exigía token. Corregido a `if not os.getenv("MCP_SKIP_AUTH")`. Ahora: sin token → HTTP 401 `missing_auth_header`; con token válido → HTTP 200. |
+| 2 | No listar/ejecutar sin autenticación | ✅ Verificado | `tools/list` y `tools/call` sin Bearer devuelven HTTP 401 `missing_auth_header`; con token válido devuelven HTTP 200. Sin scope de la tool, la llamada se deniega antes de tocar el backend. |
 | 3 | `update_incident_status` usa `PATCH /api/incidents/{id}/status` | ✅ | La tool `update_incident_status` en `tools.py` usa `PATCH /api/incidents/{id}/status` del Incidents Manager real. Create/get/list también contra el backend real. |
-| 4 | Inventario solo lectura | ✅ | Tools de lectura (`get_product`, `list_products`) funcionan. **Además**: `create_product`, `update_product`, `delete_product` existen y devuelven error controlado `{"error": "read_only", "message": "..."}` (RETO 2 del ticket). El cliente MCP nunca recibe "tool not found". Scopes: `inventory.read` para lectura, `inventory.write` para las rejection tools. |
+| 4 | Inventario solo lectura | ✅ | Tools de lectura (`get_product`, `list_products`) usan `inventory.read`. Las tools de escritura (rechazo controlado) usan `inventory.write`; sin dicho scope no pueden ejecutarse. |
 | 5 | Descripciones y schemas claros | ✅ | `@mcp.tool(description=…)` con descripciones semánticas en español. `inputSchema` con tipos anotados, valores válidos documentados, parámetros opcionales con `default`. Verificable via `tools/list`. |
 | 6 | Errores diferenciados | ✅ | Sin token → `missing_auth_header` (401). Token inválido → `invalid_token` (401). Token sin scope → `missing_required_scopes` (403). Tool timeout → `"El servicio no respondió en Ns"`. Conexión fallida → `"No se pudo conectar"`. HTTP error → `"código NNN"`. Validación campo requerido → Pydantic `Field required` (422). |
-| 7 | Log por invocación | ✅ | `_serialize_result()` registra `Tool OK | tool=<label> | success=true` o `Tool ERROR | tool=<label> | success=false | error=<msg>`. Un log por invocación con cliente, tool y resultado. |
+| 7 | Log por invocación | ✅ | `_serialize_result()` registra `tool`, `client` (subject validado), `success` y error acotado. No registra bearer tokens. |
 | 8 | Agente usa MCP Client | ✅ | `graph.py` importa solo de `services.agent.tools.mcp_client`. El cliente usa **`langchain-mcp-adapters`** (`load_mcp_tools`) para convertir tools MCP a BaseTool de LangChain, cumpliendo RETO 4 del ticket. Archivos legacy `incidents.py` e `inventory.py` marcados como DEPRECATED con `DeprecationWarning`. 32 tests pasando. |
 | 9 | MCP Playground / URL pública | ✅ | URL pública de Codespaces (`https://<codespace>-9100.app.github.dev/mcp`) configurada con visibilidad **Public**. CORS: `access-control-allow-origin: *`. **Fix transport_security**: se deshabilitó `enable_dns_rebinding_protection` en FastMCP vía `TransportSecuritySettings` para permitir proxies reversos. Verificado: `tools/list` → 10 tools, `tools/call` → write rejection `{"error": "read_only", "success": false}`. |
 
@@ -627,8 +643,9 @@ mcps/
 
 ### Requisitos
 
-- Servidor MCP corriendo con `MCP_SKIP_AUTH=1` (modo desarrollo sin OAuth)
-- Puerto **públicamente accesible** desde Internet
+- Servidor MCP corriendo con autenticación activa (OAuth/JWKS o token dev de prueba). **No usar `MCP_SKIP_AUTH=1`**.
+- Token con scopes requeridos por las herramientas que se probarán.
+- Puerto **públicamente accesible** desde Internet.
 
 ### 1. Exponer el puerto en Codespaces
 
@@ -660,7 +677,7 @@ https://congenial-pancake-gxq77rxwr56q3v7x4-9100.app.github.dev/mcp
 1. Abrir https://www.mcpplayground.tech/playground
 2. Ingresar la URL pública en el campo de conexión: `https://<codespace>-9100.app.github.dev/mcp`
 3. Click **Connect**
-4. El Playground listará las **10 tools** disponibles
+4. Sin Bearer token, `tools/list` debe responder **401 Unauthorized**. Con token, lista las **10 tools**.
 
 ### 3. Probar flujos completos
 
@@ -688,9 +705,16 @@ https://congenial-pancake-gxq77rxwr56q3v7x4-9100.app.github.dev/mcp
 ### 4. Verificación con curl
 
 ```bash
-# Probar servidor en local
+# Probar servidor en local: primero sin token (401)
 curl -s -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"tools/list"}' \
+  http://127.0.0.1:9100/mcp
+
+# Con token (200 y lista de tools)
+curl -s -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer hc_local_test_token" \
   -d '{"jsonrpc":"2.0","id":"1","method":"tools/list"}' \
   http://127.0.0.1:9100/mcp
 
@@ -715,7 +739,7 @@ curl -s -H "Content-Type: application/json" \
 |---------|---------------|----------|
 | `HTTP 502` desde URL pública | Servidor MCP no está corriendo | `uvicorn mcps.server:app --host 0.0.0.0 --port 9100` |
 | `HTTP 502` después de arrancar servidor | Proxy de Codespaces no actualizado | Esperar 10-30 segundos y reintentar |
-| `401 Unauthorized` | `MCP_SKIP_AUTH` no está configurado | Usar `MCP_SKIP_AUTH=1` para desarrollo |
+| `401 Unauthorized` | No se envió Bearer token o el token es inválido | Enviar un token OAuth/dev válido; no deshabilitar auth para Playground |
 | Conexión fallida en Playground | Puerto no es público | `gh codespace ports visibility 9100:public` |
 | Playground no lista tools | CORS bloqueado | Verificar cabecera `access-control-allow-origin: *` en respuesta OPTIONS |
 | `Invalid Host header` | FastMCP DNS rebinding protection | Ya fixeado con `TransportSecuritySettings(enable_dns_rebinding_protection=False)` |
@@ -728,7 +752,7 @@ Durante la implementación se corrigieron los siguientes bugs / desviaciones del
 
 | # | Bug / Desviación | Síntoma | Fix |
 |---|------------------|---------|-----|
-| 1 | **Auth invertido** — `MCP_REQUIRED_SCOPES` se llenaba con `MCP_SKIP_AUTH=1` y quedaba vacío sin ella | Sin `MCP_SKIP_AUTH` el middleware no exigía token → cualquiera podía llamar tools | Invertir condición: `if not os.getenv("MCP_SKIP_AUTH")` |
+| 1 | **Playground validado con auth bypass** | Permitía listar tools sin credencial y no demostraba el control de acceso | Mantener OAuth/token dev habilitado; verificado sin token 401 en `tools/list` y `tools/call`, con token 200 |
 | 2 | **langchain-mcp-adapters listo en pyproject pero no importado** (RETO 4) | `mcp_client.py` usaba HTTP directo en vez de `load_mcp_tools` | Refactorizar `mcp_client.py` para usar `load_mcp_tools(session=session)` y `BaseTool.ainvoke()` |
 | 3 | **Write rejection solo en comentarios** (RETO 2) | `create_product`, `update_product`, `delete_product` no existían como tools; el cliente recibiría "tool not found" | Implementar las 3 tools como rejection explícito con error controlado |
 | 4 | **Invalid Host header con túneles** | localtunnel, Codespaces proxy y cualquier reverse proxy recibían HTTP 421 | Añadir `transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)` al constructor de FastMCP |

@@ -56,10 +56,19 @@ MCP_SCOPES_SUPPORTED = [
     "inventory.write",
 ]
 
-# Scopes requeridos globalmente (todas las tools).  Se aplican además de
-# los scopes específicos que cada tool exige.  Usamos uno "base" para que
-# un token sin ningún scope sea rechazado incluso antes de llegar a la tool.
-MCP_REQUIRED_SCOPES = ["incidents.read"] if not os.getenv("MCP_SKIP_AUTH") else []
+# No hay scopes globales: exigir incidents.read en todas las peticiones
+# bloqueaba tokens válidos de inventario y no implementaba permisos por tool.
+# La autenticación es obligatoria en el middleware; el scope específico se
+# valida al ejecutar cada herramienta (server.py).
+MCP_REQUIRED_SCOPES: list[str] = []
+
+# Scopes del token fijo para pruebas locales. Permite verificar mínimo
+# privilegio sin depender de un Authorization Server real.
+MCP_DEV_TOKEN_SCOPES = [
+  scope.strip()
+  for scope in os.getenv("MCP_DEV_TOKEN_SCOPES", "").split()
+  if scope.strip() in MCP_SCOPES_SUPPORTED
+]
 
 # ── Propiedades del servidor ─────────────────────────────────────────
 SERVER_NAME = "healthcore-mcp"
