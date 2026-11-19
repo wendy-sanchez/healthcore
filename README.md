@@ -29,6 +29,7 @@
 | 11 | **RAG Knowledge Base** — Retrieval-Augmented Generation over HealthCore policy documents (insurance, appointments, referrals, checklists) | Qdrant, pplx-embed-v1, DeepSeek-v4, FastAPI | ✅ Complete |
 | 12 | **LangGraph Support Agent** — Decision graph wrapping RAG pipeline with explicit state, checkpointing, tracing, and HTTP endpoint | LangGraph 1.2.22, MemorySaver, httpx | ✅ Complete |
 | 13 | **LangGraph Agent — External Tools** — Added real-time incident and inventory query tools. Auto-routing between RAG, tools, or both via regex classification (no LLM). 5s timeout, honest fallback. 32 tests. | LangGraph, httpx, regex | ✅ Complete |
+| 14 | **MCP Server — OAuth-Protected Tools** — Model Context Protocol server exposing Incidents (5 tools) and Inventory (5 tools) as MCP tools, protected with OAuth 2.1 Resource Server via mcpauth. Inventory write operations explicitly rejected (RETO 2). LangGraph agent integrated via langchain-mcp-adapters. 9/9 acceptance criteria. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Complete |
 
 ---
 
@@ -50,6 +51,9 @@ services/                   # Backend services
 ├── nightly/                #   Nightly export job — background process
 └── job_runner.py           #   State machine for job orchestration
 
+mcps/                       # MCP Server (port 9100) — FastMCP + OAuth 2.1
+                            #   10 tools (incidents + inventory) protected via mcpauth
+
 data/                       # Data layer
 ├── raw/                    #   Raw data (CSV)
 ├── process/                #   Processed data, TinyDB databases
@@ -63,7 +67,7 @@ scripts/                    # CLI tools: sales forecast, model evaluation, night
 tests/                      # Test suites: pipelines, nightly, agent, RAG, evaluation
 ```
 
-**Backend architecture:** Most APIs use TinyDB for auth and operational data. Inventory and reporting use Supabase PostgreSQL. A standalone auth server avoids SQLModel/Python 3.14 incompatibility.
+**Backend architecture:** Most APIs use TinyDB for auth and operational data. Inventory and reporting use Supabase PostgreSQL. A standalone auth server avoids SQLModel/Python 3.14 incompatibility. The MCP Server (`mcps/`) exposes incident and inventory tools via Model Context Protocol with OAuth 2.1 protection.
 
 **Docker:** Services communicate via Docker Compose under `healthcore-net`. See [`docker-compose.yml`](./docker-compose.yml).
 
@@ -95,6 +99,12 @@ uv run python services/telemetry/server_standalone.py
 
 # RAG standalone server (port 8000 — avoids SQLModel)
 uv run python services/api/routes/rag_standalone.py
+
+# MCP Server (port 9100) — OAuth-protected tools with dev token
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+# MCP Server will start with authentication ENABLED by default.
+# Use the dev token: hc_dev_token_no_usar_en_produccion
+# To connect via MCP Playground or CLI: add Authorization header with this token.
 ```
 
 ### Run Frontends
@@ -120,6 +130,9 @@ uv run python -m pytest tests/pipelines/test_rag.py -v
 # Sales forecast (19 tests)
 uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
 
+# MCP Server auth (10 tests)
+uv run pytest tests/test_mcp_server_auth.py -v
+
 # Nightly job (30 tests)
 .venv-nightly/bin/python -m pytest tests/nightly -q
 ```
@@ -143,6 +156,22 @@ The support agent is implemented as a LangGraph `StateGraph` with **10 nodes** a
 - **Tracing:** Each run produces a JSON trace persisted to `services/agent/traces/{run_id}.json`.
 - **Endpoint:** `POST /agent/query` (thin FastAPI layer — no business logic).
 - **Docs:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md) (Spanish).
+
+---
+
+## 🔧 MCP Server — OAuth-Protected Tools — Key Details
+
+Model Context Protocol server exposing internal tools as MCP resources, protected with **OAuth 2.1 Resource Server** via **mcpauth**. Designed for the LangGraph agent to consume via `langchain-mcp-adapters`.
+
+- **10 tools:** Incidents (5 — CRUD + summary) and Inventory (5 — 2 read + 3 explicit write rejection).
+- **OAuth enforcement:** `SelectiveBearerASGI` wrapper — public routes (`/.well-known/`, `/health`) bypass auth; `/mcp` requires Bearer JWT.
+- **Authentication enabled by default:** Dev mode uses token `hc_dev_token_no_usar_en_produccion` with all scopes. Production uses JWKS endpoint (`MCP_JWKS_URI`).
+- **Scopes:** Minimum privilege — `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`. Each tool enforces its required scope.
+- **Logging:** All tool invocations logged with client subject (`client=<sub>`), tool name, success/error status, and error details.
+- **Write rejection (RETO 2):** `create_product`, `update_product`, `delete_product` exist and are discoverable but return `{"error": "read_only", "success": false, "code": "INVENTORY_READ_ONLY"}`.
+- **LangGraph integration:** Agent migrated from direct HTTP to MCP Client via `langchain-mcp-adapters` (`load_mcp_tools()`). Nodes are `async def` with `await tool.ainvoke()`.
+- **Transport:** Streamable HTTP (`stateless_http=True`). DNS rebinding protection disabled for tunnel compatibility.
+- **Docs:** [`mcp-server.md`](./mcp-server.md), [`mcps/README.md`](./mcps/README.md).
 
 ---
 
@@ -177,7 +206,9 @@ Retrieval-Augmented Generation over 4 HealthCore policy documents. Embedded with
 | [`predic-ventas-model-regresion.md`](./predic-ventas-model-regresion.md) | Sales forecast model design and audit |
 | [`docs/rag/rag-design.md`](./docs/rag/rag-design.md) | RAG knowledge base design |
 | [`background-processes.md`](./background-processes.md) | Background job architecture |
+| [`message-queues-asyns-task.md`](./message-queues-asyns-task.md) | Asynchronous Task Queue — Redis + Celery |
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Overall architecture proposal |
+| [`mcp-server.md`](./mcp-server.md) | MCP Server — OAuth-protected tools, architecture, setup |
 | [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns |
 
 ---

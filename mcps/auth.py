@@ -1,0 +1,379 @@
+"""
+mcps/auth.py — Helpers de autenticación OAuth 2.1 para el MCP Server.
+
+El MCP Server actúa como **Resource Server** (RS) de OAuth 2.1, NO como
+Authorization Server (AS).  Sus responsabilidades son:
+
+1. Publicar Protected Resource Metadata (RFC 9728) en
+   ``/.well-known/oauth-protected-resource`` para que los clientes sepan
+   qué AS pueden emitir tokens válidos y qué scopes se requieren.
+
+2. Validar tokens Bearer JWT en cada request usando el middleware de
+   mcpauth (Bearer Auth).  El middleware verifica issuer, audience,
+   scopes y firma contra la JWKS del AS emisor.
+
+Referencias de la especificación MCP Auth (modo Resource Server):
+  https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/authorization/
+
+Principios:
+  - Sin acoplamiento a un proveedor OIDC específico (agnóstico).
+  - Scopes de mínimo privilegio: incidents.read, incidents.write, inventory.read.
+  - El servidor rechaza tokens sin los scopes requeridos (403).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextvars import ContextVar
+from typing import Any
+
+from mcpauth import AuthServerConfig, MCPAuth
+from mcpauth.config import AuthorizationServerMetadata, AuthServerType
+from mcpauth.types import AuthInfo
+
+from mcps import config
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────
+# Context Var para pasar auth_info a través de async context
+# ─────────────────────────────────────────────────────────────────────
+# Esto permite que las funciones de tool accedan al auth_info del request
+# actual sin necesidad de pasar el request explícitamente.
+
+_auth_info_context: ContextVar[AuthInfo | None] = ContextVar(
+    'auth_info', default=None
+)
+
+
+def set_auth_info(auth_info: AuthInfo | None) -> None:
+    """Establece el auth_info en el contexto actual."""
+    _auth_info_context.set(auth_info)
+
+
+def get_auth_info() -> AuthInfo | None:
+    """Obtiene el auth_info del contexto actual."""
+    return _auth_info_context.get()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Construcción del AuthServerConfig (para mcpauth)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# mcpauth necesita saber qué AS emitió el token para validar issuer y
+# jwks_uri.  Esto NO significa que seamos el AS; es la configuración del
+# AS remoto que los clientes deben usar para obtener tokens.
+
+
+def build_auth_server_config() -> AuthServerConfig:
+    """Construye la configuración del AS remoto para mcpauth.
+
+    La metadata describe el AS que emite tokens para este RS.  El RS
+    la necesita para saber dónde validar los JWT (jwks_uri).
+
+    Returns:
+        AuthServerConfig lista para pasar a ``MCPAuth(server=...)``.
+    """
+    issuer = config.MCP_ISSUER
+    jwks_uri = config.MCP_JWKS_URI.strip()
+
+    metadata = AuthorizationServerMetadata(
+        issuer=issuer,
+        authorization_endpoint="",
+        token_endpoint="",
+        jwks_uri=jwks_uri or None,
+        response_types_supported=["code"],
+        grant_types_supported=["authorization_code"],
+        code_challenge_methods_supported=["S256"],
+        token_endpoint_auth_methods_supported=["client_secret_basic"],
+        scope_supported=config.MCP_SCOPES_SUPPORTED,
+    )
+
+    return AuthServerConfig(
+        metadata=metadata,
+        type=AuthServerType.OAUTH,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Middleware Bearer Auth
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _verify_dev_token(token: str) -> AuthInfo:
+    """Validador de desarrollo: acepta solo un token fijo configurado.
+
+    Útil para integración temprana cuando no hay un IDP disponible.
+    NUNCA usar en producción.
+    """
+    from mcpauth.exceptions import (
+        MCPAuthTokenVerificationException,
+        MCPAuthTokenVerificationExceptionCode,
+    )
+
+    dev_token = os.getenv("MCP_DEV_TOKEN", "hc_dev_token_no_usar_en_produccion")
+
+    if token != dev_token:
+        raise MCPAuthTokenVerificationException(
+            MCPAuthTokenVerificationExceptionCode.INVALID_TOKEN,
+            cause=ValueError("Token de desarrollo inválido"),
+        )
+
+    return AuthInfo(
+        token=token,
+        issuer=config.MCP_ISSUER,
+        scopes=config.MCP_DEV_TOKEN_SCOPES,
+        subject="dev-agent",
+        audience=None,
+        claims={"sub": "dev-agent", "iss": config.MCP_ISSUER},
+    )
+
+
+def build_bearer_middleware(mcp_auth: MCPAuth) -> type:
+    """Crea el middleware Bearer Auth de mcpauth para este servidor.
+
+    Si ``MCP_JWKS_URI`` está configurado, usa validación JWT contra
+    JWKS remota.  Si no, usa un validador de desarrollo con token fijo.
+
+    Args:
+        mcp_auth: Instancia de MCPAuth ya configurada.
+
+    Returns:
+        Clase middleware Starlette (``BaseHTTPMiddleware``) lista para
+        aplicar sobre la app.
+    """
+    required_scopes: list[str] | None = None
+    if config.MCP_REQUIRED_SCOPES:
+        required_scopes = config.MCP_REQUIRED_SCOPES
+
+    jwks_uri = config.MCP_JWKS_URI.strip()
+
+    if jwks_uri:
+        # ── Producción: validar JWT contra JWKS remota ──────────────
+        bearer_mw = mcp_auth.bearer_auth_middleware(
+            mode_or_verify="jwt",
+            required_scopes=required_scopes,
+            show_error_details=False,
+        )
+        logger.info("Bearer Auth configurado con JWKS URI: %s", jwks_uri)
+    else:
+        # ── Desarrollo: token fijo ──────────────────────────────────
+        bearer_mw = mcp_auth.bearer_auth_middleware(
+            mode_or_verify=_verify_dev_token,
+            required_scopes=required_scopes,
+            show_error_details=True,
+        )
+        logger.info(
+            "Bearer Auth en modo DEV (token estático). "
+            "Configura MCP_JWKS_URI para producción."
+        )
+
+    return bearer_mw
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Wrapper ASGI que aplica Bearer Auth solo en rutas protegidas
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Envuelve el FastMCP app directamente a nivel ASGI.  Las rutas públicas
+# (/.well-known/, /health) pasan directo; el resto pasa por el middleware
+# Bearer Auth de mcpauth.
+#
+# mcpauth guarda AuthInfo en un ContextVar compartido (configurado desde
+# server.py como MCPAuth(server=..., context_var=_auth_info_context)).
+# _require_tool_scope() y _current_client() leen del mismo ContextVar y
+# obtienen el subject validado sin necesidad de parsear scope["state"].
+#
+# Así el lifespan del FastMCP se preserva porque seguimos siendo una sola
+# capa ASGI.
+
+
+class SelectiveBearerASGI:
+    """ASGI wrapper que aplica bearer auth solo en paths no-públicos y propaga auth_info via ContextVar."""
+
+    EXCLUDED_PREFIXES = ("/.well-known/", "/health", "/openapi")
+
+    def __init__(self, mcp_asgi_app: Any, bearer_mw_class: type) -> None:
+        self._public_app = mcp_asgi_app
+        # La instancia del middleware Bearer envuelve el app protegido
+        self._protected_app = bearer_mw_class(mcp_asgi_app)
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        # ⚠️ CRÍTICO: Pasar el lifespan directamente al app interno sin filtrar
+        # para que el session_manager de FastMCP se inicialice correctamente
+        if scope["type"] == "lifespan":
+            await self._public_app(scope, receive, send)
+            return
+
+        if scope["type"] != "http":
+            await self._public_app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if any(path.startswith(prefix) for prefix in self.EXCLUDED_PREFIXES):
+            await self._public_app(scope, receive, send)
+        else:
+            # Protegido: usar el middleware de mcpauth.
+            # mcpauth guarda AuthInfo en su ContextVar compartido
+            # (configurado en server.py), accesible por get_auth_info().
+            # No necesita send_wrapper porque el ContextVar ya fue
+            # seteado por el middleware antes de llegar al handler.
+            await self._protected_app(scope, receive, send)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Protected Resource Metadata (RFC 9728)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Publicamos la metadata en /.well-known/oauth-protected-resource para
+# que los clientes MCP puedan descubrir:
+#   - La URL de este resource server (resource)
+#   - Los AS autorizados para emitir tokens (authorization_servers)
+#   - Los scopes soportados (scopes_supported)
+#
+# Esto es parte del flujo de autorización de MCP: el cliente obtiene esta
+# metadata, descubre qué AS debe usar, solicita un token con los scopes
+# adecuados, y luego lo presenta al MCP Server.
+
+
+def build_protected_resource_routes() -> list:
+    """Construye las rutas de Protected Resource Metadata (RFC 9728).
+
+    Returns:
+        Lista de rutas Starlette para agregar a la aplicación.
+
+    Uso:
+        app = Starlette(routes=[
+            *build_protected_resource_routes(),
+            Mount("/", app=mcp_app),
+        ])
+    """
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    # Si no hay public URL, usar localhost (para desarrollo)
+    public_url = config.MCP_PUBLIC_URL
+    if not public_url:
+        # Inferir desde MCP_ISSUER (que siempre tiene un valor default)
+        # o usar http://localhost:{MCP_PORT}
+        public_url = config.MCP_ISSUER or f"http://localhost:{config.MCP_PORT}"
+        logger.info(
+            "MCP_PUBLIC_URL no está configurado. "
+            "Usando %s para Protected Resource Metadata.",
+            public_url
+        )
+
+    # La URL canónica de este resource server
+    resource_url = public_url.rstrip("/")
+
+    # Los AS que pueden emitir tokens para este RS
+    authorization_servers: list[str] = []
+    if config.MCP_JWKS_URI:
+        # Si tenemos JWKS URI, inferimos el AS desde ahí
+        # (en OIDC, el JWKS URI suele ser {issuer}/.well-known/jwks.json)
+        authorization_servers.append(config.MCP_ISSUER)
+    else:
+        # Sin JWKS configurada, no podemos anunciar un AS.
+        # En desarrollo con token fijo, esto es aceptable.
+        logger.info(
+            "No hay authorization_servers configurados (esperado en desarrollo). "
+            "La Protected Resource Metadata se publicará con lista vacía."
+        )
+
+    metadata_payload: dict[str, Any] = {
+        "resource": resource_url,
+        "authorization_servers": authorization_servers,
+        "scopes_supported": config.MCP_SCOPES_SUPPORTED,
+        "bearer_methods_supported": ["header"],
+    }
+
+    async def protected_resource_metadata(request):
+        """Sirve la Protected Resource Metadata (RFC 9728)."""
+        if request.method == "OPTIONS":
+            from starlette.responses import Response
+
+            return Response(status_code=204)
+
+        return JSONResponse(
+            content=metadata_payload,
+            media_type="application/json",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        )
+
+    return [
+        Route(
+            "/.well-known/oauth-protected-resource",
+            endpoint=protected_resource_metadata,
+            methods=["GET", "OPTIONS"],
+        ),
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CORS ASGI middleware
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Necesario para que el MCP Playground (web) pueda conectar desde el
+# navegador.  Sin CORS, el navegador bloquea las peticiones cross-origin.
+
+
+class CORSAsgiMiddleware:
+    """ASGI wrapper que añade cabeceras CORS a todas las respuestas.
+
+    Permite peticiones cross-origin desde cualquier origen (necesario
+    para el MCP Playground web).  Maneja preflight OPTIONS.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        # ⚠️ CRÍTICO: Pasar el lifespan directamente al app interno sin filtrar
+        # para que FastMCP gestione su inicialización correctamente
+        if scope["type"] == "lifespan":
+            await self._app(scope, receive, send)
+            return
+
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        # ── Preflight OPTIONS ────────────────────────────────────────
+        if scope["method"] == "OPTIONS":
+            headers = [
+                (b"access-control-allow-origin", b"*"),
+                (b"access-control-allow-methods", b"GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+                (b"access-control-allow-headers", b"Content-Type, Authorization, Accept, X-Requested-With"),
+                (b"access-control-max-age", b"86400"),
+                (b"content-length", b"0"),
+            ]
+            response = b"HTTP/1.1 204 No Content\r\n"
+            for name, value in headers:
+                response += name + b": " + value + b"\r\n"
+            response += b"\r\n"
+            await send({
+                "type": "http.response.start",
+                "status": 204,
+                "headers": headers,
+            })
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        # ── Request normal: interceptar send para añadir CORS ────────
+        original_send = send
+
+        async def cors_send(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"access-control-allow-origin", b"*"))
+                headers.append((b"access-control-allow-headers", b"Content-Type, Authorization, Accept"))
+                headers.append((b"access-control-allow-methods", b"GET, POST, PUT, PATCH, DELETE, OPTIONS"))
+                message["headers"] = headers
+            await original_send(message)
+
+        await self._app(scope, receive, cors_send)

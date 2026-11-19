@@ -158,3 +158,14 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Interfaz de usuario**: Página de chat Q&A en el website público (`uis/website/app/rag/page.tsx`) para coordinadores de HealthCore. También UI HTML embebida en el propio servidor standalone.
 - **Evaluación**: 8 queries de prueba en `data/eval/test-queries.json` cubriendo los 4 documentos. KPI: Recall@3 ≥ 80%, Faithfulness 100%, Threshold coverage 100%.
 - **Tests**: 26 tests unitarios en `tests/pipelines/test_rag.py` cubriendo chunking, embedding, retrieval, generación y validación de modelos.
+
+13. **MCP Server — OAuth-protected tools (Dec 2026 v1.0.0)**
+- **Servidor MCP** que expone los módulos de Incidencias e Inventario como 10 herramientas MCP (Model Context Protocol), protegidas con OAuth 2.1 Resource Server vía MCP Auth (mcpauth). Autenticación activada por defecto con token dev fijo.
+- **Herramientas de Incidencias (5)**: `get_incident`, `list_incidents`, `create_incident`, `update_incident_status` (usa endpoint de ciclo de vida `PATCH /api/incidents/{id}/status`), `get_incident_summary`.
+- **Herramientas de Inventario (5)**: `get_product`, `list_products` (lectura), `create_product`, `update_product`, `delete_product` (las 3 de escritura devuelven error controlado `INVENTORY_READ_ONLY` — rechazo explícito, RETO 2).
+- **OAuth v1.0.0**: SelectiveBearerASGI wrapper que mantiene `/.well-known/` y `/health` públicos, protege `/mcp` con Bearer JWT. Soporta JWKS (producción), token fijo de desarrollo (`hc_dev_token_no_usar_en_produccion`), y modo skip. 401 Unauthorized si falta token o es inválido.
+- **Scopes**: `incidents.read`, `incidents.write`, `inventory.read`, `inventory.write` — mínimo privilegio por tool. Variable `MCP_DEV_TOKEN_SCOPES` asigna TODOS los scopes en desarrollo si no está configurado (permisivo para dev sin IDP real).
+- **Logging con auditoría**: Cada invocación de tool genera log `"Tool OK/ERROR/DENIED | tool=<name> | client=<sub> | ..."` donde `client=<sub>` es el subject del token validado. Acceso al auth_info desde funciones de tool via ContextVar (`get_auth_info()`).
+- **Integración LangGraph**: El agente de soporte migró de HTTP directo a MCP Client usando `langchain-mcp-adapters`. Los nodos del grafo se convirtieron a `async def` con `await tool.ainvoke()`.
+- **Validación completa**: 9/9 tests de autenticación pasan. Auth_info accesible en contexto async. Logging incluye cliente. Scopes se validan por tool. MCP_SKIP_AUTH produce warning si está activado.
+- **Documentación**: `mcp-server.md` — arquitectura completa, setup, tools, OAuth flow, logging con cliente, contextvars, códigos de error, migración del agente, testing. README.md / README.es.md actualizados con startup sin `MCP_SKIP_AUTH=1`.

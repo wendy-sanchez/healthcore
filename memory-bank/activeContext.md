@@ -1,5 +1,23 @@
 # Active Context
 
+## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
+- **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
+- **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.
+- **Corrección**: Al construir `MCPAuth`, pasar nuestro `_auth_info_context` como `context_var`:
+  ```python
+  from mcps.auth import _auth_info_context as _mcp_auth_ctx
+  mcp_auth = MCPAuth(server=auth_server_config, context_var=_mcp_auth_ctx)
+  ```
+  Así mcpauth escribe en el mismo ContextVar que leen nuestras funciones.
+- **Limpieza**: Se eliminó el `send_wrapper` en `SelectiveBearerASGI` que intentaba (sin éxito) leer `scope["state"]["auth_info"]` para propagarlo al ContextVar — mcpauth nunca escribe en `scope["state"]`, solo en su ContextVar.
+- **Tests**: Se reemplazó `test_client_subject_in_error_response` (que solo verificaba HTTP 200) por `test_tool_call_with_valid_token_returns_result` que:
+  - Verifica HTTP 200 real con `result` en el body SSE (no error de auth)
+  - Verifica que el log contenga `client=dev-agent` via `caplog`
+  - Se agregó `test_tool_call_fails_without_token` para verificar 401 real
+  - **10/10 tests pasan**
+- **Archivos modificados**: `mcps/server.py` (pasar context_var a MCPAuth), `mcps/auth.py` (eliminar send_wrapper, actualizar docstring), `tests/test_mcp_server_auth.py` (test robusto con caplog).
+- **Branch**: `feature/mcp-oauth-tools`.
+
 ## Agente de Soporte LangGraph — HealthCore — Part 2: External Tools (2026-11-15)
 - **Entregable**: Extensión del agente de soporte LangGraph con **tools externas** que consultan datos operativos en tiempo real (gestor de incidentes + gestor de inventario). El agente decide automáticamente si necesita RAG, tool(s) o ambos, sin que el usuario lo especifique.
 - **Stack**: `langgraph v1.2.22`, `langgraph-checkpoint v4.3.2`, Python 3.14, `uv 0.13.5`, `httpx 0.28.1`. La lógica RAG existente se reutiliza sin modificar.
@@ -576,3 +594,63 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 - Website público (uis/website) como aplicación Next.js independiente.
 - Scripts de análisis de datos (scripts/analyze.py, seed_incidents.py).
 - Estructuras preparadas para escalado: agents/, skills/, workflows/, docs/, infra/.
+
+---
+
+## MCP Server — HealthCore MCP OAuth Tools (2026-12)
+
+### Estado actual
+- **Completado**: Servidor MCP con FastMCP v1 + mcpauth Resource Server + SelectiveBearerASGI.
+- **Completado**: 10 tools MCP (5 incidents + 5 inventory) con scopes, descripciones claras y schemas.
+- **Completado**: Rechazo explícito de escritura en inventario (RETO 2) — `create_product`, `update_product`, `delete_product` devuelven `INVENTORY_READ_ONLY`.
+- **Completado**: OAuth 2.1 funcional — JWKS (producción), token fijo (dev), skip (testing).
+- **Completado**: Bug corregido en `config.py` — lógica de scopes invertida (`if os.getenv("MCP_SKIP_AUTH")` → `if not`).
+- **Completado**: `update_incident_status` usa endpoint de ciclo de vida específico (`PATCH /api/incidents/{id}/status`).
+- **Completado**: Logging por invocación con `_serialize_result()` — formato `"Tool OK | tool=... | client=<sub> | success=true"`.
+- **Completado**: Códigos de error diferenciados (HTTP 401 missing_auth_header, invalid_token; HTTP 403 missing_required_scopes; HTTP 500 server_error).
+- **Completado**: Integración LangGraph con langchain-mcp-adapters — `services/agent/tools/mcp_client.py` con cache, 6 funciones async.
+- **Completado**: Migración del grafo a async — nodos `async def`, `load_mcp_tools(session=session)`, `await tool.ainvoke()`.
+- **Completado**: DNS Rebinding fix — `TransportSecuritySettings(enable_dns_rebinding_protection=False)`.
+- **Completado**: MCP Playground conectado exitosamente — `tools/list` (10 tools), `tools/call` (rechazo escritura), CORS preflight (204).
+- **Completado**: Documentación en `mcp-server.md` — arquitectura, setup, tools, OAuth flow, migración, testing.
+- **Completado**: Archivos legacy deprecados con `DeprecationWarning` (`services/agent/tools/incidents.py`, `inventory.py`).
+- **Completado (v1.0.0)**: ContextVar-based auth_info propagation — `get_auth_info()` / `set_auth_info()` para acceso al cliente (`sub`) desde funciones de tool de FastMCP.
+- **Completado (v1.0.0)**: Logging con identificación de cliente — format `"Tool OK/ERROR/DENIED | tool=... | client=<sub> | ..."` para auditoría completa.
+- **Completado (v1.0.0)**: Scopes por defecto — `MCP_DEV_TOKEN_SCOPES` asigna TODOS los scopes en desarrollo si no está configurado (permisivo para dev sin IDP real).
+- **Completado (v1.0.0)**: Validación de inicio — warnings claros si `MCP_SKIP_AUTH=1` está activado en producción con clientes remotos.
+- **Completado (v1.0.0)**: Verificación completa — 9/9 tests de autenticación pasan; auth_info accesible en contexto de tool; logging incluye cliente.
+
+### Bugs encontrados y corregidos
+1. **Scopes invertidos** (`mcps/config.py`): `if os.getenv("MCP_SKIP_AUTH")` en lugar de `if not os.getenv("MCP_SKIP_AUTH")`. En producción (sin `MCP_SKIP_AUTH`), `required_scopes` quedaba vacío y el middleware aceptaba cualquier request sin token. Corregido.
+2. **DNS Rebinding** (`mcps/server.py`): FastMCP activa protección anti-DNS rebinding para localhost por defecto, lo que rechaza Host headers de túneles (localtunnel). Corregido con `TransportSecuritySettings(enable_dns_rebinding_protection=False)`.
+3. **CORS preflight** (`mcps/server.py`): FastMCP no respondía OPTIONS correctamente. Corregido asegurando que SelectiveBearerASGI pase requests OPTIONS sin intervención del middleware Bearer.
+4. **Auth_info context propagation** (`mcps/auth.py`, `mcps/server.py`): FastMCP ejecuta funciones de tool en contexto async profundo donde el request no es accesible. Corregido con Python `contextvars.ContextVar` que captura auth_info en SelectiveBearerASGI y lo propaga a través del async stack. Funciones `_current_client()` y `_require_tool_scope()` usan `get_auth_info()`.
+5. **Logging sin cliente** (`mcps/server.py`): El formato de log original `"Tool OK | tool=... | success=..."` no incluía el cliente (sub del token). Actualizado a `"Tool OK/ERROR/DENIED | tool=... | client=<sub> | ..."` para auditoría completa.
+
+### Acceptance criteria (9/9)
+- AC-1: Paquete `mcps/` existe con `__init__.py`, `server.py`, `auth.py`, `config.py`, `tools.py` ✅
+- AC-2: OAuth enforcement funcional (SelectiveBearerASGI + mcpauth bearer middleware) ✅
+- AC-3: `update_incident_status` usa endpoint de ciclo de vida (`PATCH /api/incidents/{id}/status`) ✅
+- AC-4: Inventory read-only con rechazo explícito (3 tools con error `INVENTORY_READ_ONLY`) ✅
+- AC-5: Clear descriptions y argument schemas en todas las tools ✅
+- AC-6: Códigos de error diferenciados por escenario (401/403/500 + error code string) ✅
+- AC-7: Log per invocation con tool name y success/failure ✅
+- AC-8: Agent usa MCP Client con langchain-mcp-adapters (no HTTP directo) ✅
+- AC-9: MCP Playground / Public URL funcional (10 tools listables, write rejection, CORS) ✅
+
+### Archivos clave
+- `mcps/server.py` — FastMCP app composition
+- `mcps/auth.py` — OAuth middleware, SelectiveBearerASGI
+- `mcps/config.py` — Config, McpMode, compute_required_scopes
+- `mcps/tools.py` — 10 tools MCP
+- `services/agent/tools/mcp_client.py` — MCP Client con langchain-mcp-adapters
+- `docs/mcp-server.md` — Documentación completa
+- `services/agent/graph.py` — Grafo migrado a async con MCP Client
+
+### Documentación
+- `mcp-server.md` — Documentación técnica completa del MCP Server
+- `mcps/README.md` / `mcps/README.es.md` — Documentación del paquete
+
+### URL pública (Playground)
+- `https://congenial-pancake-gxq77rxwr56q3v7x4-9100.app.github.dev/mcp`
+- Verificada con `tools/list` → 10 tools, `tools/call` → write rejection, CORS preflight → 204

@@ -500,3 +500,120 @@ La API principal (`services/api/main.py`) no arranca en Python 3.14 por incompat
 ### Comandos
 - Entrenar y generar artefactos: `uv run scripts/train_sales_forecast.py` (o `uv run python scripts/train_sales_forecast.py`).
 - Tests del split: `uv run pytest tests/pipelines/test_sales_forecast_split.py -v`.
+
+---
+
+## MCP Server — HealthCore MCP OAuth Tools (mcps/)
+
+### Stack técnico
+- **Python 3.14**, gestionado con `uv` (pyproject.toml raíz).
+- **Dependencias**: `mcp>=1.24.0,<2`, `mcpauth>=0.1.0`, `fastmcp>=1.0.0`, `httpx`, `pydantic`.
+- **langchain-mcp-adapters v0.3.2** en `services/agent/tools/mcp_client.py` (convierte tools MCP a BaseTool de LangChain).
+- **Uvicorn 0.54.0** con `--http h11 --forwarded-allow-ips '*'`.
+
+### Estructura de archivos
+
+```
+mcps/
+├── __init__.py              # Paquete
+├── server.py                # FastMCP app + SelectiveBearerASGI composition
+├── auth.py                  # build_auth_server_config(), build_bearer_middleware(), SelectiveBearerASGI, ContextVar auth_info
+├── config.py                # Configuración de entorno (MCP_DEV_TOKEN_SCOPES por defecto)
+├── tools.py                 # 10 tools MCP (5 incidents + 5 inventory)
+├── README.md                # EN documentation
+└── README.es.md             # ES documentation
+
+services/agent/tools/
+├── mcp_client.py            # MCP Client con langchain-mcp-adapters (async, cache)
+├── incidents.py             # DEPRECATED (legacy HTTP direct)
+├── inventory.py             # DEPRECATED (legacy HTTP direct)
+└── __init__.py              # Actualizado para reflejar MCP Client
+
+docs/
+└── mcp-server.md            # Documentación completa del MCP Server
+```
+
+### Componentes clave
+
+| Componente | Archivo | Propósito |
+|---|---|---|
+| **FastMCP v1** | `mcps/server.py` | Servidor MCP con `stateless_http=True`, Streamable HTTP. 10 tools registradas con `@mcp.tool()`. |
+| **mcpauth** | `mcps/auth.py` | `MCPAuth(server=AuthServerConfig)` en modo Resource Server. `bearer_auth_middleware()` para validación JWT. |
+| **SelectiveBearerASGI** | `mcps/auth.py` | Wrapper ASGI que aplica Bearer solo en rutas protegidas y propaga auth_info via ContextVar. |
+| **ContextVar auth_info** | `mcps/auth.py` | `get_auth_info()` / `set_auth_info()` — permite acceso al auth_info desde funciones de tool de FastMCP. |
+| **Config** | `mcps/config.py` | Variables de entorno. `MCP_DEV_TOKEN_SCOPES` asigna TODOS los scopes por defecto si no está configurado. |
+| **Tools** | `mcps/tools.py` | 10 funciones decoradas con `@mcp.tool()`. Incidencias (5): consulta real. Inventario (5): 2 lectura + 3 rechazo explícito. |
+| **MCP Client** | `services/agent/tools/mcp_client.py` | `load_mcp_tools(session=session)` → `_tools_cache`. 6 funciones asíncronas que envuelven tools MCP. |
+
+### Variables de entorno
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `MCP_HOST` | `0.0.0.0` | Host de escucha |
+| `MCP_PORT` | `9100` | Puerto |
+| `MCP_TRANSPORT` | `streamable-http` | Transporte MCP |
+| `MCP_PUBLIC_URL` | — | URL pública para el issuer (se infiere desde MCP_ISSUER o localhost si falta) |
+| `MCP_ISSUER` | `MCP_PUBLIC_URL` o `http://localhost:9100` | Issuer esperado en JWT |
+| `MCP_JWKS_URI` | — | URI del JWKS endpoint (producción con validación JWT) |
+| `MCP_SKIP_AUTH` | — | ⚠️ `1` para deshabilitar OAuth (NUNCA en producción ni con clientes remotos). Log WARNING si está activado. |
+| `MCP_DEV_TOKEN` | `hc_dev_token_no_usar_en_produccion` | Token fijo para desarrollo |
+| `MCP_DEV_TOKEN_SCOPES` | (todos los scopes) | Scopes del token dev. Si no está configurado, se asignan todos (modo permisivo para desarrollo). |
+| `INCIDENTS_API_URL` | `http://incidents-backend:8010` | Incidents API |
+| `INVENTORY_API_URL` | `http://backend:8000` | Inventory API |
+| `AGENT_JWT_TOKEN` | — | JWT para inventario interno |
+| `MCP_SERVER_URL` | `http://mcp-server:9100` | URL del MCP Server (para el cliente) |
+| `MCP_AGENT_TOKEN` | — | Bearer JWT del agente contra MCP Server |
+
+### OAuth Flow
+
+```
+Cliente MCP → GET /.well-known/oauth-protected-resource (público, sin auth)
+            ← authorization_servers, scopes_supported
+Cliente MCP → POST /mcp + Authorization: Bearer <JWT>
+            → SelectiveBearerASGI → mcpauth.bearer_auth_middleware()
+            → valida: issuer, signature (JWKS), exp, scopes
+            → auth_info se propaga a ContextVar (get_auth_info())
+            → FastMCP (stateless_http) → tool execution
+            → Log: Tool OK/ERROR/DENIED | tool=... | client=<sub> | ...
+```
+
+### Comandos
+
+```bash
+# Arranque local (autenticación activada, token dev)
+uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100
+
+# Probar tools/list (con token dev)
+curl -X POST http://localhost:9100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer hc_dev_token_no_usar_en_produccion" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# Probar sin token (401 Unauthorized)
+curl -X POST http://localhost:9100/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# Metadata RFC 9728 (público, sin auth)
+curl http://localhost:9100/.well-known/oauth-protected-resource
+
+# Tests de autenticación
+uv run pytest tests/test_mcp_server_auth.py -v
+```
+
+### Decisiones técnicas clave
+
+| Decisión | Opción | Motivo |
+|---|---|---|
+| **OAuth** | MCP Auth (mcpauth) modo Resource Server | Alineado con especificación MCP Auth; desacoplado de FastMCP; soporta OIDC; scopes por tool |
+| **Transporte** | Streamable HTTP (`stateless_http=True`) | Un solo endpoint HTTP; múltiples clientes simultáneos; sin estado de sesión |
+| **Auth wrapper** | SelectiveBearerASGI (ASGI puro) | Preserva lifespan de FastMCP; evita Starlette Mount que rompe session manager |
+| **ContextVar auth_info** | `get_auth_info()` / `set_auth_info()` | Las funciones de tool pueden acceder al auth_info del request actual sin pasar request explícitamente |
+| **Scopes por defecto** | Todos si `MCP_DEV_TOKEN_SCOPES` vacío | Desarrollo fluido sin IDP real; se personaliza en producción |
+| **Logging** | `Tool OK/ERROR/DENIED \| tool=... \| client=<sub> \| ...` | Auditoría completa con subject del token validado |
+| **Rechazo escritura** | Tools existen + error controlado | RETO 2: el cliente no debe recibir "tool not found" |
+| **Integración LangGraph** | langchain-mcp-adapters | Convierte tools MCP a BaseTool de LangChain; integración nativa con LangGraph |
+| **DNS Rebinding** | `TransportSecuritySettings(enable_dns_rebinding_protection=False)` | FastMCP bloquea Host headers de túneles por defecto; se deshabilita para proxies reversos legítimos |
+

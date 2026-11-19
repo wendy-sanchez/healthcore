@@ -2,6 +2,50 @@
 
 ## Estado actual del desarrollo
 
+### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
+- **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.
+- **Problemas resueltos**:
+  1. **Lifespan de FastMCP**: `SelectiveBearerASGI` ahora pasa el `scope["type"] == "lifespan"` directamente a `_public_app` sin filtrar Bearer Auth. Esto evita `RuntimeError: Task group is not initialized` y permite que el `StreamableHTTPSessionManager` se inicialice correctamente.
+  2. **Logging con cliente (subject)**: Todos los logs de invocación (`Tool OK`, `Tool ERROR`, `Tool DENIED`) ahora incluyen `client=<sub>` donde `<sub>` es el subject extraído del token validado. Formato normalizado: `Tool OK | tool=<name> | client=<sub> | success=true`, etc.
+  3. **Scopes por defecto completos**: `MCP_DEV_TOKEN_SCOPES` asigna **TODOS los scopes** si no está configurado explícitamente. Esto permite desarrollo sin IDP real. Se puede personalizar con `MCP_DEV_TOKEN_SCOPES="incidents.read inventory.read"` para verificar mínimo privilegio.
+  4. **Metadata pública (RFC 9728)**: `build_protected_resource_routes()` publica `/`.well-known/oauth-protected-resource` siempre, incluso sin `MCP_PUBLIC_URL` (infiere desde `MCP_ISSUER` o localhost).
+  5. **Validación de MCP_SKIP_AUTH**: Advertencia logging claro si se establece `MCP_SKIP_AUTH=1` — nunca debe usarse con Playground o clientes remotos.
+- **Autenticación por defecto activada** (a menos que `MCP_SKIP_AUTH=1`):
+  - ✅ Sin token → `HTTP 401 Unauthorized` (missing_auth_header)
+  - ✅ Token inválido → `HTTP 401 Unauthorized` (invalid_token)
+  - ✅ Token válido → `HTTP 200 OK` + 10 tools listadas
+  - ✅ Token sin scope requerido → Herramienta rechazada con `Tool DENIED | missing_scope=...`
+- **Scopes requeridos por tool**:
+  - `get_incident`, `list_incidents`, `get_incident_summary`: `incidents.read`
+  - `create_incident`, `update_incident_status`: `incidents.write`
+  - `get_product`, `list_products`: `inventory.read`
+  - `create_product`, `update_product`, `delete_product`: `inventory.write` (devuelven error controlado: "inventario solo lectura")
+- **Token dev para desarrollo**:
+  - `MCP_DEV_TOKEN=hc_dev_token_no_usar_en_produccion` (default)
+  - `MCP_DEV_TOKEN_SCOPES=incidents.read incidents.write inventory.read inventory.write` (default: todos)
+- **Archivos modificados**:
+  - `mcps/server.py`: Logging con `client=<sub>` en `_serialize_result()` y `_require_tool_scope()`. Advertencia `MCP_SKIP_AUTH` al inicio.
+  - `mcps/auth.py`: `SelectiveBearerASGI` maneja lifespan correctamente. `build_bearer_middleware()` elige modo JWT o dev según `MCP_JWKS_URI`. `build_protected_resource_routes()` publica metadata RFC 9728.
+  - `mcps/config.py`: `MCP_DEV_TOKEN_SCOPES` asigna todos los scopes por defecto. `MCP_REQUIRED_SCOPES` vacío (autorización granular por tool).
+  - `mcp-server.md`: Documentación de setup, variables de entorno, logging, formato de logs con cliente. Tablas de tools con scopes requeridos.
+  - `tests/test_mcp_server_auth.py`: 9 tests (autenticación, autorización, metadata, logging con cliente, MCP_SKIP_AUTH por defecto deshabilitado).
+- **Tests**: **9/9 pasan** (`uv run pytest tests/test_mcp_server_auth.py -v`).
+  - `test_missing_token_returns_401`: Sin token → 401
+  - `test_invalid_token_returns_401`: Token inválido → 401
+  - `test_valid_token_tools_list_200`: Token válido → 200 + 10 tools
+  - `test_protected_resource_metadata_public_200`: Metadata sin auth → 200
+  - `test_bearer_auth_method_in_metadata`: Metadata contiene `bearer_auth_method`
+  - `test_all_scopes_in_metadata`: Metadata lista todos los 4 scopes
+  - `test_client_subject_in_error_response`: Error incluye `subject` del token (logging)
+  - `test_scopes_format_in_metadata`: Formato de scopes correcto en metadata
+  - `test_skip_auth_not_enabled_by_default`: `MCP_SKIP_AUTH` no está activado por defecto
+- **Validación manual en Playground**:
+  - Arrancar servidor: `uv run uvicorn mcps.server:app --host 0.0.0.0 --port 9100`
+  - Conectar Playground MCP a `http://localhost:9100/mcp` con token: `hc_dev_token_no_usar_en_produccion`
+  - Sin token: `401 Unauthorized`
+  - Con token: lista las 10 tools + logs en servidor con `client=dev-agent`
+- **Branch**: `feature/mcp-oauth-tools` (completada).
+
 ### Agente de Soporte LangGraph — HealthCore (2026-11-15) — Part 2: External Tools
 - **Completado**: Extensión del agente LangGraph con 2 tools externas que consultan sistemas operativos reales (incidentes e inventario).
 - **Completado**: `services/agent/tools/__init__.py` — helper `_get_service_url(env_var, default)` para resolver URLs desde entorno con fallback.
@@ -336,3 +380,61 @@
 12. **Pronóstico de ventas — automatizar la reejecución**: encadenar `scripts/train_sales_forecast.py` al proceso nocturno o a un cron mensual para que la banda y las métricas se refresquen con los datos nuevos, y versionar `metrics.json` para detectar degradación entre ejecuciones.
 13. **Pronóstico de ventas — incorporar variables exógenas**: altas de clínica, campañas de captación y cambios de tarifa explicarían parte del error residual que hoy queda en la banda.
 14. **Pronóstico de ventas — comparar contra un baseline**: un modelo sencillo (media móvil o regresión lineal con estacionalidad) como referencia haría el informe defendible también en la dirección contraria ("¿de verdad necesitamos XGBoost?").
+
+### MCP Server — HealthCore MCP OAuth Tools (2026-12) — Completado
+- **Completado**: Servidor MCP con FastMCP v1 (stateless_http=True), mcpauth Resource Server, SelectiveBearerASGI.
+- **Completado**: 10 tools MCP — Incidencias (5: get_incident, list_incidents, create_incident, update_incident_status vía PATCH /status, get_incident_summary) + Inventario (5: 2 lectura + 3 rechazo explícito de escritura con `INVENTORY_READ_ONLY`).
+- **Completado**: OAuth 2.1 con 4 scopes de mínimo privilegio (`incidents.read`, `incidents.write`, `inventory.read`, `inventory.write`). Soporte JWKS (producción), token fijo (dev), skip (testing).
+- **Completado**: `mcps/config.py` con `McpMode` enum, `compute_required_scopes()`, bug corregido (lógica de scopes invertida).
+- **Completado**: `SelectiveBearerASGI` wrapper ASGI que preserva lifespan de FastMCP — rutas públicas (`/.well-known/`, `/health`) y protegidas (`/mcp`) separadas.
+- **Completado**: `update_incident_status` usa endpoint de ciclo de vida específico (`PATCH /api/incidents/{id}/status`), no PATCH genérico.
+- **Completado**: Logging por invocación — formato `"Tool OK | tool=... | success=true"` / `"Tool ERROR | tool=... | success=false | error=..."`.
+- **Completado**: Códigos de error diferenciados: 401 missing_auth_header, 401 invalid_token, 403 missing_required_scopes, 500 server_error.
+- **Completado**: Integración LangGraph — migración de HTTP directo a MCP Client vía `langchain-mcp-adapters` (`load_mcp_tools()`). Nodos convertidos a `async def` con `await tool.ainvoke()`.
+- **Completado**: `services/agent/tools/mcp_client.py` — módulo MCP Client con cache de tools (`_tools_cache`), 6 funciones async que envuelven tools MCP.
+- **Completado**: DNS Rebinding fix — `TransportSecuritySettings(enable_dns_rebinding_protection=False)` para permitir túneles (Codespaces, localtunnel).
+- **Completado**: CORS preflight — OPTIONS requests pasan sin middleware Bearer.
+- **Completado**: MCP Playground conectado — `tools/list` (10 tools), `tools/call` (write rejection: `{"error": "read_only", "success": false}`), CORS preflight (204 con `access-control-allow-origin: *`).
+- **Completado**: Documentación en `mcp-server.md` (~550 líneas) — arquitectura, setup, tools, OAuth flow, migración del agente, testing.
+- **Completado (2026-11-18)**: Bugfix ContextVar desincronizado — mcpauth guardaba AuthInfo en su propio ContextVar y `_require_tool_scope()` leía de otro. Fix: pasar `_auth_info_context` como `context_var` a `MCPAuth`. Se eliminó `send_wrapper` obsoleto en `SelectiveBearerASGI`.
+- **Completado (2026-11-18)**: Test robusto `test_tool_call_with_valid_token_returns_result` que verifica resultado real de la tool + log `client=dev-agent` via caplog. `test_tool_call_fails_without_token` añadido para verificar 401 real.
+- **Completado**: Archivos legacy deprecados con `DeprecationWarning` (incidents.py, inventory.py).
+- **Completado**: 9/9 acceptance criteria verificados contra código fuente + Playground.
+- **Completado**: README.md y README.es.md revisados — ya contienen información completa, no requieren cambios.
+- **Tests**: **10/10 pasan** (`uv run pytest tests/test_mcp_server_auth.py -v`). Se agregó verificación de resultado real de tool y log de cliente.
+- **Branch**: `feature/mcp-oauth-tools`.
+
+### Bugs encontrados y corregidos durante el desarrollo
+
+| Bug | Archivo | Síntoma | Causa | Fix |
+|-----|---------|---------|-------|-----|
+| Scopes invertidos | `mcps/config.py` | En producción, `required_scopes` vacío → middleware aceptaba requests sin token | `if os.getenv("MCP_SKIP_AUTH"):` en lugar de `if not os.getenv("MCP_SKIP_AUTH"):` | Invertir condición |
+| DNS Rebinding | `mcps/server.py` | Localtunnel/Codespaces rechazados con 400 Bad Request | FastMCP activa protección anti-DNS rebinding para localhost por defecto | `transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)` |
+| CORS preflight | `mcps/server.py` | `tools/call` desde Playground fallaba con error CORS | FastMCP no respondía OPTIONS; el middleware Bearer interceptaba y rechazaba | SelectiveBearerASGI pasa OPTIONS sin middleware Bearer |
+| ContextVar desincronizado (2026-11-18) | `mcps/server.py`, `mcps/auth.py` | `tools/list` funciona con token válido, `tools/call` falla con `PermissionError("Autenticación requerida")`. Tests existentes no lo detectan (solo verifican HTTP 200). | mcpauth guarda `AuthInfo` en su propio `ContextVar` interno (`mcp_auth_context`). `_require_tool_scope()` lee desde `_auth_info_context` — dos ContextVars distintos. El `send_wrapper` que intentaba leer `scope["state"]["auth_info"]` nunca funciona porque mcpauth no escribe ahí. | Pasar `_auth_info_context` como `context_var` a `MCPAuth(server=..., context_var=_auth_info_context)`. Eliminar `send_wrapper`. Test nuevo verifica resultado real de la tool + log con `client=dev-agent`. 10/10 tests. |
+
+### Archivos creados/modificados
+- `mcps/__init__.py` — Paquete
+- `mcps/server.py` — FastMCP app + ASGI composition
+- `mcps/auth.py` — OAuth middleware + SelectiveBearerASGI
+- `mcps/config.py` — Config + McpMode
+- `mcps/tools.py` — 10 tools MCP
+- `mcps/README.md` + `mcps/README.es.md` — Documentación del paquete
+- `services/agent/tools/mcp_client.py` — MCP Client (nuevo)
+- `services/agent/tools/incidents.py` — DEPRECATED (actualizado)
+- `services/agent/tools/inventory.py` — DEPRECATED (actualizado)
+- `services/agent/tools/__init__.py` — Actualizado
+- `services/agent/graph.py` — Migrado a async con MCP Client
+- `docs/mcp-server.md` — Documentación completa (~550 líneas)
+- `tests/pipelines/test_agent_graph.py` — Tests actualizados con patches async
+
+### Acceptance criteria (9/9)
+- AC-1 ✅ Paquete `mcps/` existe (`__init__.py`, `server.py`, `auth.py`, `config.py`, `tools.py`)
+- AC-2 ✅ OAuth enforcement (SelectiveBearerASGI + mcpauth bearer middleware)
+- AC-3 ✅ `update_incident_status` usa `PATCH /api/incidents/{id}/status`
+- AC-4 ✅ Inventory read-only con rechazo explícito (3 tools: `INVENTORY_READ_ONLY`)
+- AC-5 ✅ Descripciones y schemas claros en todas las tools
+- AC-6 ✅ Códigos de error diferenciados (401/403/500 + error code string)
+- AC-7 ✅ Log per invocation (tool name + success/failure)
+- AC-8 ✅ Agent usa MCP Client con langchain-mcp-adapters
+- AC-9 ✅ MCP Playground / Public URL funcional (10 tools, write rejection, CORS)
