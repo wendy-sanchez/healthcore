@@ -161,7 +161,7 @@ class TestGraphCompilation:
         assert hasattr(agent_graph, "nodes")
 
     def test_graph_has_all_expected_nodes(self):
-        """Deben existir todos los nodos del diseño (Parte 1 + Parte 2)."""
+        """Deben existir todos los nodos del diseño (Parte 1 + Parte 2 + Parte 3)."""
         from services.agent.graph import agent_graph
 
         expected_nodes = {
@@ -176,6 +176,10 @@ class TestGraphCompilation:
             "query_incident",
             "query_inventory",
             "synthesize_tool_answer",
+            # Parte 3 — Memoria
+            "load_memory_context",
+            "process_proposal",
+            "auto_evaluate_memory",
         }
         actual_nodes = set(agent_graph.nodes.keys())
         for node in expected_nodes:
@@ -214,19 +218,19 @@ class TestConditionalRouting:
         with pytest.raises(ValueError, match="demasiado corta"):
             await run_agent("ab")
 
-    def test_valid_question_routes_to_classify_query(self):
-        """Pregunta válida → classify_query debe ejecutarse (Parte 2)."""
+    def test_valid_question_routes_to_load_memory(self):
+        """Pregunta válida → load_memory_context debe ejecutarse primero (Parte 3)."""
         from services.agent.graph import agent_graph, build_initial_state
 
         state = build_initial_state("¿Cuál es la política de cancelación?")
         config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-        # Simular que receive_question pasó sin error y enruta a classify_query
+        # Simular que receive_question pasó sin error y enruta a load_memory_context
         from services.agent.graph import route_after_receive
 
         decision = route_after_receive(state)
-        assert decision == "classify_query", (
-            f"Esperaba 'classify_query' pero obtuve '{decision}'"
+        assert decision == "load_memory_context", (
+            f"Esperaba 'load_memory_context' pero obtuve '{decision}'"
         )
 
     def test_no_chunks_routes_to_respond_no_info(self):
@@ -869,3 +873,548 @@ class TestMixedSynthesis:
         assert "no pudo" in answer.lower() or "conectar" in answer.lower() or "incidente" in answer.lower(), (
             f"La respuesta debe reflejar el fallo de la tool. Respuesta: {answer[:200]}"
         )
+
+
+# ======================================================================
+# EVAL 10: Memoria — Auto-evaluación, Clasificación y PHI
+# ======================================================================
+
+
+class TestMemoryPHI:
+    """PHI validation: nunca debe entrar PHI en memoria."""
+
+    def test_phi_validate_clean_text(self):
+        """Texto sin PHI debe pasar validación."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe(
+            "El nuevo proceso de derivación en Manchester requiere formulario M-CDX2."
+        )
+        assert ok, f"No debió detectar PHI en texto limpio. Matches: {matches}"
+
+    def test_phi_rejects_name(self):
+        """Nombres completos deben ser detectados como PHI."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe(
+            "El paciente Juan Pérez tiene una cita el lunes."
+        )
+        assert not ok, f"Debió detectar PHI (nombre). Matches: {matches}"
+
+    def test_phi_rejects_ssn(self):
+        """SSN debe ser detectado como PHI."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe("SSN: 123-45-6789")
+        assert not ok, f"Debió detectar PHI (SSN). Matches: {matches}"
+
+    def test_phi_rejects_email(self):
+        """Email debe ser detectado como PHI."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe("Contacto: paciente@healthcore.com")
+        assert not ok, f"Debió detectar PHI (email). Matches: {matches}"
+
+    def test_phi_rejects_phone(self):
+        """Teléfono debe ser detectado como PHI."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe("Teléfono: 555-123-4567")
+        assert not ok, f"Debió detectar PHI (teléfono). Matches: {matches}"
+
+    def test_phi_rejects_patient_id(self):
+        """Identificador de paciente debe ser detectado como PHI."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe("MRN: 1234567")
+        assert not ok, f"Debió detectar PHI (MRN). Matches: {matches}"
+
+    def test_phi_empty_string_is_safe(self):
+        """Cadena vacía se considera segura."""
+        from services.agent.memory.store import validate_phi_safe
+
+        ok, matches = validate_phi_safe("")
+        assert ok
+        assert len(matches) == 0
+
+    def test_set_pending_rejects_phi(self):
+        """set_pending_proposal debe rechazar propuestas con PHI."""
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_pending_proposal,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        result = set_pending_proposal(
+            proposal="El paciente Juan Pérez tiene cita mañana.",
+            reason="test",
+            category="operational",
+            source_run_id="test_phi",
+            source_question="test",
+        )
+        assert result is None, "No debió guardar propuesta con PHI"
+        assert get_pending_proposal() is None, "No debe haber propuesta pendiente"
+        clear_pending_proposal()
+
+
+class TestMemoryStore:
+    """Operaciones CRUD sobre el almacén TinyDB."""
+
+    def setup_method(self):
+        from services.agent.memory.store import (
+            _get_db,
+            clear_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        # Limpiar facts de prueba
+        db = _get_db()
+        table = db.table("memory_facts")
+        table.truncate()
+
+    def test_add_and_get_fact(self):
+        """Añadir fact y recuperarlo."""
+        from services.agent.memory.store import add_fact, get_all_facts
+
+        fact = add_fact(
+            content="El nuevo proceso de derivación en Manchester requiere formulario M-CDX2.",
+            category="operational",
+            source_run_id="test_run_001",
+        )
+        assert fact is not None
+        assert "id" in fact
+        assert fact["category"] == "operational"
+
+        facts = get_all_facts()
+        assert len(facts) >= 1
+        assert any(f["content"] == fact["content"] for f in facts)
+
+    def test_add_fact_rejects_phi(self):
+        """add_fact debe rechazar hechos con PHI."""
+        from services.agent.memory.store import add_fact, get_all_facts
+
+        initial_count = len(get_all_facts())
+        result = add_fact(
+            content="Paciente: Juan Pérez, diagnóstico: diabetes.",
+            category="operational",
+            source_run_id="test_phi",
+        )
+        assert result is None, "add_fact debe retornar None cuando hay PHI"
+        assert len(get_all_facts()) == initial_count
+
+    def test_pending_proposal_singleton(self):
+        """Solo puede haber una propuesta pendiente."""
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_pending_proposal,
+            has_pending_proposal,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        assert not has_pending_proposal()
+
+        p1 = set_pending_proposal(
+            proposal="Primera propuesta.",
+            reason="test",
+            category="operational",
+            source_run_id="run_1",
+            source_question="test",
+        )
+        assert p1 is not None
+        assert has_pending_proposal()
+
+        p2 = set_pending_proposal(
+            proposal="Segunda propuesta (no debería guardarse).",
+            reason="test",
+            category="operational",
+            source_run_id="run_2",
+            source_question="test",
+        )
+        assert p2 is None, "No debe sobrescribir propuesta existente"
+
+        current = get_pending_proposal()
+        assert current["proposal"] == "Primera propuesta."
+
+        clear_pending_proposal()
+        assert not has_pending_proposal()
+
+    def test_get_facts_by_category(self):
+        """Recuperar facts filtrados por categoría."""
+        from services.agent.memory.store import add_fact, get_facts_by_category
+
+        add_fact(
+            content="Test operational fact.",
+            category="operational",
+            source_run_id="test_cat",
+        )
+        add_fact(
+            content="Test staff_preference fact.",
+            category="staff_preference",
+            source_run_id="test_cat",
+        )
+
+        op_facts = get_facts_by_category("operational")
+        assert len(op_facts) >= 1
+        for f in op_facts:
+            assert f["category"] == "operational"
+
+    def test_delete_fact(self):
+        """Eliminar un fact de memoria."""
+        from services.agent.memory.store import (
+            add_fact,
+            delete_fact,
+            get_all_facts,
+        )
+
+        fact = add_fact(
+            content="Fact para eliminar.",
+            category="operational",
+            source_run_id="test_del",
+        )
+        assert fact is not None
+        fact_id = fact["id"]
+
+        result = delete_fact(fact_id)
+        assert result is True
+
+        remaining = get_all_facts()
+        assert not any(f["id"] == fact_id for f in remaining)
+
+
+class TestMemoryClassifier:
+    """Clasificador de intención del usuario."""
+
+    def setup_method(self):
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        set_pending_proposal(
+            proposal="Test proposal for classification.",
+            reason="test",
+            category="operational",
+            source_run_id="test_cls",
+            source_question="test",
+        )
+
+    def teardown_method(self):
+        from services.agent.memory.store import clear_pending_proposal
+        clear_pending_proposal()
+
+    def test_classify_approve_si(self):
+        """"sí" debe clasificarse como approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("sí")
+        assert result.intent == "approve"
+
+    def test_classify_approve_ok(self):
+        """"ok, guárdalo" debe clasificarse como approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("ok, guárdalo")
+        assert result.intent == "approve"
+
+    def test_classify_reject_no(self):
+        """"no guardes" debe clasificarse como reject."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no guardes eso")
+        assert result.intent == "reject"
+
+    def test_classify_edit_mejor_dicho(self):
+        """"mejor dicho" debe clasificarse como edit."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("mejor dicho: el proceso cambió en Manchester y Leeds.")
+        assert result.intent == "edit"
+        assert result.edit_text is not None
+        assert "Leeds" in result.edit_text
+
+    def test_classify_discard_by_default(self):
+        """Mensaje ambiguo debe descartarse por defecto."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("¿qué hora es?")
+        assert result.intent == "discard"
+
+    def test_classify_no_proposal_when_none_pending(self):
+        """Sin propuesta pendiente debe retornar no_proposal."""
+        from services.agent.memory.classifier import classify_user_intent
+        from services.agent.memory.store import clear_pending_proposal
+
+        clear_pending_proposal()
+        result = classify_user_intent("sí")
+        assert result.intent == "no_proposal"
+        # Restaurar para teardown
+        from services.agent.memory.store import set_pending_proposal
+        set_pending_proposal(
+            proposal="Test proposal for classification.",
+            reason="test",
+            category="operational",
+            source_run_id="test_cls",
+            source_question="test",
+        )
+
+    def test_classify_empty_message_discards(self):
+        """Mensaje vacío debe descartarse."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("")
+        assert result.intent == "discard"
+
+
+class TestMemoryPipeline:
+    """Pipeline de auto-evaluación y procesamiento de respuesta."""
+
+    def setup_method(self):
+        from services.agent.memory.store import (
+            _get_db,
+            clear_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+
+    def test_auto_evaluate_proposal_no_trigger(self):
+        """Pregunta sin señales de cambio no debe generar propuesta."""
+        from services.agent.memory.pipeline import auto_evaluate_proposal
+
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Cuál es la política de cancelación?",
+            answer="La política de cancelación requiere 24 horas de antelación.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is None, "No debió generar propuesta para pregunta rutinaria"
+
+    def test_auto_evaluate_proposal_with_trigger(self):
+        """Pregunta con señal de cambio debe evaluar propuesta."""
+        from services.agent.memory.pipeline import auto_evaluate_proposal
+
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Ha cambiado el proceso de derivación en Manchester?",
+            answer="Sí, el proceso de derivación en Manchester ahora requiere el formulario M-CDX2 firmado.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is not None, "Debió generar propuesta para cambio de proceso"
+        assert proposal["category"] == "operational"
+        assert "M-CDX2" in proposal["proposal"]
+
+    def test_auto_evaluate_proposal_skips_non_memorizable(self):
+        """Preguntas no memorizables no deben generar propuesta."""
+        from services.agent.memory.pipeline import auto_evaluate_proposal
+
+        answer, proposal = auto_evaluate_proposal(
+            question="gracias por la ayuda",
+            answer="De nada, ¡que tengas buen día!",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is None, "No debió generar propuesta para agradecimiento"
+
+    def test_process_user_response_approve(self):
+        """Respuesta 'sí' debe aprobar y escribir en memoria."""
+        from services.agent.memory.pipeline import process_user_response
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        initial_count = len(get_all_facts())
+
+        set_pending_proposal(
+            proposal="Nuevo proceso en Manchester.",
+            reason="test",
+            category="operational",
+            source_run_id="test_pipeline",
+            source_question="test",
+        )
+
+        result = process_user_response("sí, guárdalo")
+        assert result["resolution"] == "approved"
+        assert result["final_content"] is not None
+
+        # Verificar que se escribió en memoria
+        facts = get_all_facts()
+        assert len(facts) > initial_count
+        clear_pending_proposal()
+
+    def test_process_user_response_reject(self):
+        """Respuesta 'no' debe rechazar, no escribir en memoria."""
+        from services.agent.memory.pipeline import process_user_response
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        initial_count = len(get_all_facts())
+
+        set_pending_proposal(
+            proposal="Patrón de incidentes los lunes.",
+            reason="test",
+            category="incident_pattern",
+            source_run_id="test_pipeline",
+            source_question="test",
+        )
+
+        result = process_user_response("no, olvídalo")
+        assert result["resolution"] == "rejected"
+
+        facts = get_all_facts()
+        assert len(facts) == initial_count, "No debe haber nuevos facts tras rechazo"
+        clear_pending_proposal()
+
+    def test_process_user_response_edit(self):
+        """Respuesta editando debe escribir el texto editado."""
+        from services.agent.memory.pipeline import process_user_response
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+
+        set_pending_proposal(
+            proposal="El proceso cambió en Manchester.",
+            reason="test",
+            category="operational",
+            source_run_id="test_pipeline",
+            source_question="test",
+        )
+
+        result = process_user_response(
+            "mejor dicho: el proceso cambió en Manchester y Leeds."
+        )
+        assert result["resolution"] == "edited"
+        assert result["final_content"] is not None
+        assert "Leeds" in result["final_content"]
+
+        facts = get_all_facts()
+        assert any("Leeds" in f["content"] for f in facts)
+        clear_pending_proposal()
+
+    def test_process_user_response_discard_by_default(self):
+        """Mensaje ambiguo debe descartar la propuesta."""
+        from services.agent.memory.pipeline import process_user_response
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        initial_count = len(get_all_facts())
+
+        set_pending_proposal(
+            proposal="Propuesta de prueba.",
+            reason="test",
+            category="operational",
+            source_run_id="test_pipeline",
+            source_question="test",
+        )
+
+        result = process_user_response("¿qué clima hace?")
+        assert result["resolution"] == "discarded"
+
+        facts = get_all_facts()
+        assert len(facts) == initial_count
+        clear_pending_proposal()
+
+    def test_audit_log_created_on_approve(self):
+        """Aprobación debe crear entrada en audit_log."""
+        from services.agent.memory.pipeline import process_user_response
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_audit_log,
+            set_pending_proposal,
+        )
+
+        clear_pending_proposal()
+        initial_log_count = len(get_audit_log(limit=999))
+
+        set_pending_proposal(
+            proposal="Hecho auditado.",
+            reason="test",
+            category="operational",
+            source_run_id="test_audit",
+            source_question="test",
+        )
+
+        process_user_response("sí")
+
+        log = get_audit_log(limit=10)
+        assert len(log) > initial_log_count, "Debe haber nuevas entradas en audit_log"
+
+        # Verificar que hay un evento de aprobación
+        event_types = [e.get("event_type", "") for e in log]
+        has_approve = any("approved" in et for et in event_types)
+        assert has_approve, f"No se encontró evento 'approved'. Eventos: {event_types}"
+
+        clear_pending_proposal()
+
+    def test_build_memory_context_format(self):
+        """build_memory_context debe formatear facts correctamente."""
+        from services.agent.memory.pipeline import build_memory_context
+
+        test_facts = [
+            {"content": "Fact 1", "category": "operational"},
+            {"content": "Fact 2", "category": "incident_pattern"},
+            {"content": "Fact 3", "category": "staff_preference"},
+        ]
+
+        context = build_memory_context(test_facts)
+        assert "Fact 1" in context
+        assert "Fact 2" in context
+        assert "Fact 3" in context
+        # Debe incluir emojis por categoría
+        assert "📌" in context or "⚡" in context or "👤" in context
+
+
+class TestMemoryGraphIntegration:
+    """Verifica que los nodos de memoria están integrados correctamente en el grafo."""
+
+    def test_memory_nodes_exist_in_graph(self):
+        """Los 3 nodos de memoria deben existir en el grafo."""
+        from services.agent.graph import agent_graph
+
+        for node_name in ("load_memory_context", "process_proposal", "auto_evaluate_memory"):
+            assert node_name in agent_graph.nodes, (
+                f"Nodo de memoria '{node_name}' no encontrado en el grafo"
+            )
+
+    def test_memory_routes_defined(self):
+        """Las funciones de ruta de memoria deben importarse correctamente."""
+        from services.agent.graph import (
+            route_after_auto_evaluate,
+            route_after_load_memory,
+            route_after_process_proposal,
+        )
+
+        # Solo verificar que son callables
+        assert callable(route_after_load_memory)
+        assert callable(route_after_process_proposal)
+        assert callable(route_after_auto_evaluate)
+
+    def test_route_after_receive_goes_to_load_memory(self):
+        """route_after_receive debe enrutar a load_memory_context."""
+        from services.agent.graph import build_initial_state, route_after_receive
+
+        state = build_initial_state("¿Cuál es la política?")
+        decision = route_after_receive(state)
+        assert decision == "load_memory_context"
