@@ -11,6 +11,7 @@ pnpm-debug.log*
 
 .venv/
 __pycache__/
+*.py[cod]
 data/process/suppliers_db.json
 .env 
 .env.local
