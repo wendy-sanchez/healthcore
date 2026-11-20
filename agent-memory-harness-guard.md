@@ -463,6 +463,42 @@ julio."
    "proposal": "El nuevo proceso de derivación...", "user_message": "Sí, guárdalo.",
    "classification": "approve", "detail": "Fact escrito en memory_facts"},
 ]
+
+### Evidencia real desde tests (APROBADO)
+
+```
+$ uv run python -m pytest tests/pipelines/test_agent_graph.py -v --tb=long \
+  -k "test_process_user_response_approve or test_audit_log_created_on_approve"
+
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_approve PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_audit_log_created_on_approve PASSED
+```
+
+**`test_process_user_response_approve`** (código real):
+```python
+set_pending_proposal(
+    proposal="Nuevo proceso en Manchester.",
+    reason="test", category="operational"
+)
+result = process_user_response("sí, guárdalo")
+assert result["resolution"] == "approved"
+assert result["final_content"] is not None
+
+facts = get_all_facts()
+assert len(facts) > initial_count  # ← se escribió en memoria
+```
+
+**`test_audit_log_created_on_approve`** (código real):
+```python
+set_pending_proposal(
+    proposal="Hecho auditado.",
+    reason="test", category="operational"
+)
+process_user_response("sí")
+log = get_audit_log(limit=10)
+event_types = [e.get("event_type", "") for e in log]
+has_approve = any("approved" in et for et in event_types)
+assert has_approve  # ← evento 'approved' en audit_log
 ```
 
 ---
@@ -523,6 +559,74 @@ detalles de alguno en particular?"
    "proposal": "Los incidentes de facturación suelen escalar...", "user_message": "No, no hace falta que recuerdes eso.",
    "classification": "reject", "detail": null},
 ]
+```
+
+### Evidencia real desde tests (RECHAZADO)
+
+```
+$ uv run python -m pytest tests/pipelines/test_agent_graph.py -v --tb=long \
+  -k "test_process_user_response_reject"
+
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_reject PASSED
+```
+
+**`test_process_user_response_reject`** (código real):
+```python
+set_pending_proposal(
+    proposal="Patrón de incidentes los lunes.",
+    reason="test", category="incident_pattern"
+)
+
+result = process_user_response("no, olvídalo")
+assert result["resolution"] == "rejected"
+
+facts = get_all_facts()
+assert len(facts) == initial_count  # ← NO se escribió en memoria
+```
+
+**Resultado**: `resolution = "rejected"`, `final_content = None` (no se escribe
+nada en `memory_facts`). El audit_log registra el evento `user_rejected` con el
+texto original de la propuesta y el mensaje del usuario.
+
+### Suite completa de memoria (32 tests) — todos pasan
+
+```
+$ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "TestMemory"
+
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_validate_clean_text PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_name PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_ssn PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_email PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_phone PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_patient_id PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_empty_string_is_safe PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_set_pending_rejects_phi PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryStore::test_add_and_get_fact PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryStore::test_add_fact_rejects_phi PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryStore::test_pending_proposal_singleton PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryStore::test_get_facts_by_category PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryStore::test_delete_fact PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_approve_si PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_approve_ok PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_reject_no PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_edit_mejor_dicho PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_discard_by_default PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_no_proposal_when_none_pending PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_empty_message_discards PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_no_trigger PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_with_trigger PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_skips_non_memorizable PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_approve PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_reject PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_edit PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_discard_by_default PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_audit_log_created_on_approve PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_build_memory_context_format PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_memory_nodes_exist_in_graph PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_memory_routes_defined PASSED
+tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_route_after_receive_goes_to_load_memory PASSED
+
+====================== 32 passed in 1.17s =======================
 ```
 
 ---
