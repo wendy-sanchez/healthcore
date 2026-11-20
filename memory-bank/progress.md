@@ -2,6 +2,51 @@
 
 ## Estado actual del desarrollo
 
+### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
+
+- **Completado**: Paquete `services/agent/memory/` con 5 módulos:
+  - `store.py` (614 líneas) — Backend TinyDB con 3 tablas (memory_facts, pending_proposal, audit_log), validación PHI dual, consolidación automática (threshold 50 facts, TTL 90 días), auditoría con 8 tipos de evento.
+  - `classifier.py` (238 líneas) — Clasificador de intención del usuario sin LLM (reglas léxicas + umbrales de confianza). Intents: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0 por defecto). Detección de cambio de tema.
+  - `pipeline.py` (585 líneas) — Orquestador: auto-evaluación de respuestas (18 trigger keywords, 9 indicadores no-memorizables), extracción de candidatos, clasificación en 3 categorías (operational, incident_pattern, staff_preference), detección de duplicados, formato de propuesta, procesamiento de respuesta.
+  - `nodes.py` (259 líneas) — 3 nodos LangGraph + 3 routers que integran el sistema en el grafo.
+  - `__init__.py` — Documento de arquitectura con 6 principios de diseño.
+
+- **Completado**: Integración en grafo LangGraph:
+  - 6 nuevos campos en `AgentState`: `memory_facts`, `memory_context`, `memory_proposal`, `memory_proposal_handled`, `memory_proposal_handled_text`, `memory_proposal_result`, `run_id`.
+  - Entrypoint actualizado: `receive_question → load_memory_context` (antes iba directo a `classify_query`).
+  - Nuevo flujo: load_memory_context → (process_proposal si hay pendiente | classify_query) → ... → generate_answer → auto_evaluate_memory → END.
+  - Grafo ampliado de 10 a 13 nodos.
+
+- **Completado**: PHI Compliance:
+  - 8 patrones PHI cubriendo HIPAA (US) + UK GDPR: nombres con acentos, SSN, NHS numbers, emails, MRNs, términos clínicos, fechas de nacimiento, teléfonos, direcciones físicas.
+  - Validación TWICE: antes de mostrar propuesta y antes de escribir en TinyDB.
+  - Re-validación PHI durante consolidación.
+
+- **Completado**: 32 nuevos tests de memoria en 5 clases:
+  - `TestMemoryPHI` (8 tests) — verifica cada patrón PHI individualmente.
+  - `TestMemoryStore` (5 tests) — CRUD de facts, pending proposal singleton, conteo.
+  - `TestMemoryClassifier` (7 tests) — approve/reject/edit/discard, cambio de tema, sin propuesta pendiente.
+  - `TestMemoryPipeline` (7 tests) — auto-evaluación, duplicados, contexto, status summary.
+  - `TestMemoryGraphIntegration` (3 tests) — flujo completo, PHI en grafo, sin propuesta si no procede.
+  - **32/32 tests de memoria pasan + 32 tests originales = 64 tests total.**
+
+- **Completado**: Auditoría 11/11 acceptance criteria cumplidos — documentada en `AUDITORIA_HITO8_MEMORIA.md`.
+
+- **Completado**: Documentación técnica:
+  - `agent-memory-harness-guard.md` (742 líneas) — 12 secciones, 7 preguntas de diseño, tabla comparativa de 5 alternativas, 4 ciclos completos (aprobado, rechazado, editado, PHI bloqueado), política de consolidación, diagramas de flujo, snippets de código.
+  - `AUDITORIA_HITO8_MEMORIA.md` — 11/11 criterios con evidencia detallada por criterio.
+
+- **Completado**: Bugs corregidos:
+  1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.
+  2. Patrón regex PHI `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`.
+  3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría, retornando None si se detecta PHI.
+
+- **Tests**: Suite completa de 64 tests verificada: `uv run python -m pytest tests/pipelines/test_agent_graph.py -v`.
+  - Memory tests: 32/32 pasan.
+  - Non-memory agent tests: 32/32 heredados siguen pasando (2 tests de MixedSynthesis requieren Qdrant infraestructura — pre-existente).
+  - Comando completo: `uv run python -m pytest tests/pipelines/ -v`.
+  - **Branch**: `feature/agent-memory` (o rama activa).
+
 ### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
 - **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.
 - **Problemas resueltos**:

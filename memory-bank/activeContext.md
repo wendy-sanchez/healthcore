@@ -1,5 +1,26 @@
 # Active Context
 
+## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
+
+- **Entregable**: Sistema de memoria persistente para el agente LangGraph de HealthCore, que permite al agente recordar hechos operativos entre conversaciones con control explícito del usuario, auditoría completa y protección PHI.
+- **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador por reglas léxicas, sin LLM).
+- **Arquitectura**: 5 módulos en `services/agent/memory/`:
+  - `store.py` (614 líneas) — Backend TinyDB con 3 tablas: `memory_facts` (hechos aprobados), `pending_proposal` (singleton, 0-1), `audit_log` (8 eventos). Validación PHI dual (antes de mostrar propuesta y antes de escribir). Consolidación automática al alcanzar 50 facts o 90 días TTL.
+  - `classifier.py` (238 líneas) — Clasificador de intención del usuario sin LLM: reglas léxicas con umbrales de confianza (`approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto a 0.0). `Nunca se asume aprobación por silencio`.
+  - `pipeline.py` (585 líneas) — Orquestador que evalúa automáticamente respuestas del agente (18 trigger keywords, 9 indicadores no-memorizables), extrae candidatos a memoria, clasifica en 3 categorías (`operational`, `incident_pattern`, `staff_preference`), detecta duplicados, formatea propuesta al usuario con sufijo `📝 ¿Quieres que recuerde esto?`, y procesa la respuesta del usuario.
+  - `nodes.py` (259 líneas) — 3 nodos LangGraph (`node_load_memory_context`, `node_process_proposal`, `node_auto_evaluate_memory`) + 3 routers condicionales (`route_after_load_memory`, `route_after_process_proposal`, `route_after_auto_evaluate`) que integran el sistema en el grafo existente.
+  - `__init__.py` — Documento 6 principios: PHI-free, audit trail, no silent writes, no assumption by default, single pending proposal, dual PHI validation.
+- **Integración en grafo**: `AgentState` ampliado con 6 nuevos campos (`memory_facts`, `memory_context`, `memory_proposal`, `memory_proposal_handled`, `memory_proposal_handled_text`, `memory_proposal_result`, `run_id`). Flujo: `receive_question → load_memory_context` (nuevo entrypoint) → `process_proposal` si hay pendiente, sino `classify_query` → ... → `generate_answer` → `auto_evaluate_memory` → END.
+- **PHI Compliance**: 8 patrones PHI (nombres con acentos, SSN, NHS, emails, MRNs, términos clínicos, fechas de nacimiento, teléfonos, direcciones físicas). Validación TWICE: antes de mostrar propuesta al usuario y antes de escribir en TinyDB, más re-validación durante consolidación. Marco HIPAA (US) + UK GDPR.
+- **Tests**: **64 tests** (32 originales + 32 nuevos de memoria). 5 nuevas clases: `TestMemoryPHI` (8 tests — 8 patrones PHI), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (7 tests), `TestMemoryPipeline` (7 tests), `TestMemoryGraphIntegration` (3 tests). **Todos pasan**.
+- **Bugs corregidos durante desarrollo**:
+  1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido.
+  2. Patrón regex PHI `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`.
+  3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría.
+- **Auditoría**: 11/11 acceptance criteria cumplidos. Ver `AUDITORIA_HITO8_MEMORIA.md` y `agent-memory-harness-guard.md` (742 líneas, 12 secciones, 4 ciclos completos: aprobado, rechazado, editado, PHI bloqueado).
+- **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, 4 ciclos completos con trazas, política de consolidación.
+- **Branch**: `feature/agent-memory` (o rama activa del desarrollo).
+
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
 - **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
 - **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.

@@ -30,6 +30,7 @@
 | 12 | **Agente de Soporte LangGraph** — Grafo de decisión que envuelve el pipeline RAG con estado explícito, checkpointing, trazabilidad y endpoint HTTP | LangGraph 1.2.22, MemorySaver, httpx | ✅ Completado |
 | 13 | **Agente LangGraph — Tools Externas** — Añadidas herramientas de consulta en tiempo real a incidencias e inventario. Enrutamiento automático entre RAG, tools o ambos mediante clasificación regex (sin LLM). Timeout 5s, fallback honesto. 32 tests. | LangGraph, httpx, regex | ✅ Completado |
 | 14 | **Servidor MCP — Tools Protegidas con OAuth** — Servidor Model Context Protocol que expone Incidencias (5 tools) e Inventario (5 tools) como herramientas MCP, protegidas con OAuth 2.1 Resource Server vía mcpauth. Operaciones de escritura en inventario explícitamente rechazadas (RETO 2). Agente LangGraph integrado vía langchain-mcp-adapters. 9/9 criterios de aceptación. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Completado |
+| 15 | **Agente LangGraph — Memoria Persistente** — El agente aprende de la interacción sin acumular basura para siempre. Memoria respaldada por TinyDB (separada de RAG), validación PHI dual (8 patrones HIPAA+UK GDPR), aprobación explícita del usuario requerida (nunca asumida), clasificador de intención léxico (sin LLM), máximo una propuesta pendiente, trazabilidad completa (8 tipos de evento), consolidación automática (threshold 50 facts, TTL 90 días). 32 tests de memoria + 32 originales = 64 total. 11/11 criterios de aceptación. | TinyDB, LangGraph, clasificador léxico, Python 3.14 | ✅ Completado |
 
 ---
 
@@ -147,15 +148,16 @@ docker compose up --build    # Construye e inicia todos los servicios
 
 ## 🧠 Agente LangGraph — Detalles Clave
 
-El agente de soporte está implementado como un `StateGraph` de LangGraph con **10 nodos** y **7 enrutadores condicionales**. Reutiliza las funciones RAG existentes (`retrieve`, `generate_answer`) sin reescribirlas.
+El agente de soporte está implementado como un `StateGraph` de LangGraph con **13 nodos** y **8 enrutadores condicionales**. Reutiliza las funciones RAG existentes (`retrieve`, `generate_answer`) sin reescribirlas.
 
-**Nodos:** `receive_question` → `classify_query` → (tool y/o RAG) → `synthesize_tool_answer` / `generate_answer` → END
+**Flujo principal:** `receive_question` → `load_memory_context` → (process_proposal / `classify_query`) → (tool y/o RAG) → `synthesize_tool_answer` / `generate_answer` → `auto_evaluate_memory` → END
 
 - **Clasificación:** Basada en regex (sin LLM). Decide entre RAG, tool de incidencias, tool de inventario, o una combinación.
 - **Tools:** Solo lectura (GET). Consultan los servicios reales de incidencias e inventario. Timeout 5s. Todos los errores producen respuestas de fallback honestas.
+- **Memoria Persistente:** El agente puede recordar hechos operativos entre conversaciones (preferencias de personal, patrones de incidencias, configuraciones operativas) con control explícito del usuario. Usa TinyDB (separado de RAG), validación PHI dual, clasificador de intención léxico (sin LLM), y consolida/expira hechos viejos automáticamente. 32 tests de memoria. Ver [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md).
 - **Trazabilidad:** Cada ejecución produce un trace JSON persistido en `services/agent/traces/{run_id}.json`.
 - **Endpoint:** `POST /agent/query` (capa FastAPI delgada — sin lógica de negocio).
-- **Documentación:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md)
+- **Documentación:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md), [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md).
 
 ---
 
@@ -209,15 +211,17 @@ Generación Aumentada por Recuperación sobre 4 documentos de políticas de Heal
 | [`message-queues-asyns-task.md`](./message-queues-asyns-task.md) | Cola de Tareas Asíncronas — Redis + Celery |
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Propuesta de arquitectura general |
 | [`mcp-server.md`](./mcp-server.md) | Servidor MCP — tools protegidas con OAuth, arquitectura, configuración |
-| [`memory-bank/`](./memory-bank/) | Progreso del desarrollo, contexto activo, patrones del sistema |
+| [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | Memoria Persistente del Agente LangGraph — arquitectura, decisiones de diseño, diagramas de flujo |
+| [`memory-bank/`](./memory-bank/) | Progreso del desarrollo, contexto activo, patrones del sistema, decisiones técnicas |
 
 ---
 
 ## 🧪 Filosofía de Testing
 
 - **Tests de pipelines** (`tests/pipelines/`) cubren agente, RAG y pronóstico de ventas — todos ejecutables con `uv run python -m pytest`
-- Los tests del agente incluyen: compilación del grafo, enrutamiento condicional, trazabilidad, comportamiento RAG fundamentado, enrutamiento de tools (5 tests), comportamiento de fallback de tools (5 tests) y síntesis mixta (2 tests)
-- Todas las suites de tests pasan como puerta de entrada antes de fusionar ramas de funcionalidad
+- Los tests del agente incluyen: compilación del grafo, enrutamiento condicional, trazabilidad, comportamiento RAG fundamentado, enrutamiento de tools (5 tests), comportamiento de fallback de tools (5 tests), síntesis mixta (2 tests) y 32 tests específicos de memoria (validación PHI, CRUD de store, clasificación de intención, orquestación del pipeline, integración en el grafo)
+- Los 64 tests del agente pasan como puerta de entrada antes de fusionar ramas
+- Sistema de memoria: 11/11 criterios de aceptación verificados mediante auditoría (ver `AUDITORIA_HITO8_MEMORIA.md`)
 - Desarrollo impulsado por auditoría: cada entregable tiene criterios de aceptación verificables
 
 
