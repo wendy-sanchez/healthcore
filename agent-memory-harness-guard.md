@@ -125,9 +125,12 @@ que el backend sea intercambiable.
    confianza ≥0.70), la propuesta se descarta.
 4. **Single pending proposal**: si el usuario ignora la propuesta y cambia de
    tema, la propuesta se descarta.
-5. **Clasificador conservador**: el clasificador de intención (`classifier.py`)
-   requiere umbrales de confianza altos (aprobación ≥0.70, rechazo ≥0.75,
-   edición ≥0.85). Por defecto → `discard`.
+5. **Clasificador conservador**: el clasificador de intención (`classifier.py`,
+   ~514 líneas) usa **6 ejes analíticos estructurales** en lugar de listas
+   planas de patrones. Evalúa la respuesta del usuario mediante un pipeline de
+   **8 pasos secuenciales**: pregunta/condicional → cortesía → rechazo →
+   aprobación → edición → falsos positivos → comparación con umbrales
+   (aprobación ≥0.70, rechazo ≥0.75, edición ≥0.85). Por defecto → `discard`.
 6. **Sin escritura en RAG**: la memoria usa TinyDB, **no** las colecciones
    Qdrant de la empresa. Esto aísla completamente el riesgo de poison en
    retrieval.
@@ -187,16 +190,15 @@ Reglas:
 
 ### 2.7 ¿Qué eventos se auditan?
 
-| Evento               | Cuándo                                                      |
-|-----------------------|-------------------------------------------------------------|
-| `proposal_created`    | Se genera una propuesta y se persiste en `pending_proposal`. |
-| `phi_rejected`        | `validate_phi_safe()` detecta PHI → propuesta descartada.   |
-| `user_approved`       | Usuario responde "sí" → fact escrito en `memory_facts`.      |
-| `user_rejected`       | Usuario responde "no" → propuesta descartada.                |
-| `user_edited`         | Usuario edita la propuesta → fact escrito con texto editado.  |
-| `user_discarded`      | Sin respuesta clara → propuesta descartada por defecto.      |
-| `fact_deleted`        | Eliminación manual de un fact.                               |
-| `consolidation_done`  | Consolidación ejecutada (resumen creado, originales marcados). |
+| Evento           | Cuándo                                                      |
+|-------------------|-------------------------------------------------------------|
+| `proposed`       | Se genera una propuesta y se persiste en `pending_proposal`. |
+| `phi_rejected`   | `validate_phi_safe()` detecta PHI → propuesta descartada.   |
+| `approved`       | Usuario responde "sí" → fact escrito en `memory_facts`.      |
+| `rejected`       | Usuario responde "no" → propuesta descartada.                |
+| `edited`         | Usuario edita la propuesta → fact escrito con texto editado.  |
+| `discarded`      | Sin respuesta clara → propuesta descartada por defecto.      |
+| `consolidated`   | Consolidación ejecutada (resumen creado, originales marcados). |
 
 Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
 `user_message`, `classification` (intención detectada), `detail`.
@@ -379,10 +381,10 @@ rompiendo el ciclo.
 | Fichero                                   | Propósito                                      | Líneas ~ |
 |-------------------------------------------|------------------------------------------------|----------|
 | `services/agent/memory/__init__.py`       | Docstring del paquete, principios.             | 30       |
-| `services/agent/memory/store.py`          | TinyDB backend, PHI validation, audit, consolidation. | 320 |
-| `services/agent/memory/classifier.py`     | Clasificador de intención del usuario.         | 180      |
-| `services/agent/memory/pipeline.py`       | Orchestrador: auto-evaluación + respuesta.     | 300      |
-| `services/agent/memory/nodes.py`          | Nodos LangGraph (sync wrappers).              | 230      |
+| `services/agent/memory/store.py`          | TinyDB backend, PHI validation, audit, consolidation. | ~716 |
+| `services/agent/memory/classifier.py`     | Clasificador estructural de intención (6 ejes analíticos, 8 pasos). | ~514     |
+| `services/agent/memory/pipeline.py`       | Orchestrador: auto-evaluación + respuesta.     | ~802     |
+| `services/agent/memory/nodes.py`          | Nodos LangGraph (sync wrappers).              | ~267     |
 | `services/agent/graph.py` (modificado)    | Integración en el grafo (4 nodos + 3 rutas).  | +100     |
 
 ---
@@ -542,6 +544,8 @@ return True, []
 
 ## 5. Flujo de decisión completo
 
+### 5.1 Auto-evaluación (pipeline)
+
 ```
   ┌─────────────────────────────────────────────────────────────────────────┐
   │                            AUTO-EVALUACIÓN                              │
@@ -560,8 +564,71 @@ return True, []
   │  9. Generar propuesta, persistir en pending_proposal, responder al      │
   │     usuario con "¿Quieres que recuerde esto?"                           │
   └─────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
+```
+
+### 5.2 Clasificador de intención (classifier.py) — 6 ejes estructurales
+
+La función `classify_user_intent()` procesa la respuesta del usuario mediante
+**8 pasos secuenciales** que evalúan **6 ejes analíticos** en lugar de
+depender de listas planas de patrones:
+
+**Ejes analíticos**:
+1. **Estructura gramatical**: ¿La frase es una pregunta o condicional? →
+   descartar inmediatamente (función `_es_pregunta_o_condicional()`).
+2. **Señales de rechazo**: ¿Hay «no», «no hace falta», «no guardes»,
+   «mejor no»? → puntuar como `reject` (función `_hay_rechazo()`).
+3. **Señales de aprobación**: ¿Hay «sí», «ok», «de acuerdo», «correcto»,
+   «guárdalo»? → puntuar como `approve` (función `_hay_aprobacion()`).
+4. **Señales de edición**: ¿Hay «mejor», «mejor dicho», «corrige»,
+   «cambia»? → puntuar como `edit` (función `_hay_edicion()`).
+5. **Cortesía sola**: ¿La frase es solo «gracias», «bien gracias»,
+   «de nada»? → descartar (función `_es_solo_cortesia()`).
+6. **Falsos positivos de aprobación**: ¿«sí» va seguido de condicional
+   (ej. «sí cambia algo...», «sí hay un problema...»)? → descartar
+   (función `_es_falso_positivo_aprobacion()`).
+
+**Pipeline de 8 pasos** (`classify_user_intent()`):
+
+```
+  1. Texto vacío / solo espacios        → discard   (0.0)
+  2. ¿Es pregunta o condicional?        → discard   (0.0)
+  3. ¿Solo cortesía?                    → discard   (0.0)
+  4. Computar ejes de rechazo (axis 2)  → score_reject (0-3 señales)
+  5. Computar ejes de aprobación (axis 3)→ score_approve (0-4 señales)
+  6. Computar ejes de edición (axis 4)  → score_edit (0-2 señales)
+  7. Evaluar falsos positivos (axis 6)  → si aplica, anula approve
+  8. Comparar scores con umbrales:
+       score_approve ≥ 0.70  → approve
+       score_reject  ≥ 0.75  → reject
+       score_edit    ≥ 0.85  → edit
+       default               → discard
+```
+
+**Umbrales de confianza**:
+- approve ≥ 0.70
+- reject ≥ 0.75
+- edit ≥ 0.85
+- discard = 0.0 (por defecto)
+
+**Ejemplos de clasificación**:
+
+| Entrada                     | Ejes activados                          | Resultado  | Confianza |
+|-----------------------------|-----------------------------------------|------------|-----------|
+| "sí, guárdalo"              | approve (sí + store_commands)           | approve    | 0.85      |
+| "sí, claro"                 | approve + exception segunda palabra     | approve    | 0.75      |
+| "ok"                        | approve (ok)                            | approve    | 0.70      |
+| "no, gracias"               | reject (no + cortesía)                  | reject     | 0.75      |
+| "no guardes eso"            | reject (no + frase compuesta)           | reject     | 0.80      |
+| "mejor dicho..."            | edit (mejor)                            | edit       | 0.88      |
+| "corrige el texto"          | edit (corrige)                          | edit       | 0.85      |
+| "gracias"                   | cortesía sola                           | discard    | 0.0       |
+| "bien, gracias"             | cortesía sola                           | discard    | 0.0       |
+| "si llueve mañana"          | pregunta/condicional                    | discard    | 0.0       |
+| "sí cambia algo, avísame"   | falso positivo approve                  | discard    | 0.0       |
+| "¿qué has guardado?"        | pregunta                               | discard    | 0.0       |
+| "cambia el horario"         | edit (cambia)                           | edit       | 0.85      |
+
+```
   ┌─────────────────────────────────────────────────────────────────────────┐
   │                           RESPUESTA DEL USUARIO                         │
   │                                                                         │
@@ -631,7 +698,7 @@ propuesta_memoria: {
 - `classify_user_intent("Sí, guárdalo.")` → `approve` (confidence: 0.85)
 - `add_fact(proposal_text, "operational", run_id, now(), False, None)`
 - `clear_pending_proposal()`
-- `_record_audit("user_approved", ...)`
+- `_record_audit("approved", ...)`
 - `consolidate_memory()` (si hay ≥50 facts)
 
 ### Paso 7: Confirmación al usuario
@@ -661,9 +728,9 @@ julio."
 
 ```json
 [
-  {"event_type": "proposal_created",  "run_id": "run_001", "timestamp": "2025-07-16T10:00:00",
+  {"event_type": "proposed",  "run_id": "run_001", "timestamp": "2025-07-16T10:00:00",
    "proposal": "El nuevo proceso de derivación...", "classification": null, "detail": null},
-  {"event_type": "user_approved",     "run_id": "run_002", "timestamp": "2025-07-16T10:01:00",
+  {"event_type": "approved",     "run_id": "run_002", "timestamp": "2025-07-16T10:01:00",
    "proposal": "El nuevo proceso de derivación...", "user_message": "Sí, guárdalo.",
    "classification": "approve", "detail": "Fact escrito en memory_facts"},
 ]
@@ -702,7 +769,7 @@ set_pending_proposal(
 process_user_response("sí")
 log = get_audit_log(limit=10)
 event_types = [e.get("event_type", "") for e in log]
-has_approve = any("approved" in et for et in event_types)
+has_approve = any(et == "approved" for et in event_types)
 assert has_approve  # ← evento 'approved' en audit_log
 ```
 
@@ -739,7 +806,7 @@ propuesta_memoria: {
 
 - `classify_user_intent("No, no hace falta que recuerdes eso.")`
   → detecta "no" + "no hace falta" → `reject` (confidence: 0.82)
-- `_record_audit("user_rejected", ...)`
+- `_record_audit("rejected", ...)`
 - `clear_pending_proposal()`
 
 ### Paso 6: Confirmación
@@ -758,9 +825,9 @@ detalles de alguno en particular?"
 
 ```json
 [
-  {"event_type": "proposal_created",  "run_id": "run_003", "timestamp": "2025-07-16T11:00:00",
+  {"event_type": "proposed",  "run_id": "run_003", "timestamp": "2025-07-16T11:00:00",
    "proposal": "Los incidentes de facturación suelen escalar...", "classification": null, "detail": null},
-  {"event_type": "user_rejected",     "run_id": "run_004", "timestamp": "2025-07-16T11:01:00",
+  {"event_type": "rejected",     "run_id": "run_004", "timestamp": "2025-07-16T11:01:00",
    "proposal": "Los incidentes de facturación suelen escalar...", "user_message": "No, no hace falta que recuerdes eso.",
    "classification": "reject", "detail": null},
 ]
@@ -790,22 +857,28 @@ assert len(facts) == initial_count  # ← NO se escribió en memoria
 ```
 
 **Resultado**: `resolution = "rejected"`, `final_content = None` (no se escribe
-nada en `memory_facts`). El audit_log registra el evento `user_rejected` con el
+nada en `memory_facts`). El audit_log registra el evento `rejected` con el
 texto original de la propuesta y el mensaje del usuario.
 
-### Suite completa de memoria (32 tests) — todos pasan
+### Suite completa de memoria (47 tests) — todos pasan
 
 ```
 $ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "TestMemory" --tb=short
 
-Tests de memoria (32/32):
-  PHI:        7/7  PASSED  (phi_validate_clean_text, phi_rejects_name, ...)
+Tests de memoria (47/47):
+  PHI:        8/8  PASSED  (phi_validate_clean_text, phi_rejects_name, ...)
   Store:      5/5  PASSED  (add_fact, pending_proposal, delete, ...)
-  Classifier: 6/6  PASSED  (approve, reject, edit, discard, ...)
-  Pipeline:   8/8  PASSED  (auto_evaluate, process_response, audit, ...)
-  Integration:3/3  PASSED  (nodes_exist, routes_defined, route_after_receive)
+  Classifier: 17/17 PASSED  (6 ejes estructurales, approve, reject, edit,
+                              discard, falso positivo approve, cortesía sola,
+                              pregunta/condicional, texto vacío, sin propuesta)
+  Pipeline:   11/11 PASSED  (auto_evaluate, process_response, audit,
+                              e2e_approve_cycle, e2e_reject_cycle,
+                              e2e_discard_cycle)
+  Integration:6/6  PASSED  (graph_E2E_approve_cycle, graph_E2E_reject_cycle,
+                             graph_E2E_discard_cycle, nodes_exist,
+                             routes_defined, route_after_receive)
 
-====================== 32 passed in 1.24s =======================
+====================== 47 passed in 1.24s =======================
 ```
 
 ---
@@ -847,7 +920,7 @@ propuesta_memoria: {
 ### Paso 6: Escritura
 
 - `add_fact("El usuario prefiere ver primero los incidentes críticos y luego los abiertos.", "staff_preference", ...)`
-- `_record_audit("user_edited", ..., classification="edit", ...)`
+- `_record_audit("edited", ..., classification="edit", ...)`
 - `clear_pending_proposal()`
 
 ### Paso 7: Confirmación
@@ -1070,15 +1143,15 @@ print(agent_graph.nodes.keys())
 #  'process_proposal', 'auto_evaluate_memory']
 ```
 
-### 11.5 Resultado final — 194/194 tests PASSED
+### 11.5 Resultado final — 209/209 tests PASSED
 
 ```
-$ uv run python -m pytest tests/pipelines/test_agent_graph.py --tb=short -q
+$ uv run python -m pytest tests/ --tb=short -q
 
-194 passed in 2.35s
+209 passed in 4.45s
 ```
 
-Desglose por categoría:
+Desglose por categoría (tests en `test_agent_graph.py`):
 
 | Categoría                  | Tests | Estado |
 |----------------------------|-------|--------|
@@ -1092,29 +1165,39 @@ Desglose por categoría:
 | MixedSynthesis             | 2     | ✅     |
 | MemoryPHI                  | 8     | ✅     |
 | MemoryStore                | 5     | ✅     |
-| MemoryClassifier           | 7     | ✅     |
-| MemoryPipeline             | 7     | ✅     |
-| MemoryGraphIntegration     | 3     | ✅     |
-| MixedSynthesis             | 2     | ✅     |
-| **Total**                  | **64** | ✅     |
+| MemoryClassifier           | 17    | ✅     |
+| MemoryPipeline             | 11    | ✅     |
+| MemoryGraphIntegration     | 6     | ✅     |
+| **Total (agente+memoria)** | **79**| ✅     |
+| **Total suite completa**   | **209**| ✅     |
 
-> **Nota**: 64 tests en `test_agent_graph.py` + 130 tests en otros módulos
-> (`test_sales_forecast_split.py`, `test_mcp_server_auth.py`, `test_temporal_cv.py`,
-> `nightly/`, etc.) = **194 tests totales en la suite del workspace**.
+### 11.6 Historial de bugs corregidos (15 totales)
 
-### 11.6 Correcciones aplicadas durante el Hito 8
+| #  | Bug | Síntoma | Causa raíz | Corrección |
+|----|-----|---------|------------|------------|
+| 1 | `route_after_receive` entrypoint | KeyError en aristas del grafo | Devolvía `"classify_query"` pero cambió a `"load_memory_context"` | Actualizar ruta |
+| 2 | PHI: falsos negativos acentos | "Juan Pérez" no detectado | Regex sin soporte acentos | `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+` |
+| 3 | `add_fact()` sin validación PHI | PHI llegaba a TinyDB | Falta validación en escritura | Validación dual |
+| 4 | Clasificador ambigüedad como aprobado | Hipotéticas clasificadas como approve | Falta filtro de condicionales | `_should_evaluate` reescrito |
+| 5 | Consolidación: facts nunca expiraban | Memoria acumulaba facts | No auto-asignación de TTL | `_DEFAULT_TTL_DAYS=90` |
+| 6 | Loop RAG+tool | Síntesis se re-ejecutaba en ciclo | `route_after_generate` re-enrutaba | `route_after_synthesis()` |
+| 7 | CONTEXT examples bloqueados | Casos 3,5,6 no generaban propuesta | Keywords en lista equivocada | Mover triggers |
+| 8 | Word boundary en `_QUERY_PHRASES` | "especialista" bloqueado por "lista" | Substring match | `re.search(r"\b...\b")` |
+| 9 | Faltaban comandos explícitos | "apúntalo", "guárdalo" ignorados | No en triggers | Añadir 10 comandos |
+| 10 | `_extract_memory_candidate` sin fallback | Propuesta None aunque _should_evaluate True | Sin extractor de respaldo | `_extract_command_memory`, `_extract_fallback_content` |
+| 11 | PHI rejection silenciosa | Propuesta PHI se descartaba sin aviso | Retornaba `(answer, None)` | Rechazo explícito HIPAA/UK GDPR |
+| 12 | **"si llueve" → discard** | "si" condicional se clasificaba como approve | `\bs[ií]\b` emparejaba "si" = "sí" | Añadir eje de pregunta/condicional en §5.2 |
+| 13 | **"bien gracias" → discard** | "bien" daba approve falso | `\bbien\b` en patrones de aprobación | Añadir eje de cortesía sola en §5.2 |
+| 14 | **"cambia el horario" → discard** | "cambia" daba approve en vez de edit | "cambia" listado como trigger de memorize | Rediseño completo a 6 ejes estructurales |
+| 15 | **Clasificador basado en listas planas** | Múltiples falsos positivos por patrón | Arquitectura de pattern lists | Rediseño total: clasificador estructural con 6 ejes analíticos y pipeline de 8 pasos |
 
-| # | Bug | Síntoma | Fix |
-|---|-----|---------|-----|
-| 1 | PHI: falsos negativos | `diabetes tipo 2`, `cáncer`, `MRN: 1234567`, `+34 612...`, `García`, `15/03/1985` no detectados | Patrones expandidos: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone |
-| 2 | Clasificador: ambigüedad como aprobado | `"¿cambia el horario?"` y `"si llueve cancelo"` generaban propuestas | `_should_evaluate` reescrito: bloquea hipotéticas, requiere trigger keywords en `combined` text |
-| 3 | Consolidación: facts nunca expiraban | `add_fact()` no asignaba `expires_at` para facts no consolidados | Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None` |
-| 4 | Loop RAG+tool | `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes | `route_after_synthesis()` nueva, va directo a `auto_evaluate_memory` o `__end__` |
-| 5/6/7 | CONTEXT examples bloqueados | `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. | Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"` |
-| 8 | Word boundary en `_QUERY_PHRASES` | `"lista"` matcheaba dentro de `"especialista"`, bloqueando Caso 2 Manchester | `phrase in q_lower` → `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)` |
-| 9 | Faltaban comandos explícitos en triggers | `"apúntalo"`, `"guárdalo"`, `"recuérdalo"` no evaluaban → Johnson PHI ignorado en silencio | Añadidos 10 comandos: `apúntalo`, `apunta`, `guárdalo`, `guarda`, `recuérdalo`, `recordar`, `escribe`, `escribir`, `almacena`, `almacenar` |
-| 10 | `_extract_memory_candidate` sin fallback | `_should_evaluate` retorna True pero ningún extractor clasifica → None → propuesta perdida (Johnson PHI nunca llegaba a validación) | Añadidos `_extract_command_memory()` para comandos explícitos y `_extract_fallback_content()` como fallback genérico |
-| 11 | PHI rejection silenciosa | `validate_phi_safe()` retorna False pero `auto_evaluate_proposal()` hace `return answer, None` — usuario nunca se entera | Rechazo explícito con mensaje HIPAA/UK GDPR + `{"phi_rejected": True}` + nodo de grafo no persiste propuesta |
+**Bugs 12-14**: Reportados por el usuario después del Hito 8 inicial.
+**Bug 15**: Corrección estructural que resuelve los bugs 12-14 de raíz, eliminando la dependencia de listas planas de patrones. Implementado en `classifier.py` (~514 líneas) con 6 funciones analíticas y pipeline de 8 pasos en `classify_user_intent()`.
+
+> **Nota**: 79 tests en `test_agent_graph.py` (47 de memoria + 32 de agente) +
+> 130 tests en otros módulos (`test_sales_forecast_split.py`,
+> `test_mcp_server_auth.py`, `test_temporal_cv.py`, `nightly/`, etc.) =
+> **209 tests totales en la suite del workspace**.
 
 ---
 

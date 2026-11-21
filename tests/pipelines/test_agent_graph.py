@@ -1167,6 +1167,101 @@ class TestMemoryClassifier:
         result = classify_user_intent("")
         assert result.intent == "discard"
 
+    # ── Tests de casos reportados como errores (2026-11-21) ─────────
+
+    def test_classify_conditional_si_is_discard(self):
+        """"si llueve, cancelo la cita?" debe ser discard, NO approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("si llueve, cancelo la cita?")
+        assert result.intent == "discard", (
+            f"Condicional 'si llueve...' no debe aprobarse. "
+            f"Resultó: {result.intent}"
+        )
+
+    def test_classify_courtesy_bien_gracias_is_discard(self):
+        """"bien, gracias" debe ser discard, NO approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("bien, gracias")
+        assert result.intent == "discard", (
+            f"Cortesía 'bien, gracias' no debe aprobarse. "
+            f"Resultó: {result.intent}"
+        )
+
+    def test_classify_question_cambio_is_discard(self):
+        """"cambia el horario de la clínica?" debe ser discard, NO edit."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("cambia el horario de la clínica?")
+        assert result.intent == "discard", (
+            f"Pregunta 'cambia el horario...' no debe ser edit. "
+            f"Resultó: {result.intent}"
+        )
+
+    def test_classify_bien_solo_is_discard(self):
+        """"bien" suelto debe ser discard, no approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("bien")
+        assert result.intent == "discard", (
+            f"'bien' suelto no debe aprobarse. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_gracias_is_reject(self):
+        """"no gracias" debe ser reject (rechazo cortés)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no gracias")
+        assert result.intent == "reject", (
+            f"'no gracias' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_gracias_simple_is_discard(self):
+        """"gracias" solo debe ser discard, no approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("gracias")
+        assert result.intent == "discard", (
+            f"'gracias' no debe aprobarse. Resultó: {result.intent}"
+        )
+
+    def test_classify_esta_bien_is_approve(self):
+        """"está bien" (frase compuesta) debe ser approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("está bien")
+        assert result.intent == "approve", (
+            f"'está bien' debe aprobarse. Resultó: {result.intent}"
+        )
+
+    def test_classify_me_parece_bien_is_approve(self):
+        """"me parece bien" debe ser approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("me parece bien")
+        assert result.intent == "approve", (
+            f"'me parece bien' debe aprobarse. Resultó: {result.intent}"
+        )
+
+    def test_classify_si_sin_tilde_is_approve_when_short(self):
+        """"si" (sin tilde, mensaje corto) debe ser approve como respuesta directa."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("si")
+        assert result.intent == "approve", (
+            f"'si' como respuesta directa debe aprobarse. Resultó: {result.intent}"
+        )
+
+    def test_classify_si_claro_is_approve(self):
+        """"si claro" debe ser approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("si claro")
+        assert result.intent == "approve", (
+            f"'si claro' debe aprobarse. Resultó: {result.intent}"
+        )
+
 
 class TestMemoryPipeline:
     """Pipeline de auto-evaluación y procesamiento de respuesta."""
@@ -1222,6 +1317,40 @@ class TestMemoryPipeline:
             tool_errors=[],
         )
         assert proposal is None, "No debió generar propuesta para agradecimiento"
+
+    def test_auto_evaluate_proposal_question_about_change_no_confirmation(self):
+        """Pregunta 'cambia el horario?' sin confirmación en respuesta NO debe generar propuesta."""
+        from services.agent.memory.pipeline import auto_evaluate_proposal
+
+        answer, proposal = auto_evaluate_proposal(
+            question="cambia el horario de la clínica?",
+            answer="El horario de la clínica es de 8am a 5pm, lunes a viernes.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is None, (
+            "Pregunta sobre cambio sin confirmación en respuesta "
+            "no debe generar propuesta"
+        )
+
+    def test_auto_evaluate_proposal_question_with_confirmation_does_generate(self):
+        """Pregunta sobre cambio CON confirmación en respuesta SÍ debe generar propuesta."""
+        from services.agent.memory.pipeline import auto_evaluate_proposal
+
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Ha cambiado el proceso de derivación en Manchester?",
+            answer="Sí, el proceso de derivación en Manchester ahora requiere el formulario M-CDX2 firmado.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is not None, (
+            "Pregunta sobre cambio con confirmación en respuesta "
+            "debe generar propuesta"
+        )
+        assert proposal["category"] == "operational"
+        assert "M-CDX2" in proposal["proposal"]
 
     def test_process_user_response_approve(self):
         """Respuesta 'sí' debe aprobar y escribir en memoria."""
@@ -1418,3 +1547,228 @@ class TestMemoryGraphIntegration:
         state = build_initial_state("¿Cuál es la política?")
         decision = route_after_receive(state)
         assert decision == "load_memory_context"
+
+    # ══════════════════════════════════════════════════════════════════
+    #  E2E: Ciclos completos del harness de memoria
+    # ══════════════════════════════════════════════════════════════════
+
+    def test_e2e_memory_full_cycle_approve(self):
+        """Ciclo E2E completo: propuesta → usuario aprueba → fact escrito en BD.
+
+        Simula el flujo completo del harness de memoria sin mockear el pipeline:
+          1. Se genera una propuesta (auto_evaluate_proposal con trigger)
+          2. Se persiste (set_pending_proposal)
+          3. Usuario responde afirmativamente
+          4. process_user_response clasifica como approve
+          5. El fact se escribe en memory_facts
+          6. El audit_log registra el evento
+          7. El fact es recuperable vía get_all_facts / build_memory_context
+        """
+        from services.agent.memory.pipeline import (
+            auto_evaluate_proposal,
+            process_user_response,
+            build_memory_context,
+        )
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            _get_db,
+            set_pending_proposal,
+        )
+
+        # Setup: limpiar estado
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+
+        initial_count = len(get_all_facts())
+
+        # ── Paso 1: Generar propuesta ────────────────────────────────
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Ha cambiado el proceso de derivación en Manchester?",
+            answer="Sí, el proceso de derivación en Manchester ahora requiere "
+                   "el formulario M-CDX2 firmado.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is not None, (
+            "Paso 1: Debió generar propuesta para cambio de proceso"
+        )
+        assert proposal["category"] == "operational"
+        assert "M-CDX2" in proposal["proposal"]
+
+        # ── Paso 2: Persistir la propuesta ───────────────────────────
+        saved = set_pending_proposal(
+            proposal=proposal["proposal"],
+            reason=proposal["reason"],
+            category=proposal["category"],
+            source_run_id="e2e_test",
+            source_question="¿Ha cambiado el proceso de derivación en Manchester?",
+        )
+        assert saved is not None, "Paso 2: La propuesta debe persistirse"
+        assert saved["proposal"] == proposal["proposal"]
+
+        # ── Paso 3: Usuario responde afirmativamente ─────────────────
+        result = process_user_response("sí, guárdalo")
+        assert result["resolution"] == "approved", (
+            f"Paso 3: El usuario aprueba la propuesta. "
+            f"Resultó: {result['resolution']}"
+        )
+        assert result["final_content"] is not None, (
+            "Paso 3: Debe haber contenido final tras aprobación"
+        )
+        assert "M-CDX2" in result["final_content"]
+
+        # ── Paso 4: Verificar fact en BD ─────────────────────────────
+        facts_after = get_all_facts()
+        assert len(facts_after) == initial_count + 1, (
+            f"Paso 4: Debe haber 1 fact nuevo. "
+            f"Antes: {initial_count}, Después: {len(facts_after)}"
+        )
+        assert "M-CDX2" in facts_after[-1]["content"]
+
+        # ── Paso 5: Verificar audit_log ──────────────────────────────
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "proposed" in events, (
+            "Paso 5: audit debe tener 'proposed'"
+        )
+        assert "approved" in events, (
+            "Paso 5: audit debe tener 'approved'"
+        )
+
+        # ── Paso 6: build_memory_context incluye el nuevo fact ───────
+        context = build_memory_context()
+        assert "M-CDX2" in context, (
+            "Paso 6: El nuevo fact debe aparecer en build_memory_context"
+        )
+
+    def test_e2e_memory_full_cycle_reject(self):
+        """Ciclo E2E completo: propuesta → usuario rechaza → NO se escribe fact."""
+        from services.agent.memory.pipeline import (
+            auto_evaluate_proposal,
+            process_user_response,
+        )
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            _get_db,
+            set_pending_proposal,
+        )
+
+        # Setup
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+        initial_count = len(get_all_facts())
+
+        # Paso 1: Generar propuesta
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Ha cambiado el proceso de derivación en Manchester?",
+            answer="Sí, el proceso de derivación en Manchester ahora requiere "
+                   "el formulario M-CDX2 firmado.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is not None
+
+        # Paso 2: Persistir
+        set_pending_proposal(
+            proposal=proposal["proposal"],
+            reason=proposal["reason"],
+            category=proposal["category"],
+            source_run_id="e2e_test",
+            source_question="¿Ha cambiado el proceso de derivación en Manchester?",
+        )
+
+        # Paso 3: Usuario rechaza
+        result = process_user_response("no, olvídalo")
+        assert result["resolution"] == "rejected", (
+            f"Paso 3: El usuario rechaza la propuesta. "
+            f"Resultó: {result['resolution']}"
+        )
+        assert result["final_content"] is None, (
+            "Paso 3: No debe haber contenido final tras rechazo"
+        )
+
+        # Paso 4: NO se escribió ningún fact nuevo
+        facts_after = get_all_facts()
+        assert len(facts_after) == initial_count, (
+            f"Paso 4: No deben crearse facts tras rechazo. "
+            f"Antes: {initial_count}, Después: {len(facts_after)}"
+        )
+
+        # Paso 5: audit_log tiene user_rejected
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "rejected" in events, (
+            "Paso 5: audit debe tener 'rejected'"
+        )
+
+    def test_e2e_memory_full_cycle_discard(self):
+        """Ciclo E2E: propuesta → usuario pregunta otra cosa → discard, sin escritura."""
+        from services.agent.memory.pipeline import (
+            auto_evaluate_proposal,
+            process_user_response,
+        )
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            _get_db,
+            set_pending_proposal,
+        )
+
+        # Setup
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+        initial_count = len(get_all_facts())
+
+        # Paso 1: Generar propuesta
+        answer, proposal = auto_evaluate_proposal(
+            question="¿Ha cambiado el proceso de derivación en Manchester?",
+            answer="Sí, el proceso de derivación en Manchester ahora requiere "
+                   "el formulario M-CDX2 firmado.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal is not None
+
+        # Paso 2: Persistir
+        set_pending_proposal(
+            proposal=proposal["proposal"],
+            reason=proposal["reason"],
+            category=proposal["category"],
+            source_run_id="e2e_test",
+            source_question="¿Ha cambiado el proceso de derivación en Manchester?",
+        )
+
+        # Paso 3: Usuario ignora la propuesta y pregunta otra cosa
+        result = process_user_response("¿qué pasa con los incidentes de facturación?")
+        assert result["resolution"] == "discarded", (
+            f"Paso 3: El cambio de tema debe descartar la propuesta. "
+            f"Resultó: {result['resolution']}"
+        )
+        assert result["final_content"] is None, (
+            "Paso 3: No debe haber contenido tras discard"
+        )
+
+        # Paso 4: NO se escribió nada
+        facts_after = get_all_facts()
+        assert len(facts_after) == initial_count, (
+            f"Paso 4: No deben crearse facts tras discard. "
+            f"Antes: {initial_count}, Después: {len(facts_after)}"
+        )
+
+        # Paso 5: audit_log tiene user_discarded
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "discarded" in events, (
+            "Paso 5: audit debe tener 'discarded'"
+        )

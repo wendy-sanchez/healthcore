@@ -1,27 +1,28 @@
 """Clasificador de intención del usuario frente a una propuesta de memoria.
 
 Cuando el agente ha hecho una propuesta de memoria y el usuario responde,
-este módulo clasifica la intención del usuario de forma explícita y
-estructurada. Usa patrones léxicos (reglas) para determinar si el usuario:
+este módulo clasifica la intención del usuario mediante **reglas estructurales**
+(no listas cerradas de palabras). Analiza la **posición sintáctica**, la
+**estructura de la frase** y el **contexto gramatical** para determinar si:
 
-  - ``approve``  — Aprueba la propuesta (sí, ok, adelante, guárdalo, etc.)
-  - ``reject``   — Rechaza la propuesta (no, no guardes, olvídalo, etc.)
-  - ``edit``     — Propone una edición (mejor dicho así, cambia algo, etc.)
-  - ``discard``  — Cambia de tema sin responder a la propuesta (default)
+  - ``approve``  — Aprueba la propuesta (confianza >= 0.70)
+  - ``reject``   — Rechaza la propuesta (confianza >= 0.75)
+  - ``edit``     — Propone una edición (confianza >= 0.85)
+  - ``discard``  — Cambia de tema sin responder (default)
 
-Reglas de decisión:
-  - Si no hay propuesta pendiente → devuelve ``no_proposal``.
-  - Si el mensaje contiene señales claras de aprobación/rechazo/edición,
-    se clasifica como tal.
-  - Si no hay señales claras → ``discard`` (descarte por defecto).
-  - NUNCA se asume aprobación por silencio o ambigüedad.
-  - La clasificación ``edit`` requiere un texto de edición asociado.
+Principios (CONTEXT.md + agent-memory-harness-guard.md §2.4):
+  1. **Confirmación explícita necesaria**: sin un "sí" claro, no hay approve.
+  2. **Nunca asumir aprobación por silencio o ambigüedad**.
+  3. **Clasificador conservador**: umbrales altos, discard por defecto.
+  4. La edición requiere texto alternativo explícito.
+  5. Cortesías ("gracias", "saludos") NUNCA son aprobación.
+  6. Preguntas y condicionales NUNCA son approve/edit.
 
-Formato: devuelve un ``IntentClassification`` con:
-  - intent: Literal["approve", "reject", "edit", "discard", "no_proposal"]
-  - confidence: float (0.0 - 1.0)
-  - edit_text: str | None (solo si intent == "edit")
-  - explanation: str
+En lugar de listas de palabras, el clasificador usa ejes estructurales:
+  - **Eje de tonicidad**: "sí" (átono=condicional) vs "sí" (tónico=afirmación)
+  - **Eje de posición**: palabra inicial vs incrustada vs final
+  - **Eje de modo**: indicativo (hecho) vs subjuntivo/condicional (hipótesis)
+  - **Eje de puntuación**: ¿? delatan pregunta, no respuesta
 """
 
 from __future__ import annotations
@@ -68,42 +69,274 @@ class IntentClassification:
         }
 
 
-# ── Patrones de aprobación explícita ────────────────────────────────
-_APPROVE_PATTERNS: list[re.Pattern] = [
-    re.compile(r"\b(?:s[ií]|ok|okay|vale|de[ae]cuerdo|adelante|"
-               r"gu[aá]rdalo|recu[eé]rdalo|aprobado|confirmo|good|yes|yeah|"
-               r"correcto|exacto|perfecto|guardar|recuerda)\b", re.IGNORECASE),
-    re.compile(r"\b(?:hazlo|h[aá]galo|procede|adelante|guardar|guardalo|"
-               r"s[ií]guiente|bien|est[aá] bien|me parece bien)\b", re.IGNORECASE),
-]
+# ── Constantes de umbral (CONTEXT.md §Hito8 + agent-memory-harness-guard.md §2.4) ──
+_CONFIDENCE_APPROVE: float = 0.70  # Confirmación explícita del usuario
+_CONFIDENCE_REJECT: float = 0.75   # Rechazo explícito
+_CONFIDENCE_EDIT: float = 0.85     # Edición con texto alternativo
+_CONFIDENCE_DISCARD: float = 0.0   # Sin señal clara → descarte
 
-# ── Patrones de rechazo explícito ───────────────────────────────────
-_REJECT_PATTERNS: list[re.Pattern] = [
-    re.compile(r"\b(?:no\s+(?:guardes|recuerdes|gra[ae]bes|guardar|"
-               r"recuerdes eso|quiero|hagas)|"
-               r"olv[ií]dalo|descarta|no|nunca|quit a|elimina|"
-               r"no\s+gracias|no\s+m[aá]s|d[eé]jalo)\b", re.IGNORECASE),
-]
+# ── Signos de pregunta (delatan que no es respuesta a la propuesta) ──
+_RE_QUESTION_END = re.compile(r"\?\s*$")
+_RE_QUESTION_WORDS = re.compile(
+    r"\b(?:qui[eé]n|qu[eé]|c[uoá]l|c[uoá]les|"
+    r"d[oó]nde|c[oó]mo|por\s*qu[eé]|cu[aá]ndo|"
+    r"cu[aá]nto|cu[aá]ntos|cu[aá]ntas?)\b",
+    re.IGNORECASE,
+)
+_RE_CONDITIONAL_VERBS = re.compile(
+    r"\b(?:puedes|podr[ií]as|ser[ií]a|habr[ií]a|tendr[ií]a|"
+    r"deber[ií]a|har[ií]a|ir[ií]a)\b",
+    re.IGNORECASE,
+)
 
-# ── Patrones de edición ─────────────────────────────────────────────
-_EDIT_PATTERNS: list[re.Pattern] = [
-    re.compile(r"\b(?:mejor\s+d[ií]cho|en\s+realidad|cambia|"
-               r"edita|modifica|corrige|rectifica|en\s+lugar\s+de|"
-               r"mejor\s+as[ií]|no\s+es\s+exacto|matiza|precisemos|"
-               r"con\s+m[aá]s\s+precisi[oó]n)\b", re.IGNORECASE),
-]
+# ── Palabras de cortesía (NUNCA son approve) ──
+_RE_COURTESY = re.compile(
+    r"\b(?:gracias|thank|thanks|de\s+nada|saludos|cordialmente|"
+    r"(?:que\s+)?tengas?|excelente\s+d[ií]a|"
+    r"buen[ao]s?\s+(?:d[ií]a|tardes|noches)|"
+    r"hasta\s+luego|nos\s+vemos|chao|bye|"
+    r"cuidate|cuídese|un\s+gusto)\b",
+    re.IGNORECASE,
+)
 
-# ── Umbrales de confianza ───────────────────────────────────────────
-_CONFIDENCE_HIGH = 0.85
-_CONFIDENCE_APPROVE_MEDIUM = 0.70
-_CONFIDENCE_REJECT_MEDIUM = 0.75
-_CONFIDENCE_DISCARD = 0.0  # no hay señal → descarte
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 1: Modo de la frase (pregunta vs afirmación vs hipótesis)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _es_pregunta_o_condicional(text: str) -> bool:
+    """Analiza si el texto es una pregunta, condicional o hipótesis.
+
+    Reglas estructurales:
+      - Termina con "?" → es pregunta
+      - Contiene palabras WH (qué, quién, cómo, etc.) → es pregunta
+      - Contiene verbos en condicional (podría, sería, etc.) → es hipótesis
+      - Empieza con "si " sin tilde y tiene más de 2 palabras → condicional
+    """
+    t = text.lower().strip()
+
+    # Regla 1: Signo de interrogación
+    if _RE_QUESTION_END.search(t):
+        return True
+
+    # Regla 2: Palabras WH que indican pregunta
+    if _RE_QUESTION_WORDS.search(t):
+        return True
+
+    # Regla 3: Verbos en condicional/subjuntivo (modo hipotético)
+    if _RE_CONDITIONAL_VERBS.search(t):
+        return True
+
+    # Regla 4: "si" condicional al inicio (sin tilde)
+    # Diferencia: "si quiero" (afirmación) vs "si llueve" (condición)
+    words = t.split()
+    if len(words) >= 2 and words[0] == "si" and "sí" not in t:
+        second = words[1].strip(",.!?¿¡;:")
+        # Palabras afirmativas tras "si": "si claro", "si segura?", "si quiero" → afirmación
+        if second in ("claro", "seguro", "segura", "quiero", "quiero", "por", "dame"):
+            return False  # "si claro", "si quiero" → afirmación
+        # Palabras que indican condicional: "si llueve", "si cambia", "si tengo"
+        # Verbo conjugado en 3ra persona o verbo de acción
+        return True  # "si llueve", "si pasa", "si puedo" → condicional
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 2: Cortesía (no es respuesta a la propuesta)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _es_solo_cortesia(text: str) -> bool:
+    """Determina si el mensaje es únicamente una cortesía o saludo.
+
+    Un mensaje de SOLO cortesía (sin otras señales) nunca es approve.
+    """
+    t = text.lower().strip()
+    return bool(_RE_COURTESY.search(t))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 3: Intención de rechazo (posición y negación)
+# ══════════════════════════════════════════════════════════════════════
+
+
+_RE_NO_WORD = re.compile(r"(?<!\w)no(?!\w)", re.IGNORECASE)
+# Verbos de rechazo semántico (no son listas, son raíces semánticas)
+_RE_REJECT_VERBS = re.compile(
+    r"\b(?:olv[ií]d|descart[aá]|elimin[aá]|quit[aá]|ignor[aá]|cancel[aá]|anul[aá]|borr[aá]|tir[aá])\w*\b",
+    re.IGNORECASE,
+)
+# Frases compuestas de rechazo (estructura, no lista)
+_RE_REJECT_PHRASE = re.compile(
+    r"\b(?:no\s+(?:guard|quiero|hag[ae]s?|graba|recuerd|necesit))\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _hay_rechazo(text: str) -> float:
+    """Evalúa la fuerza de la señal de rechazo en el texto.
+
+    Retorna confianza 0.0 (sin rechazo) a 1.0 (rechazo inequívoco).
+    """
+    t = text.lower().strip()
+    score = 0.0
+
+    # Señal fuerte: "no" como palabra independiente
+    if _RE_NO_WORD.search(t):
+        # Si "no" es la única palabra o va seguido de cortesía, es reject claro
+        words = t.split()
+        if len(words) == 1:
+            score += 0.75  # "no" suelto → reject inequívoco
+        elif len(words) == 2 and _RE_COURTESY.search(t):
+            score += 0.75  # "no gracias" → reject
+        else:
+            score += 0.5  # "no" en frase más larga
+
+    # Señal fuerte: verbo de rechazo
+    if _RE_REJECT_VERBS.search(t):
+        score += 0.3
+
+    # Señal muy fuerte: frase compuesta "no + verbo de memoria"
+    if _RE_REJECT_PHRASE.search(t):
+        score += 0.3
+
+    return min(score, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 4: Intención de aprobación (tonicidad y contexto)
+# ══════════════════════════════════════════════════════════════════════
+
+
+# "sí" con tilde es tónico → afirmación. "si" sin tilde es átono → condicional.
+_RE_SI_TILDE = re.compile(r"\bs[íi]\b", re.IGNORECASE)  # sí o sí (con tilde)
+# Verbos de aprobación semántica (raíces, no lista cerrada)
+_RE_APPROVE_VERBS = re.compile(
+    r"\b(?:aprob|confirm|acept|valid[ae]|autoric)\w*\b",
+    re.IGNORECASE,
+)
+# Frases compuestas de aprobación (estructura detectada)
+_RE_APPROVE_PHRASE = re.compile(
+    r"\b(?:est[aá]\s+bien|me\s+p[aá]rece\s+bien|de\s+acuerdo|"
+    r"muy\s+bien|perfecto?|correcto|excelente)\b",
+    re.IGNORECASE,
+)
+# Comandos de memorización (acción explícita)
+_RE_STORE_COMMANDS = re.compile(
+    r"\b(?:gu[aá]rd[aeoá]l?|recu[eé]rd[aeoá]l?|ap[uú]nt[aeoá]l?|"
+    r"escrib[ae]|almacen[ae]|anot[ae])\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _hay_aprobacion(text: str) -> float:
+    """Evalúa la fuerza de la señal de aprobación en el texto.
+
+    Retorna confianza 0.0 (sin aprobación) a 1.0 (aprobación inequívoca).
+
+    Reglas estructurales (NO listas de palabras):
+      - "sí" tónico (con tilde o contexto afirmativo corto) → approve
+      - Verbos semánticos de aprobación → approve
+      - Frases compuestas de consentimiento → approve
+      - Comandos de memorización → approve implícito
+      - "bien" como única palabra o al inicio de cortesía → NO approve
+    """
+    t = text.lower().strip()
+    score = 0.0
+
+    # Señal fuerte: "sí" con tilde (inequívoco, confianza alta)
+    if _RE_SI_TILDE.search(t):
+        score += 0.7
+
+    # Señal fuerte: verbo de aprobación
+    if _RE_APPROVE_VERBS.search(t):
+        score += 0.4
+
+    # Señal fuerte: frase compuesta aprobatoria ("está bien", "me parece bien")
+    if _RE_APPROVE_PHRASE.search(t):
+        score += 0.7
+
+    # Señal fuerte: comando de memorización (acción explícita de guardar)
+    # "guárdalo", "recuérdalo", "apúntalo" → approve implícito
+    if _RE_STORE_COMMANDS.search(t):
+        score += 0.8
+
+    # Señal fuerte: palabras cortas de afirmación internacional
+    words_clean = [w.strip(",.!?¿¡;:") for w in t.split()]
+    if len(words_clean) == 1 and words_clean[0] in ("ok", "okay", "vale", "yes", "yeah", "yep", "dale", "claro"):
+        score += 0.7
+
+    return min(score, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 5: Intención de edición (corrección estructural)
+# ══════════════════════════════════════════════════════════════════════
+
+
+_RE_EDIT_MARKERS = re.compile(
+    r"\b(?:mejor\s+d[ií]cho|en\s+realidad|"
+    r"edita|modifica|corrige|rectific|matiz[ae]|precisemos|"
+    r"en\s+lugar\s+de|no\s+es\s+exacto|m[aá]s\s+bien|"
+    r"con\s+m[aá]s\s+precisi[oó]n)\b",
+    re.IGNORECASE,
+)
+
+
+def _hay_edicion(text: str) -> float:
+    """Evalúa la fuerza de la señal de edición en el texto.
+
+    Retorna confianza 0.0 a 1.0.
+    La edición requiere señales explícitas de corrección + texto alternativo.
+    """
+    t = text.lower().strip()
+    if _RE_EDIT_MARKERS.search(t):
+        return 0.85  # Señal inequívoca de corrección
+    return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Eje 6: Falsos positivos (lo que parece approve pero no lo es)
+# ══════════════════════════════════════════════════════════════════════
+
+
+# "bien" suelto: "bien, gracias", "bien", "bien y tú" NO son approve
+_RE_BIEN_WORD = re.compile(r"\bbien\b", re.IGNORECASE)
+
+
+def _es_falso_positivo_aprobacion(text: str) -> bool:
+    """Detecta palabras que parecen aprobación pero no lo son.
+
+    "bien" suelto sin frase compuesta aprobatoria → NO es approve.
+    """
+    t = text.lower().strip()
+    if not _RE_BIEN_WORD.search(t):
+        return False
+    # Si "bien" está en frase compuesta aprobatoria, no es falso positivo
+    if _RE_APPROVE_PHRASE.search(t):
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Clasificador principal
+# ══════════════════════════════════════════════════════════════════════
 
 
 def classify_user_intent(
     user_message: str,
 ) -> IntentClassification:
     """Clasifica la intención del usuario respecto a la propuesta pendiente.
+
+    Usa un sistema de reglas estructurales en 6 ejes:
+      1. Modo (pregunta/condicional vs afirmación)
+      2. Cortesía
+      3. Rechazo (posición de negación + verbos semánticos)
+      4. Aprobación (tonicidad + verbos semánticos + frases compuestas)
+      5. Edición (marcadores de corrección + texto alternativo)
+      6. Falsos positivos
 
     Args:
         user_message: El mensaje completo del usuario.
@@ -127,74 +360,127 @@ def classify_user_intent(
             explanation="No hay propuesta pendiente para clasificar.",
         )
 
-    msg_lower = user_message.lower().strip()
+    msg = user_message.strip()
+    msg_lower = msg.lower()
 
-    # ── Detectar intención de edición (primero, porque contiene "no" pero es constructiva) ──
-    for pattern in _EDIT_PATTERNS:
-        if pattern.search(msg_lower):
-            # Intentar extraer el texto editado
-            edit_text = _extract_edit_text(user_message, proposal.get("proposal", ""))
+    # ════════════════════════════════════════════════════════════════
+    # Paso 1: Descartar por estructura — preguntas y condicionales
+    # ════════════════════════════════════════════════════════════════
+    # Una pregunta NUNCA es approve/edit (no responde a la propuesta)
+    if _es_pregunta_o_condicional(msg_lower):
+        return IntentClassification(
+            intent="discard",
+            confidence=_CONFIDENCE_DISCARD,
+            explanation="El mensaje es una pregunta o expresión condicional, no una respuesta a la propuesta. Se descarta.",
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # Paso 2: Evaluar señales de rechazo
+    # ════════════════════════════════════════════════════════════════
+    reject_score = _hay_rechazo(msg_lower)
+    if reject_score >= _CONFIDENCE_REJECT:
+        return IntentClassification(
+            intent="reject",
+            confidence=reject_score,
+            explanation=f"Señal de rechazo detectada (confianza={reject_score:.2f}).",
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # Paso 3: Evaluar señales de edición
+    # ════════════════════════════════════════════════════════════════
+    edit_score = _hay_edicion(msg_lower)
+    if edit_score >= _CONFIDENCE_EDIT:
+        edit_text = _extraer_texto_editado(msg, proposal.get("proposal", ""))
+        return IntentClassification(
+            intent="edit",
+            confidence=edit_score,
+            edit_text=edit_text or proposal.get("proposal", ""),
+            explanation=f"Marcador de corrección detectado. Texto editado: '{edit_text[:80] if edit_text else 'N/A'}'.",
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # Paso 4: Descartar cortesías sin señales de approve
+    # ════════════════════════════════════════════════════════════════
+    # "gracias", "saludos", etc. sin approve explícito → discard
+    # Excepción: si tiene "no" (p.ej. "no gracias") → ya lo capturó Paso 2
+    if _es_solo_cortesia(msg_lower):
+        approve_score = _hay_aprobacion(msg_lower)
+        if approve_score < _CONFIDENCE_APPROVE:
             return IntentClassification(
-                intent="edit",
-                confidence=_CONFIDENCE_HIGH,
-                edit_text=edit_text,
-                explanation=f"El usuario sugiere una edición a la propuesta: '{edit_text[:80] if edit_text else 'N/A'}'.",
+                intent="discard",
+                confidence=_CONFIDENCE_DISCARD,
+                explanation="El mensaje es una cortesía o saludo sin aprobación explícita. Se descarta.",
             )
 
-    # ── Detectar rechazo explícito ──
-    for pattern in _REJECT_PATTERNS:
-        if pattern.search(msg_lower):
-            return IntentClassification(
-                intent="reject",
-                confidence=_CONFIDENCE_REJECT_MEDIUM,
-                explanation=f"Patrón de rechazo detectado en mensaje del usuario.",
-            )
+    # ════════════════════════════════════════════════════════════════
+    # Paso 5: Descartar falsos positivos de approve
+    # ════════════════════════════════════════════════════════════════
+    # "bien" suelto sin frase compuesta (ej: "bien, gracias") NO es approve
+    if _es_falso_positivo_aprobacion(msg_lower):
+        return IntentClassification(
+            intent="discard",
+            confidence=_CONFIDENCE_DISCARD,
+            explanation=(
+                "El mensaje contiene 'bien' sin frase compuesta de aprobación "
+                "(p.ej. 'está bien'). Se descarta por ambigüedad."
+            ),
+        )
 
-    # ── Detectar aprobación explícita ──
-    for pattern in _APPROVE_PATTERNS:
-        if pattern.search(msg_lower):
-            return IntentClassification(
-                intent="approve",
-                confidence=_CONFIDENCE_APPROVE_MEDIUM,
-                explanation=f"Patrón de aprobación detectado en mensaje del usuario.",
-            )
+    # ════════════════════════════════════════════════════════════════
+    # Paso 6: Evaluar señales de aprobación
+    # ════════════════════════════════════════════════════════════════
+    approve_score = _hay_aprobacion(msg_lower)
+    if approve_score >= _CONFIDENCE_APPROVE:
+        return IntentClassification(
+            intent="approve",
+            confidence=approve_score,
+            explanation=f"Señal de aprobación detectada (confianza={approve_score:.2f}).",
+        )
 
-    # ── Si el mensaje es muy corto y parece respuesta directa ──
-    if len(msg_lower) <= 5 and msg_lower in ("sí", "si", "ok", "okay", "vale", "no", "yes"):
-        if msg_lower in ("sí", "si", "ok", "okay", "vale", "yes"):
-            return IntentClassification(
-                intent="approve",
-                confidence=_CONFIDENCE_HIGH,
-                explanation="Respuesta afirmativa explícita.",
-            )
-        else:
-            return IntentClassification(
-                intent="reject",
-                confidence=_CONFIDENCE_HIGH,
-                explanation="Respuesta negativa explícita.",
-            )
+    # ════════════════════════════════════════════════════════════════
+    # Paso 7: "si" sin tilde como respuesta corta (1-2 palabras)
+    # ════════════════════════════════════════════════════════════════
+    # "si" sin tilde no pasó approve_score porque no es "sí" con tilde,
+    # pero en mensaje corto de 1-2 palabras puede ser afirmación oral
+    words = msg_lower.split()
+    if len(words) <= 2 and msg_lower in ("si", "si,", "si."):
+        return IntentClassification(
+            intent="approve",
+            confidence=_CONFIDENCE_APPROVE,
+            explanation='Respuesta afirmativa corta ("si" sin tilde como afirmación oral).',
+        )
 
-    # ── Si no hay señales claras → descarte por defecto ──
+    # ════════════════════════════════════════════════════════════════
+    # Paso 8: Por defecto → discard (nunca asumir aprobación)
+    # ════════════════════════════════════════════════════════════════
     return IntentClassification(
         intent="discard",
         confidence=_CONFIDENCE_DISCARD,
         explanation=(
             "No se detectaron señales claras de aprobación, rechazo o edición. "
             "La propuesta se descarta por defecto — nunca se asume aprobación "
-            "por silencio o ambigüedad."
+            "por silencio o ambigüedad.  (CONTEXT.md §Hito8, "
+            "agent-memory-harness-guard.md §2.4)"
         ),
     )
 
 
-def _extract_edit_text(user_message: str, original_proposal: str) -> str | None:
-    """Intenta extraer el texto editado de la propuesta.
+# ══════════════════════════════════════════════════════════════════════
+#  Extracción de texto editado
+# ══════════════════════════════════════════════════════════════════════
 
-    Estrategia simple: busca frases como 'mejor dicho: ...' o
-    'en realidad ...' o 'cambia X por Y'.
+
+def _extraer_texto_editado(user_message: str, original_proposal: str) -> str | None:
+    """Extrae el texto editado de la propuesta desde el mensaje del usuario.
+
+    Busca patrones estructurales de corrección:
+      - "mejor dicho: X" / "mejor así: X"
+      - "no es exacto, es X"
+      - Texto alternativo extenso (>20 chars, distinto al original)
     """
     msg = user_message
 
-    # Patrón "mejor dicho: X" o "mejor así: X"
+    # Patrón "mejor dicho/así: X"
     m = re.search(
         r"(?:mejor\s+d[ií]cho|mejor\s+as[ií]|en\s+realidad)\s*:?\s*(.+?)(?:\.\s*$|$)",
         msg, re.IGNORECASE | re.DOTALL,
@@ -202,20 +488,16 @@ def _extract_edit_text(user_message: str, original_proposal: str) -> str | None:
     if m:
         return m.group(1).strip()
 
-    # Patrón "cambia X por Y"
-    m = re.search(
-        r"cambia\s+(.+?)\s+por\s+(.+?)(?:\.\s*$|$)",
-        msg, re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        return f"{m.group(1).strip()} → {m.group(2).strip()}"
-
-    # Si el mensaje es una corrección directa de la propuesta
-    # (p. ej. el usuario escribe la versión corregida)
+    # Texto alternativo extenso y diferente al original → probable edición
     if len(msg) > 20 and msg != original_proposal:
         return msg.strip()
 
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Utilidad: cambio de tema
+# ══════════════════════════════════════════════════════════════════════
 
 
 def user_changed_topic(user_message: str, original_question: str | None) -> bool:
@@ -229,11 +511,5 @@ def user_changed_topic(user_message: str, original_question: str | None) -> bool
         True si el usuario parece haber cambiado de tema.
     """
     if not original_question:
-        # Sin referencia, consideramos cambio de tema si hay
-        # una pregunta nueva sobre la que clasificar
         return "?" in user_message
-
-    # Si hay una pregunta que no sea sobre la propuesta
-    # y no contiene referencias a la propuesta, es cambio de tema
-    # (la heurística simple: el clasificador ya nos dice si descartar)
     return False

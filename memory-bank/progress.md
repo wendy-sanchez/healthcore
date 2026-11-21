@@ -5,38 +5,37 @@
 ### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
 
 - **Completado**: Paquete `services/agent/memory/` con 5 módulos:
-  - `store.py` (~680 líneas) — Backend TinyDB con 3 tablas (memory_facts, pending_proposal, audit_log), validación PHI dual con **lista blanca** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`) para evitar falsos positivos de staff/ubicaciones de HealthCore, consolidación automática (threshold 50 facts, TTL 90 días), auditoría con 8 tipos de evento.
-  - `classifier.py` (238 líneas) — Clasificador de intención del usuario sin LLM (reglas léxicas + umbrales de confianza). Intents: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0 por defecto). Detección de cambio de tema.
-  - `pipeline.py` (~660+ líneas) — Orquestador: auto-evaluación de respuestas (28 trigger keywords incluyendo 10 comandos explícitos), extracción de candidatos con **3 extractores específicos + 2 extractores de respaldo** (`_extract_command_memory`, `_extract_fallback_content`), clasificación en 3 categorías (operational, incident_pattern, staff_preference), detección de duplicados, formato de propuesta, **rechazo explícito PHI con mensaje HIPAA/UK GDPR**, procesamiento de respuesta. `_QUERY_PHRASES` con regex `\b` para word boundary.
-  - `nodes.py` (~270 líneas) — 3 nodos LangGraph + 3 routers que integran el sistema en el grafo. `node_auto_evaluate_memory` maneja `phi_rejected` proposal_info sin persistir.
-  - `__init__.py` — Documento de arquitectura con 6 principios de diseño.
+  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas, validación PHI dual con **lista blanca** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`), consolidación automática (50 facts, TTL 90 días), auditoría con 6 eventos (`proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`).
+  - `classifier.py` (~514 líneas) — **Clasificador estructural** rediseñado con **6 ejes analíticos** y **pipeline de 8 pasos** en `classify_user_intent()`. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`. Umbrales: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0).
+  - `pipeline.py` (~802 líneas) — Orquestador con 28 trigger keywords, 3 extractores + 2 de respaldo, clasificación en 3 categorías, rechazo PHI explícito con mensaje HIPAA/UK GDPR.
+  - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers.
+  - `__init__.py` — 6 principios de diseño.
 
 - **Completado**: Integración en grafo LangGraph:
-  - 6 nuevos campos en `AgentState`: `memory_facts`, `memory_context`, `memory_proposal`, `memory_proposal_handled`, `memory_proposal_handled_text`, `memory_proposal_result`, `run_id`.
-  - Entrypoint actualizado: `receive_question → load_memory_context` (antes iba directo a `classify_query`).
-  - Nuevo flujo: load_memory_context → (process_proposal si hay pendiente | classify_query) → ... → generate_answer → auto_evaluate_memory → END.
-  - Grafo ampliado de 10 a 13 nodos.
+  - 7 nuevos campos en `AgentState`.
+  - Entrypoint actualizado y grafo ampliado de 10 a 13 nodos.
 
-- **Completado**: PHI Compliance:
-  - 8 patrones PHI cubriendo HIPAA (US) + UK GDPR: nombres con acentos, SSN, NHS numbers, emails, MRNs, términos clínicos, fechas de nacimiento, teléfonos, direcciones físicas.
-  - Validación TWICE: antes de mostrar propuesta y antes de escribir en TinyDB.
-  - Re-validación PHI durante consolidación.
+- **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
 
-- **Completado**: 32 nuevos tests de memoria en 5 clases:
-  - `TestMemoryPHI` (8 tests) — verifica cada patrón PHI individualmente.
-  - `TestMemoryStore` (5 tests) — CRUD de facts, pending proposal singleton, conteo.
-  - `TestMemoryClassifier` (7 tests) — approve/reject/edit/discard, cambio de tema, sin propuesta pendiente.
-  - `TestMemoryPipeline` (7 tests) — auto-evaluación, duplicados, contexto, status summary.
-  - `TestMemoryGraphIntegration` (3 tests) — flujo completo, PHI en grafo, sin propuesta si no procede.
-  - **32/32 tests de memoria pasan + 32 tests originales = 64 tests en test_agent_graph.py.**
+- **Completado**: **47 tests de memoria** en 5 clases (antes 32):
+  - `TestMemoryPHI` (8 tests)
+  - `TestMemoryStore` (5 tests)
+  - `TestMemoryClassifier` (**17 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente)
+  - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
+  - `TestMemoryGraphIntegration` (**6 tests**, incluyendo **3 tests E2E**: graph_E2E_approve/reject/discard)
+  - **47/47 tests de memoria pasan + 32 tests originales = 79 tests en test_agent_graph.py.**
 
-- **Completado**: 194 tests totales en la suite del workspace (64 memory+agent + 130 de sales_forecast, MCP auth, nightly, temporal_cv, etc.)
+- **Completado**: **209 tests totales** en la suite del workspace (79 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
 
-- **Completado**: Auditoría 11/11 acceptance criteria cumplidos — documentada en `AUDITORIA_HITO8_MEMORIA.md`.
+- **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
+  - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
+  - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
+  - Bug 14: "cambia el horario" → ahora edit (eje edición)
 
-- **Completado**: Documentación técnica:
-  - `agent-memory-harness-guard.md` (~1050+ líneas) — 12 secciones, 7 preguntas de diseño, tabla comparativa de 5 alternativas, 4 ciclos completos (aprobado, rechazado, editado, PHI bloqueado), política de consolidación, diagramas de flujo, snippets de código, tabla de **11 bugs corregidos**, whitelist PHI documentada, rechazo explícito PHI documentado.
-  - `AUDITORIA_HITO8_MEMORIA.md` — 11/11 criterios con evidencia detallada por criterio.
+- **Completado**: Auditoría — criterios cumplidos.
+
+- **Completado**: Documentación técnica actualizada:
+  - `agent-memory-harness-guard.md` (~1100+ líneas) — 12 secciones, clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos, eventos de auditoría corregidos a valores reales (`proposed`/`approved`/`rejected`/`discarded`/`edited`), conteos de tests actualizados (47 memoria, 209 total), tabla ampliada a **15 bugs corregidos** (bugs 12-15 documentados).
 
 - **Completado**: Bugs corregidos (11 totales):
   1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.

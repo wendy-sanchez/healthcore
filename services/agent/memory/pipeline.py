@@ -227,13 +227,12 @@ def _should_evaluate(question: str, answer: str) -> bool:
     - Preguntas hipotéticas o condicionales no generan propuestas
     - Consultas de datos puntuales no generan propuestas
     - Preguntas con señal de cambio SÍ pueden generar si la respuesta confirma
+      una cambio real, no si el usuario solo pregunta si algo cambió
     """
     combined = (question + " " + answer).lower()
     q_lower = question.lower()
 
     # Señales de NO evaluar (solo en la pregunta del usuario)
-    # No revisamos la respuesta del agente porque podría contener
-    # cortesías como "gracias" que no indican despedida real.
     for indicator in _NON_MEMORIZABLE_INDICATORS:
         if indicator in q_lower:
             return False
@@ -247,14 +246,45 @@ def _should_evaluate(question: str, answer: str) -> bool:
     has_trigger = any(keyword in combined for keyword in _MEMORIZE_TRIGGER_KEYWORDS)
 
     if has_trigger:
-        # Si tiene trigger y no es una consulta genérica → evaluar
-        # Usamos regex con \b para evitar falsos positivos
-        # Ej: "lista" no debe matchear dentro de "especialista"
+        # ── Bloqueo de preguntas ───────────────────────────────────
+        # Si la pregunta termina con "?" y contiene triggers como
+        # "cambia", "cambio", "nuevo" etc., puede ser una CONSULTA sobre
+        # un posible cambio. Distinguimos:
+        #
+        #   "cambia el horario de la clínica?" → Pregunta genérica,
+        #       el usuario pregunta si algo cambió. La respuesta típica
+        #       describe el horario actual, no confirma un cambio. → NO evaluar
+        #
+        #   "¿Ha cambiado el proceso en Manchester?" + respuesta "Sí, ahora
+        #       requiere M-CDX2" → La respuesta CONFIRMA el cambio real.
+        #       → SÍ evaluar si la respuesta contiene confirmación del cambio
+        #
+        # Regla: una pregunta sobre cambio SÍ genera propuesta si la respuesta
+        # contiene un verbo en pasado/confirmativo que indique que el cambio
+        # ya ocurrió (ahora, ya, cambió, actualmente).
+        # Excepción: comandos explícitos de memorización (apúntalo, guárdalo, etc.)
+        has_explicit_cmd = any(
+            cmd in combined
+            for cmd in ["apúntalo", "guárdalo", "recuérdalo", "escribe", "guarda", "almacena"]
+        )
+        if q_lower.strip().endswith("?") and not has_explicit_cmd:
+            # Si la respuesta NO contiene confirmación de cambio → bloquear
+            a_lower = answer.lower()
+            has_confirmation = any(
+                word in a_lower
+                for word in ["ahora", "cambió", "cambio", "ya ", "actualmente", "sí,"]
+            )
+            if not has_confirmation:
+                return False
+            # Si la respuesta confirma, dejar pasar a los extractores
+
+        # ── Bloqueo de consultas genéricas con regex ───────────────
         if any(
             re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)
             for phrase in _QUERY_PHRASES
         ):
             return False
+
         return True
 
     # Sin trigger → no evaluar (conservador)
