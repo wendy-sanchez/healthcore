@@ -2,6 +2,10 @@
 
 ## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 
+- **Mejoras post-auditoría (2026-11-21)**:
+  - **3 nuevos tests E2E**: PHI-rejected vía auto-evaluate (5 pasos: propuesta PHI → rechazo → mensaje usuario → no escritura → audit), PHI-rejected vía set_pending (4 pasos), consolidación (5 pasos: crear facts → consolidar → marcar originales → re-validar PHI → audit)
+  - **Total: 212 tests (82 en test_agent_graph.py, 50 de memoria)**
+
 - **Entregable**: Sistema de memoria persistente para el agente LangGraph de HealthCore, que permite al agente recordar hechos operativos entre conversaciones con control explícito del usuario, auditoría completa y protección PHI.
 - **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador estructural, sin LLM).
 - **Arquitectura**: 5 módulos en `services/agent/memory/`:
@@ -12,7 +16,7 @@
   - `__init__.py` — 6 principios: PHI-free, audit trail, no silent writes, no assumption by default, single pending proposal, dual PHI validation.
 - **Integración en grafo**: `AgentState` con 7 nuevos campos. Flujo: `receive_question → load_memory_context → process_proposal` (si pendiente) / `classify_query` → ... → `auto_evaluate_memory` → END.
 - **PHI Compliance**: 8 patrones PHI. Validación TWICE + re-validación consolidación. **Lista blanca** para staff HealthCore. Marco HIPAA (US) + UK GDPR.
-- **Tests**: **209 tests en toda la suite** (79 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**17** tests, cubriendo 6 ejes estructurales + pipeline 8 pasos), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**6** tests, incluyendo **3 E2E** de ciclo completo). **Todos pasan**.
+- **Tests**: **212 tests en toda la suite** (82 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**17** tests, cubriendo 6 ejes estructurales + pipeline 8 pasos), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**9** tests, incluyendo **5 E2E** de ciclo completo: approve, reject, discard, **PHI-rejected (2 rutas)**, **consolidación**). **Todos pasan**.
 - **Bugs corregidos durante desarrollo (15 totales)**:
   1. `route_after_receive` → KeyError en aristas del grafo.
   2. PHI: falsos negativos acentos → expandido a `áéíóúñ`.

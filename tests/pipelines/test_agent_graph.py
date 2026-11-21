@@ -1772,3 +1772,220 @@ class TestMemoryGraphIntegration:
         assert "discarded" in events, (
             "Paso 5: audit debe tener 'discarded'"
         )
+
+    def test_e2e_memory_phi_rejected_auto_evaluate(self):
+        """Ciclo E2E: propuesta con PHI → rechazada por auto-evaluación → mensaje al usuario.
+
+        Verifica el flujo completo del requisito CONTEXT.md Hito8:
+          "el agente debe rechazar la propuesta explícitamente,
+           no solo ignorarla en silencio, y explicarle al usuario
+           por qué no puede recordar eso"
+        """
+        from services.agent.memory.pipeline import (
+            auto_evaluate_proposal,
+        )
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            get_pending_proposal,
+            _get_db,
+        )
+
+        # Setup
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+        initial_fact_count = len(get_all_facts())
+
+        # ── Paso 1: Auto-evaluar con contenido PHI ───────────────────
+        # Escenario: usuario menciona paciente y pide apuntarlo.
+        # La pregunta contiene el nombre (activa patrón PHI de
+        # 'paciente + nombre') y el answer confirma con 'apúntalo'
+        # como trigger keyword.
+        answer_con_propuesta, proposal_info = auto_evaluate_proposal(
+            question="El paciente Smith canceló su cita.",
+            answer="Sí, el paciente John Smith canceló su cita mañana, apúntalo.",
+            facts=[],
+            tool_results=[],
+            tool_errors=[],
+        )
+        assert proposal_info is not None, "Paso 1: Debe devolver proposal_info"
+        assert proposal_info.get("phi_rejected") is True, (
+            f"Paso 1: Debe detectar PHI. Propuesta: {proposal_info}"
+        )
+        assert "phi_matches" in proposal_info, (
+            "Paso 1: Debe incluir las coincidencias PHI"
+        )
+
+        # ── Paso 2: Mensaje explícito al usuario ────────────────────
+        assert "No puedo guardar eso en mi memoria" in answer_con_propuesta, (
+            "Paso 2: Debe contener mensaje explícito de rechazo PHI"
+        )
+        assert "HIPAA" in answer_con_propuesta, (
+            "Paso 2: Mensaje debe mencionar HIPAA"
+        )
+        assert "UK GDPR" in answer_con_propuesta, (
+            "Paso 2: Mensaje debe mencionar UK GDPR"
+        )
+
+        # ── Paso 3: No hay propuesta pendiente ───────────────────────
+        pending = get_pending_proposal()
+        assert pending is None, (
+            "Paso 3: No debe haber propuesta pendiente con PHI"
+        )
+
+        # ── Paso 4: No se escribió ningún fact ──────────────────────
+        facts_after = get_all_facts()
+        assert len(facts_after) == initial_fact_count, (
+            "Paso 4: No deben crearse facts tras rechazo PHI. "
+            f"Antes: {initial_fact_count}, Después: {len(facts_after)}"
+        )
+
+        # ── Paso 5: Audit_log tiene phi_rejected ────────────────────
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "phi_rejected" in events, (
+            "Paso 5: audit debe tener 'phi_rejected'"
+        )
+
+    def test_e2e_memory_phi_rejected_set_pending(self):
+        """Ciclo E2E: intento de guardar propuesta con PHI vía set_pending → rechazada.
+
+        Verifica que la validación PHI pre-write en set_pending_proposal
+        también funciona como segunda capa de defensa.
+        """
+        from services.agent.memory.store import (
+            clear_pending_proposal,
+            get_all_facts,
+            get_pending_proposal,
+            set_pending_proposal,
+            _get_db,
+        )
+
+        # Setup
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+        initial_fact_count = len(get_all_facts())
+
+        # ── Paso 1: Intentar guardar propuesta con PHI ───────────────
+        result = set_pending_proposal(
+            proposal="El paciente Johnson canceló su cita de mañana, apúntalo.",
+            reason="El usuario pidió explícitamente apuntarlo",
+            category="operational",
+            source_run_id="e2e_phi_test",
+            source_question="¿Qué pasó con la cita del paciente Johnson?",
+        )
+        assert result is None, (
+            "Paso 1: set_pending_proposal debe retornar None para PHI"
+        )
+
+        # ── Paso 2: No hay propuesta pendiente ───────────────────────
+        pending = get_pending_proposal()
+        assert pending is None, (
+            "Paso 2: No debe haber propuesta pendiente tras rechazo PHI"
+        )
+
+        # ── Paso 3: No se escribió ningún fact ──────────────────────
+        facts_after = get_all_facts()
+        assert len(facts_after) == initial_fact_count, (
+            "Paso 3: No deben crearse facts tras rechazo PHI. "
+            f"Antes: {initial_fact_count}, Después: {len(facts_after)}"
+        )
+
+        # ── Paso 4: Audit_log tiene phi_rejected ────────────────────
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "phi_rejected" in events, (
+            "Paso 4: audit debe tener 'phi_rejected'"
+        )
+
+    def test_e2e_memory_consolidation(self):
+        """Ciclo E2E: consolidación de múltiples facts.
+
+        Verifica que consolidate_memory(force=True):
+          1. Agrupa facts por categoría y genera resumen
+          2. Crea un nuevo fact consolidado
+          3. Marca los originales como consolidated con expires_at
+          4. Re-valida PHI antes de escribir el consolidado
+          5. Registra evento 'consolidated' en audit_log
+        """
+        from services.agent.memory.store import (
+            _get_db,
+            add_fact,
+            clear_pending_proposal,
+            consolidate_memory,
+            get_all_facts,
+            validate_phi_safe,
+        )
+
+        # Setup
+        clear_pending_proposal()
+        db = _get_db()
+        db.table("memory_facts").truncate()
+        db.table("audit_log").truncate()
+
+        # ── Paso 1: Crear 4 facts operacionales ──────────────────────
+        facts_created = []
+        for i, content in enumerate([
+            "El formulario M-CDX2 ahora es obligatorio en Manchester.",
+            "El proceso de derivación en Leeds cambió a digital.",
+            "En Austin los informes se entregan los viernes.",
+            "El horario de recepción en Londres se extendió a las 19:00.",
+        ]):
+            fact = add_fact(
+                content=content,
+                category="operational",
+                source_run_id="test_consolidation",
+            )
+            assert fact is not None, f"Paso 1: Fact {i} debe crearse"
+            facts_created.append(fact)
+
+        assert len(get_all_facts()) >= 4, (
+            "Paso 1: Debe haber al menos 4 facts"
+        )
+
+        # ── Paso 2: Consolidar (force=True para evitar threshold) ────
+        consolidated = consolidate_memory(force=True)
+        assert len(consolidated) >= 1, (
+            "Paso 2: consolidate_memory(force=True) debe crear consolidados"
+        )
+
+        consolidated_fact = consolidated[0]
+        assert consolidated_fact.get("consolidated") is True, (
+            "Paso 2: El fact consolidado debe tener consolidated=True"
+        )
+        assert "operativo" in consolidated_fact["content"].lower() or \
+               "Hechos operativos" in consolidated_fact["content"] or \
+               "operacional" in consolidated_fact["content"].lower(), (
+            "Paso 2: El resumen consolidado debe describir hechos operativos. "
+            f"Contenido: {consolidated_fact['content'][:100]}"
+        )
+
+        # ── Paso 3: Originales marcados como consolidated con TTL ────
+        all_facts = get_all_facts()
+        original_ids = {f["id"] for f in facts_created}
+        for f in all_facts:
+            if f["id"] in original_ids:
+                assert f.get("consolidated") is True, (
+                    f"Paso 3: Fact original {f['id']} debe tener consolidated=True"
+                )
+                assert "expires_at" in f, (
+                    f"Paso 3: Fact original {f['id']} debe tener expires_at"
+                )
+
+        # ── Paso 4: Re-validación PHI del consolidado ────────────────
+        phi_safe, phi_matches = validate_phi_safe(consolidated_fact["content"])
+        assert phi_safe, (
+            "Paso 4: El consolidado no debe contener PHI. "
+            f"Matches: {phi_matches}"
+        )
+
+        # ── Paso 5: Audit_log tiene evento consolidated ──────────────
+        audit_log = db.table("audit_log").all()
+        events = [e["event_type"] for e in audit_log]
+        assert "consolidated" in events, (
+            "Paso 5: audit debe tener 'consolidated'"
+        )

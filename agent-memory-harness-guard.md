@@ -1143,12 +1143,12 @@ print(agent_graph.nodes.keys())
 #  'process_proposal', 'auto_evaluate_memory']
 ```
 
-### 11.5 Resultado final — 209/209 tests PASSED
+### 11.5 Resultado final — 212/212 tests PASSED
 
 ```
 $ uv run python -m pytest tests/ --tb=short -q
 
-209 passed in 4.45s
+212 passed in 4.34s
 ```
 
 Desglose por categoría (tests en `test_agent_graph.py`):
@@ -1167,9 +1167,9 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | MemoryStore                | 5     | ✅     |
 | MemoryClassifier           | 17    | ✅     |
 | MemoryPipeline             | 11    | ✅     |
-| MemoryGraphIntegration     | 6     | ✅     |
-| **Total (agente+memoria)** | **79**| ✅     |
-| **Total suite completa**   | **209**| ✅     |
+| MemoryGraphIntegration     | 9     | ✅     |
+| **Total (agente+memoria)** | **82**| ✅     |
+| **Total suite completa**   | **212**| ✅     |
 
 ### 11.6 Historial de bugs corregidos (15 totales)
 
@@ -1194,10 +1194,10 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 **Bugs 12-14**: Reportados por el usuario después del Hito 8 inicial.
 **Bug 15**: Corrección estructural que resuelve los bugs 12-14 de raíz, eliminando la dependencia de listas planas de patrones. Implementado en `classifier.py` (~514 líneas) con 6 funciones analíticas y pipeline de 8 pasos en `classify_user_intent()`.
 
-> **Nota**: 79 tests en `test_agent_graph.py` (47 de memoria + 32 de agente) +
+> **Nota**: 82 tests en `test_agent_graph.py` (50 de memoria + 32 de agente) +
 > 130 tests en otros módulos (`test_sales_forecast_split.py`,
 > `test_mcp_server_auth.py`, `test_temporal_cv.py`, `nightly/`, etc.) =
-> **209 tests totales en la suite del workspace**.
+> **212 tests totales en la suite del workspace**.
 
 ---
 

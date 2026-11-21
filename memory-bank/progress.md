@@ -17,22 +17,26 @@
 
 - **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
 
-- **Completado**: **47 tests de memoria** en 5 clases (antes 32):
+- **Completado**: **50 tests de memoria** en 5 clases (antes 32):
   - `TestMemoryPHI` (8 tests)
   - `TestMemoryStore` (5 tests)
   - `TestMemoryClassifier` (**17 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente)
   - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
-  - `TestMemoryGraphIntegration` (**6 tests**, incluyendo **3 tests E2E**: graph_E2E_approve/reject/discard)
-  - **47/47 tests de memoria pasan + 32 tests originales = 79 tests en test_agent_graph.py.**
+  - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
+  - **50/50 tests de memoria pasan + 32 tests originales = 82 tests en test_agent_graph.py.**
 
-- **Completado**: **209 tests totales** en la suite del workspace (79 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
+- **Completado**: **212 tests totales** en la suite del workspace (82 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
 
 - **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
   - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
   - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
   - Bug 14: "cambia el horario" → ahora edit (eje edición)
 
-- **Completado**: Auditoría — criterios cumplidos.
+- **Completado**: Auditoría — criterios cumplidos. Reporte completo en AUDITORIA1.md.
+- **Completado**: **3 mejoras post-auditoría** (1 descartada, 2 implementadas):
+  - ✅ **PHI-rejected flow E2E** (2 tests: auto-evaluate + set_pending) — cierre de compliance crítico
+  - ✅ **Consolidación E2E** (1 test: force=True, verifica resumen, TTL, PHI re-validation)
+  - ❌ Trigger keywords en archivo externo — descartado (constantes en módulo es suficiente, sin valor real en externalizar)
 
 - **Completado**: Documentación técnica actualizada:
   - `agent-memory-harness-guard.md` (~1100+ líneas) — 12 secciones, clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos, eventos de auditoría corregidos a valores reales (`proposed`/`approved`/`rejected`/`discarded`/`edited`), conteos de tests actualizados (47 memoria, 209 total), tabla ampliada a **15 bugs corregidos** (bugs 12-15 documentados).
