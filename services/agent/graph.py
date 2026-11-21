@@ -44,6 +44,17 @@ from services.agent.tools.mcp_client import (
     query_products_list,
 )
 
+# Módulo de memoria (Hito 8)
+from services.agent.memory.nodes import (
+    node_auto_evaluate_memory,
+    node_load_memory_context,
+    node_process_proposal,
+    route_after_auto_evaluate,
+    route_after_load_memory,
+    route_after_process_proposal,
+)
+from services.agent.memory.store import get_all_facts
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────
@@ -79,6 +90,15 @@ class AgentState(TypedDict):
                           "rag+incident" | "rag+inventory" | ""
         tool_results:     Resultados normalizados de las tools.
         tool_errors:      Errores de las tools (fallback).
+
+    Atributos (Parte 3 — memoria Hito 8):
+        memory_facts:             Hechos de memoria cargados.
+        memory_context:           Contexto de memoria formateado para prompt.
+        memory_proposal:          Propuesta pendiente (dict) o None.
+        memory_proposal_handled:  Si la propuesta pendiente ya se procesó.
+        memory_proposal_handled_text: Texto de confirmación de manejo.
+        memory_proposal_result:   Resultado del procesamiento de propuesta.
+        run_id:                   Identificador único de la corrida (para auditoría).
     """
 
     question: str
@@ -92,9 +112,17 @@ class AgentState(TypedDict):
     routing_decision: str
     tool_results: Annotated[list[dict[str, Any]], _accumulate_list]
     tool_errors: Annotated[list[str], _accumulate_list]
+    # Parte 3 — Memoria (Hito 8)
+    memory_facts: list[dict[str, Any]]
+    memory_context: str
+    memory_proposal: Optional[dict[str, Any]]
+    memory_proposal_handled: bool
+    memory_proposal_handled_text: str
+    memory_proposal_result: Optional[dict[str, Any]]
+    run_id: str
 
 
-def build_initial_state(question: str) -> AgentState:
+def build_initial_state(question: str, run_id: str = "") -> AgentState:
     """Construye el estado inicial para una nueva corrida del grafo."""
     return AgentState(
         question=question.strip(),
@@ -107,6 +135,14 @@ def build_initial_state(question: str) -> AgentState:
         routing_decision="",
         tool_results=[],
         tool_errors=[],
+        # Memoria (Hito 8)
+        memory_facts=[],
+        memory_context="",
+        memory_proposal=None,
+        memory_proposal_handled=True,
+        memory_proposal_handled_text="",
+        memory_proposal_result=None,
+        run_id=run_id,
     )
 
 
@@ -723,15 +759,16 @@ def _format_inventory_response(products: list[dict[str, Any]]) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def route_after_receive(state: AgentState) -> Literal["classify_query", "__end__"]:
+def route_after_receive(state: AgentState) -> Literal["load_memory_context", "__end__"]:
     """Decide el siguiente paso después de validar la pregunta.
 
-    Ahora enruta a ``classify_query`` en lugar de directamente a
-    ``retrieve_context``. La clasificación decide si toca RAG, tool, o ambos.
+    Ahora enruta a ``load_memory_context`` (Parte 3 — Memoria) para
+    cargar contexto de interacciones previas antes de clasificar.
+    Si la pregunta es inválida, termina.
     """
     if state.get("error") or not state.get("question_valid", True):
         return "__end__"
-    return "classify_query"
+    return "load_memory_context"
 
 
 def route_after_classify(state: AgentState) -> str:
@@ -799,11 +836,12 @@ def route_after_retrieve_v2(state: AgentState) -> str:
     return "respond_no_info"
 
 
-def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesize_tool_answer", "__end__"]:
+def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesize_tool_answer", "auto_evaluate_memory", "__end__"]:
     """Después de generar la respuesta RAG, verifica si hay tools pendientes.
 
     Si la decisión original incluía tools y hay tool_results o tool_errors,
-    enruta a synthesize_tool_answer para combinar.  Si no, va a END.
+    enruta a synthesize_tool_answer para combinar.  Si no, enruta a
+    auto_evaluate_memory para evaluar si hay algo memorable que proponer.
     """
     if state.get("error"):
         return "handle_error"
@@ -815,7 +853,18 @@ def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesi
     if (has_tool_results or has_tool_errors) and decision in ("rag+incident", "rag+inventory"):
         return "synthesize_tool_answer"
 
-    return "__end__"
+    # Siempre pasar por auto-evaluación de memoria
+    return "auto_evaluate_memory"
+
+
+def route_after_synthesis(state: AgentState) -> Literal["auto_evaluate_memory", "__end__"]:
+    """Después de sintetizar la respuesta de tools, siempre va a auto-evaluación.
+
+    NUNCA vuelve a synthesize_tool_answer para evitar bucles infinitos.
+    """
+    if state.get("error"):
+        return "__end__"
+    return "auto_evaluate_memory"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -844,13 +893,39 @@ def _build_graph() -> StateGraph:
     workflow.add_node("query_inventory", node_query_inventory)
     workflow.add_node("synthesize_tool_answer", node_synthesize_tool_answer)
 
-    # Arista de entrada: el grafo arranca validando la pregunta
+    # ── Nodos de memoria (Parte 3 — Hito 8) ──────────────────────────
+    workflow.add_node("load_memory_context", node_load_memory_context)
+    workflow.add_node("process_proposal", node_process_proposal)
+    workflow.add_node("auto_evaluate_memory", node_auto_evaluate_memory)
+
+    # Arista de entrada: el grafo arranca cargando memoria contextual
     workflow.set_entry_point("receive_question")
 
     # ── Aristas condicionales (Parte 1 adaptadas) ────────────────────
     workflow.add_conditional_edges(
         "receive_question",
         route_after_receive,
+        {
+            "load_memory_context": "load_memory_context",
+            "__end__": END,
+        },
+    )
+
+    # ── Aristas de memoria (Parte 3) ──────────────────────────────────
+    # Después de cargar memoria: ¿propuesta pendiente o continuar?
+    workflow.add_conditional_edges(
+        "load_memory_context",
+        route_after_load_memory,
+        {
+            "process_proposal": "process_proposal",
+            "classify_query": "classify_query",
+        },
+    )
+
+    # Después de procesar propuesta: ¿continuar o terminar?
+    workflow.add_conditional_edges(
+        "process_proposal",
+        route_after_process_proposal,
         {
             "classify_query": "classify_query",
             "__end__": END,
@@ -901,20 +976,38 @@ def _build_graph() -> StateGraph:
     )
 
     # Después de generate_answer: ¿tools pendientes o END?
+    # También enruta a auto_evaluate_memory si no hay tools
     workflow.add_conditional_edges(
         "generate_answer",
         route_after_generate,
         {
             "handle_error": "handle_error",
             "synthesize_tool_answer": "synthesize_tool_answer",
+            "auto_evaluate_memory": "auto_evaluate_memory",
             "__end__": END,
         },
     )
 
-    # Nodos terminales
+    # Nodos terminales (sin auto-evaluación — nodos de fallback)
     workflow.add_edge("respond_no_info", END)
     workflow.add_edge("handle_error", END)
-    workflow.add_edge("synthesize_tool_answer", END)
+
+    # Síntesis de tool_answer → auto-evaluación (NUNCA volver a síntesis)
+    workflow.add_conditional_edges(
+        "synthesize_tool_answer",
+        route_after_synthesis,
+        {
+            "auto_evaluate_memory": "auto_evaluate_memory",
+            "__end__": END,
+        },
+    )
+
+    # Auto-evaluación siempre va a END
+    workflow.add_conditional_edges(
+        "auto_evaluate_memory",
+        route_after_auto_evaluate,
+        {"__end__": END},
+    )
 
     return workflow
 
@@ -965,6 +1058,12 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
     Llama al grafo compilado vía ainvoke, lo que permite que los nodos
     asíncronos (query_incident, query_inventory) funcionen correctamente.
 
+    El grafo ahora incluye:
+      - Carga de memoria contextual (hechos recordados)
+      - Procesamiento de propuestas pendientes de conversaciones anteriores
+      - Auto-evaluación al final para detectar nuevos hechos memorables
+      - Trazabilidad completa de todas las operaciones
+
     Args:
         question: Pregunta del usuario.
         run_id:   Identificador único para esta corrida (opcional).
@@ -972,7 +1071,7 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
 
     Returns:
         El estado final del grafo, incluyendo answer, trace_events y
-        routing_log.
+        routing_log, y metadata de memoria.
 
     Raises:
         ValueError: Si la pregunta está vacía o es demasiado corta.
@@ -991,7 +1090,7 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
         import uuid
         run_id = str(uuid.uuid4())
 
-    initial_state = build_initial_state(question)
+    initial_state = build_initial_state(question, run_id=run_id)
 
     # Configuración de la corrida con thread_id para checkpointing
     config = {

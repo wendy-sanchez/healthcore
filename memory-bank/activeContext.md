@@ -1,5 +1,49 @@
 # Active Context
 
+## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
+
+- **Mejoras post-auditoría (2026-11-21)**:
+  - **3 nuevos tests E2E**: PHI-rejected vía auto-evaluate (5 pasos: propuesta PHI → rechazo → mensaje usuario → no escritura → audit), PHI-rejected vía set_pending (4 pasos), consolidación (5 pasos: crear facts → consolidar → marcar originales → re-validar PHI → audit)
+  - **Total: 212 tests (82 en test_agent_graph.py, 50 de memoria)**
+
+- **Entregable**: Sistema de memoria persistente para el agente LangGraph de HealthCore, que permite al agente recordar hechos operativos entre conversaciones con control explícito del usuario, auditoría completa y protección PHI.
+- **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador estructural, sin LLM).
+- **Arquitectura**: 5 módulos en `services/agent/memory/`:
+  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas: `memory_facts`, `pending_proposal`, `audit_log` (6 eventos: `proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`). Validación PHI dual (antes de mostrar propuesta y antes de escribir). **Lista blanca PHI** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`). Consolidación automática (50 facts, TTL 90 días).
+  - `classifier.py` (~514 líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 8 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`.
+  - `pipeline.py` (~802 líneas) — Orquestador con **28 trigger keywords** incluyendo 10 comandos explícitos. 3 extractores específicos + 2 de respaldo. Clasifica en 3 categorías (`operational`, `incident_pattern`, `staff_preference`). Rechazo PHI explícito con mensaje HIPAA/UK GDPR.
+  - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers condicionales. `node_auto_evaluate_memory` maneja `phi_rejected` sin persistir.
+  - `__init__.py` — 6 principios: PHI-free, audit trail, no silent writes, no assumption by default, single pending proposal, dual PHI validation.
+- **Integración en grafo**: `AgentState` con 7 nuevos campos. Flujo: `receive_question → load_memory_context → process_proposal` (si pendiente) / `classify_query` → ... → `auto_evaluate_memory` → END.
+- **PHI Compliance**: 8 patrones PHI. Validación TWICE + re-validación consolidación. **Lista blanca** para staff HealthCore. Marco HIPAA (US) + UK GDPR.
+- **Tests**: **212 tests en toda la suite** (82 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**17** tests, cubriendo 6 ejes estructurales + pipeline 8 pasos), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**9** tests, incluyendo **5 E2E** de ciclo completo: approve, reject, discard, **PHI-rejected (2 rutas)**, **consolidación**). **Todos pasan**.
+- **Bugs corregidos durante desarrollo (15 totales)**:
+  1. `route_after_receive` → KeyError en aristas del grafo.
+  2. PHI: falsos negativos acentos → expandido a `áéíóúñ`.
+  3. `add_fact()` sin validación PHI → validación dual.
+  4. Clasificador: ambigüedad como aprobado → `_should_evaluate` reescrito.
+  5. Consolidación: facts nunca expiraban → `_DEFAULT_TTL_DAYS=90`.
+  6. Loop RAG+tool → `route_after_synthesis()`.
+  7. CONTEXT examples bloqueados → triggers movidos/expandidos.
+  8. Word boundary `_QUERY_PHRASES` → `re.search(r"\b...\b")`.
+  9. Faltaban comandos explícitos → 10 añadidos.
+  10. `_extract_memory_candidate` sin fallback → extractores de respaldo.
+  11. PHI rejection silenciosa → mensaje HIPAA/UK GDPR explícito.
+  12. **"si llueve" → discard**: `\bs[ií]\b` emparejaba "si" condicional como "sí" approve.
+  13. **"bien gracias" → discard**: `\bbien\b` daba approve falso en cortesías.
+  14. **"cambia el horario" → discard**: "cambia" en lista de memorize daba approve en vez de edit.
+  15. **Clasificador basado en listas planas**: Rediseño total a 6 ejes estructurales (resuelve bugs 12-14 de raíz).
+- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1100+ líneas, 12 secciones, tabla de 15 bugs corregidos, clasificador estructural documentado en §5.2, 3 nuevos tests E2E documentados).
+- **Verificación CONTEXT.md**: 6/6 ejemplos verificados al nivel de flujo completo (pipeline completo, no solo `_should_evaluate`):
+  - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
+  - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente
+  - ✅ Caso 3 (Austin alerta no-show) — propuesta creada (antes bloqueado por falso positivo "En Austin")
+  - ✅ Caso 4 (Diane Foster reporte) — propuesta creada (antes bloqueado por falso positivo PHI)
+  - ✅ Caso 5 (consulta puntual) — correctamente sin propuesta
+  - ✅ Caso 6 (agradecimiento) — correctamente sin propuesta
+- **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, 4 ciclos completos con trazas, política de consolidación, tabla de 11 bugs corregidos, whitelist PHI documentada, rechazo explícito PHI documentado.
+- **Branch**: `feature/agent-memory` (o rama activa del desarrollo).
+
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
 - **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
 - **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.

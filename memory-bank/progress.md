@@ -2,6 +2,72 @@
 
 ## Estado actual del desarrollo
 
+### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
+
+- **Completado**: Paquete `services/agent/memory/` con 5 módulos:
+  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas, validación PHI dual con **lista blanca** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`), consolidación automática (50 facts, TTL 90 días), auditoría con 6 eventos (`proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`).
+  - `classifier.py` (~514 líneas) — **Clasificador estructural** rediseñado con **6 ejes analíticos** y **pipeline de 8 pasos** en `classify_user_intent()`. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`. Umbrales: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0).
+  - `pipeline.py` (~802 líneas) — Orquestador con 28 trigger keywords, 3 extractores + 2 de respaldo, clasificación en 3 categorías, rechazo PHI explícito con mensaje HIPAA/UK GDPR.
+  - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers.
+  - `__init__.py` — 6 principios de diseño.
+
+- **Completado**: Integración en grafo LangGraph:
+  - 7 nuevos campos en `AgentState`.
+  - Entrypoint actualizado y grafo ampliado de 10 a 13 nodos.
+
+- **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
+
+- **Completado**: **50 tests de memoria** en 5 clases (antes 32):
+  - `TestMemoryPHI` (8 tests)
+  - `TestMemoryStore` (5 tests)
+  - `TestMemoryClassifier` (**17 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente)
+  - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
+  - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
+  - **50/50 tests de memoria pasan + 32 tests originales = 82 tests en test_agent_graph.py.**
+
+- **Completado**: **212 tests totales** en la suite del workspace (82 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
+
+- **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
+  - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
+  - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
+  - Bug 14: "cambia el horario" → ahora edit (eje edición)
+
+- **Completado**: Auditoría — criterios cumplidos. Reporte completo en AUDITORIA1.md.
+- **Completado**: **3 mejoras post-auditoría** (1 descartada, 2 implementadas):
+  - ✅ **PHI-rejected flow E2E** (2 tests: auto-evaluate + set_pending) — cierre de compliance crítico
+  - ✅ **Consolidación E2E** (1 test: force=True, verifica resumen, TTL, PHI re-validation)
+  - ❌ Trigger keywords en archivo externo — descartado (constantes en módulo es suficiente, sin valor real en externalizar)
+
+- **Completado**: Documentación técnica actualizada:
+  - `agent-memory-harness-guard.md` (~1100+ líneas) — 12 secciones, clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos, eventos de auditoría corregidos a valores reales (`proposed`/`approved`/`rejected`/`discarded`/`edited`), conteos de tests actualizados (47 memoria, 209 total), tabla ampliada a **15 bugs corregidos** (bugs 12-15 documentados).
+
+- **Completado**: Bugs corregidos (11 totales):
+  1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.
+  2. PHI: falsos negativos — patrón regex `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`. Además se expandieron patrones PHI: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone.
+  3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría, retornando None si se detecta PHI.
+  4. Clasificador: ambigüedad como aprobado — `"¿cambia el horario?"` y `"si llueve cancelo"` generaban propuestas. `_should_evaluate` reescrito: bloquea hipotéticas, requiere trigger keywords en combined text.
+  5. Consolidación: facts nunca expiraban — `add_fact()` no asignaba `expires_at` para facts no consolidados. Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None`.
+  6. Loop RAG+tool — `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes. Nueva `route_after_synthesis()` que va directo a `auto_evaluate_memory` o `__end__`.
+  7. CONTEXT examples bloqueados — `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"`.
+  8. **Word boundary en `_QUERY_PHRASES`** — `"lista"` matcheaba dentro de `"especialista"` por substring check. Corregido a `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)`. Esto bloqueaba el Caso 2 (Manchester cambio proceso).
+  9. **Faltaban comandos explícitos en triggers** — `"apúntalo"`, `"guárdalo"`, `"recuérdalo"`, `"escribe"`, `"almacena"` y variantes no estaban en `_MEMORIZE_TRIGGER_KEYWORDS`. Añadidos 10 comandos. Esto causaba que el Caso 1 (Johnson PHI con "apúntalo") fuera ignorado en silencio.
+  10. **`_extract_memory_candidate` sin fallback** — Incluso cuando `_should_evaluate()` retornaba True, si ningún extractor específico clasificaba la interacción, retornaba `None` y la propuesta se perdía antes de llegar a validación PHI. Añadidos `_extract_command_memory()` para comandos explícitos y `_extract_fallback_content()` como fallback genérico con inferencia de categoría.
+  11. **PHI rejection silenciosa** — `auto_evaluate_proposal()` retornaba `(answer, None)` cuando `validate_phi_safe()` detectaba PHI, sin informar al usuario. Corregido a rechazo explícito con mensaje HIPAA/UK GDPR y `{"phi_rejected": True}`. El nodo de grafo detecta esto y no persiste la propuesta.
+  - **Además**: **Lista blanca PHI** añadida en `store.py` (`_PHI_WHITELIST` y `_PHI_WHITELIST_PREFIXED`) para evitar falsos positivos con staff de HealthCore (Diane Foster, Claire Whitfield, Marcus Reid, Sandra Okonkwo, Priya Nair, James Osei) y ubicaciones operativas (Austin, Manchester, London, Miami, Dallas, etc.). Esto resolvió 2 falsos positivos: "En Austin" y "Diane Foster".
+
+- **Tests**: Suite completa de **194 tests** verificada: `uv run python -m pytest tests/ -v`.
+  - Memory tests: 32/32 pasan (incluyendo PHI patterns, store CRUD, classifier, pipeline, graph integration).
+  - Non-memory agent tests: 32/32 heredados siguen pasando.
+  - Tests adicionales: 130 tests en sales_forecast, MCP auth, nightly, temporal_cv, etc.
+  - **6/6 ejemplos de CONTEXT.md verificados** al nivel de flujo completo:
+    - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
+    - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente
+    - ✅ Caso 3 (Austin alerta no-show) — propuesta creada (antes bloqueado por falso positivo "En Austin")
+    - ✅ Caso 4 (Diane Foster reporte) — propuesta creada (antes bloqueado por falso positivo PHI)
+    - ✅ Caso 5 (consulta puntual) — correctamente sin propuesta
+    - ✅ Caso 6 (agradecimiento) — correctamente sin propuesta
+  - **Branch**: `feature/agent-memory`.
+
 ### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
 - **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.
 - **Problemas resueltos**:

@@ -617,3 +617,100 @@ uv run pytest tests/test_mcp_server_auth.py -v
 | **Integración LangGraph** | langchain-mcp-adapters | Convierte tools MCP a BaseTool de LangChain; integración nativa con LangGraph |
 | **DNS Rebinding** | `TransportSecuritySettings(enable_dns_rebinding_protection=False)` | FastMCP bloquea Host headers de túneles por defecto; se deshabilita para proxies reversos legítimos |
 
+## Sistema de Memoria Persistente del Agente — Hito 8 (services/agent/memory/)
+
+### Stack técnico
+- **Runtime**: Python 3.14+ (uv)
+- **Backend de almacenamiento**: TinyDB 4.9.0+ (JSON document store, zero-config, ya en el proyecto)
+- **LangGraph >=1.2.22**: StateGraph con MemorySaver checkpointing
+- **Sin dependencias nuevas**: TinyDB ya era dependencia del proyecto para telemetría y DLQ
+
+### Estructura de archivos
+```
+services/agent/memory/
+├── __init__.py          # Documento de arquitectura con 6 principios de diseño
+├── store.py             # Backend TinyDB: 3 tablas, PHI validation, auditoría, consolidación
+├── classifier.py        # Clasificador de intención basado en reglas léxicas (sin LLM)
+├── pipeline.py          # Orquestador: auto-evaluación, extracción, formato de propuesta
+└── nodes.py             # 3 nodos LangGraph + 3 routers para integración en el grafo
+```
+
+### Almacenamiento: TinyDB (store.py)
+- **Base de datos**: `data/process/agent_memory/agent_memory.json` (único archivo JSON)
+- **3 tablas TinyDB**:
+  1. `memory_facts` — Documentos con: `content` (string), `category` (operational|incident_pattern|staff_preference), `created_at` (ISO timestamp), `updated_at` (ISO), `expires_at` (ISO opcional), `consolidated` (bool), `source` (proposal_made|proposal_approved|consolidated_summary)
+  2. `pending_proposal` — Máximo 1 documento: `proposal_text` (string), `candidate_fact` (string), `category`, `created_at` (ISO), `message_id` (string opcional)
+  3. `audit_log` — Documentos con: `event_type` (string: fact_added|fact_deleted|proposal_made|proposal_approved|proposal_rejected|proposal_edited|proposal_discarded|memory_consolidated|phi_blocked), `timestamp` (ISO), `content_preview` (primeros 100 chars), `metadata` (dict opcional)
+
+### PHI Compliance
+- **8+ patrones PHI** (HIPAA + UK GDPR, expandidos — términos clínicos ahora cubren 20+ condiciones, apellidos hispanos 70+, teléfono internacional con lookbehind, MRN con colon, fechas standalone):
+  - `NOMBRE_PERSONA`: Nombres propios con caracteres acentuados `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`
+  - `SSN_US`: `\b\d{3}-\d{2}-\d{4}\b`
+  - `NHS_UK`: `\b\d{3}\s\d{3}\s\d{4}\b`
+  - `EMAIL`: `[\w._%+-]+@[\w.-]+\.[a-zA-Z]{2,}`
+  - `MRN_MEDICAL_RECORD`: `\bMRN[:\s-]?\d+\b`
+  - `CLINICAL_TERM`: Términos como 'diagnosis', 'prognosis', 'biopsy', 'diabetes', 'cáncer', 'leucemia', etc. (20+ condiciones)
+  - `BIRTH_DATE`: `\b\d{2}/\d{2}/\d{4}\b`
+  - `PHONE_PATTERN`: `\+?\d{1,3}[\s-]?\d{1,4}[\s-]?\d{1,4}[\s-]?\d{1,4}`
+  - `ADDRESS_PATTERN`: Direcciones con números y palabras clave (Street, Road, Avenue, etc.)
+- **Validación dual**: `validate_phi_safe()` se llama ANTES de mostrar propuesta al usuario y ANTES de `add_fact()`
+- **Ofuscación en auditoría**: Solo primeros 100 chars del texto sensible se guardan en audit_log
+
+### Clasificador de Intención (classifier.py)
+- **Sin LLM**: Clasificación basada en reglas léxicas con umbrales de confianza
+- **5 intenciones**: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0 por defecto), no_proposal (1.0 cuando no hay pendiente)
+- **Extracción de ediciones**: `_extract_edit_text()` extrae texto entre comillas dobles
+- **Detección de cambio de tema**: `user_changed_topic()` basada en bigramas del mensaje del usuario
+- **Regla crítica**: «Nunca se asume aprobación por silencio o ambigüedad» — discard es el default con confidence 0.0
+
+### Pipeline de Memoria (pipeline.py)
+- **Auto-evaluación**: `auto_evaluate_proposal(question, answer, facts, tool_results, tool_errors)` se llama tras cada respuesta. `_should_evaluate` reescrito con trigger keywords, detección hipotética/condicional, y query phrases de consulta.
+- **18 trigger keywords**: recuerda, aprende, guarda, memoriza, almacena, favorito, etc. (expandidos con "pidió", "debe", "alerta", "cierre", "no-show", "fue porque", "hubo")
+- **Indicador «no memorizable» reducido**: solo "gracias" — los anteriores ("reporte", "dashboard", "esta semana") se movieron a trigger keywords
+- **3 categorías**: operational, incident_pattern, staff_preference
+- **Formato de propuesta**: `📝 **¿Quieres que recuerde esto para la próxima vez?**` + candidate fact
+- **Máximo 1 propuesta pendiente**: Si ya hay pendiente, se omite evaluación para no reemplazarla
+
+### Integración en Grafo LangGraph (graph.py + nodes.py)
+- **3 nuevos nodos**: `load_memory_context` (carga facts + chequea propuesta pendiente), `process_proposal` (procesa respuesta del usuario), `auto_evaluate_memory` (evalúa si la respuesta merece memoria)
+- **3 nuevos routers**: `route_after_load_memory` → process_proposal o classify_query, `route_after_process_proposal` → classify_query o END, `route_after_auto_evaluate` → END
+- **6 nuevos campos en AgentState**: `memory_facts`, `memory_context`, `memory_proposal`, `memory_proposal_handled`, `memory_proposal_handled_text`, `memory_proposal_result`, `run_id`
+- **Entrypoint actualizado**: `receive_question → load_memory_context` (antes iba directo a classify_query)
+- **Grafo**: 10 nodos originales + 3 nodos de memoria = 13 nodos total
+
+### Política de Consolidación
+- **Threshold**: 50 facts (configurable en `consolidate_memory(force=False)`)
+- **TTL**: 90 días (facts con `expires_at < now` se purgan)
+- **Auto-asignación**: `add_fact()` asigna `_DEFAULT_TTL_DAYS` (90) via helper `_now_plus_days(days)` cuando `consolidated=False` y `expires_at` no se proporciona
+- **Determinista**: `_build_summary()` agrupa facts por categoría y genera resumen
+- **Resumen**: Se escribe como nuevo fact con categoría `consolidated_summary`; facts originales se marcan como consolidados
+
+### Variables de Entorno (ninguna nueva)
+- El sistema de memoria no requiere variables de entorno adicionales
+- El path de la base de datos es fijo: `data/process/agent_memory/agent_memory.json`
+- Dependencias: TinyDB (ya instalada), LangGraph (ya instalado), datetime (stdlib), re (stdlib), typing (stdlib)
+
+### Tests
+```bash
+# Ejecutar todos los tests del agente (incluyendo memoria)
+uv run python -m pytest tests/pipelines/test_agent_graph.py -v
+
+# Solo tests de memoria
+uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "memory"
+
+# Tests de PHI específicamente
+uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "phi"
+```
+
+### Decisiones técnicas clave
+
+| Decisión | Opción | Motivo |
+|---|---|---|
+| **Backend de almacenamiento** | TinyDB (no SQLite, no Redis, no Qdrant) | Zero-config, sin servidor, ya instalado en proyecto, JSON legible |
+| **Clasificación de intención** | Reglas léxicas (no LLM) | Sin latencia de red, sin coste de API, determinista y testeable |
+| **Validación PHI** | Dual (antes de proponer + antes de escribir) | Evita fugas de PHI incluso si una validación falla |
+| **Propuesta pendiente** | Máximo 1 (singleton) | Simplifica el flujo; evita propuestas en cascada |
+| **Consolidación** | Automática por threshold + TTL | Memoria no crece indefinidamente; resúmenes deterministas |
+| **Auditoría** | 8 tipos de evento + preview ofuscado | Trazabilidad completa sin exponer datos sensibles |
+| **Integración en grafo** | Nodos síncronos (sync, no async) | El grafo principal usa funciones síncronas; memory nodes adoptan el mismo patrón |
+
