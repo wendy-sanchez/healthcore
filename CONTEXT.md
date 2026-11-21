@@ -2192,7 +2192,7 @@ Usa los siguientes documentos fuente como base de tu base de conocimiento: `docs
 
 Tu agente ya conoce las 12 clínicas de HealthCore (US/UK), consulta el Incidents Manager y el inventario a través del MCP Server, y recibirá su harness en la Parte 2. Claire Whitfield (Chief Compliance Officer) exige que cualquier capacidad nueva — incluida la memoria persistente aquí y el harness de la Parte 2 — pase primero por su filtro; la memoria es exactamente el tipo de capacidad que le preocupa.
 
-> ⚠️ **Restricción no negociable de HealthCore (aplica a todo el proyecto, no solo a este hito):** ningún identificador de paciente ni PHI (Protected Health Information) bajo HIPAA/UK GDPR puede aparecer en ningún evento, tabla, endpoint, log o salida generada — incluyendo, explícitamente, la memoria del agente. Esta restricción es más estricta aquí que en cualquier otra empresa del curso: mientras que en otras compañías la pregunta de diseño sobre "qué nunca debe recordarse" es una decisión a justificar, en HealthCore es un requisito de cumplimiento que no admite excepciones ni justificación en contra.
+> ⚠️ **Restricción no negociable de HealthCore (aplica a todo el proyecto, no solo a este hito):** ningún identificador de paciente ni PHI (Protected Health Information) bajo HIPAA/UK GDPR puede aparecer en ningún evento, tabla, endpoint, log o salida generada — incluyendo, explícitamente, la memoria del agente. Esta restricción es más estricta aquí que en cualquier otra empresa: mientras que en otras compañías la pregunta de diseño sobre "qué nunca debe recordarse" es una decisión a justificar, en HealthCore es un requisito de cumplimiento que no admite excepciones ni justificación en contra.
 
 ### Qué SÍ vale la pena recordar
 

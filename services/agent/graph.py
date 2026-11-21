@@ -857,6 +857,16 @@ def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesi
     return "auto_evaluate_memory"
 
 
+def route_after_synthesis(state: AgentState) -> Literal["auto_evaluate_memory", "__end__"]:
+    """Después de sintetizar la respuesta de tools, siempre va a auto-evaluación.
+
+    NUNCA vuelve a synthesize_tool_answer para evitar bucles infinitos.
+    """
+    if state.get("error"):
+        return "__end__"
+    return "auto_evaluate_memory"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 5.  Construcción y compilación del grafo
 # ──────────────────────────────────────────────────────────────────────
@@ -982,13 +992,11 @@ def _build_graph() -> StateGraph:
     workflow.add_edge("respond_no_info", END)
     workflow.add_edge("handle_error", END)
 
-    # Síntesis de tool_answer → auto-evaluación (o END)
+    # Síntesis de tool_answer → auto-evaluación (NUNCA volver a síntesis)
     workflow.add_conditional_edges(
         "synthesize_tool_answer",
-        route_after_generate,  # Reutilizamos: mismo criterio
+        route_after_synthesis,
         {
-            "handle_error": "handle_error",
-            "synthesize_tool_answer": "synthesize_tool_answer",
             "auto_evaluate_memory": "auto_evaluate_memory",
             "__end__": END,
         },

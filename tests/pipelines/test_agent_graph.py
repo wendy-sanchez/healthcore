@@ -814,7 +814,7 @@ class TestMixedSynthesis:
         # 5) Los eventos de traza deben estar en orden correcto
         events = trace.get("events", [])
         node_order = [e["node"] for e in events]
-        expected_prefix = ["receive_question", "classify_query"]
+        expected_prefix = ["receive_question", "load_memory_context", "classify_query"]
         for i, expected_node in enumerate(expected_prefix):
             assert node_order[i] == expected_node, (
                 f"Evento {i} debe ser {expected_node}, pero es {node_order[i]}"

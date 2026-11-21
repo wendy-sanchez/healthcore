@@ -5,9 +5,9 @@
 ### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
 
 - **Completado**: Paquete `services/agent/memory/` con 5 módulos:
-  - `store.py` (614 líneas) — Backend TinyDB con 3 tablas (memory_facts, pending_proposal, audit_log), validación PHI dual, consolidación automática (threshold 50 facts, TTL 90 días), auditoría con 8 tipos de evento.
+  - `store.py` (661 líneas) — Backend TinyDB con 3 tablas (memory_facts, pending_proposal, audit_log), validación PHI dual, consolidación automática (threshold 50 facts, TTL 90 días), auditoría con 8 tipos de evento.
   - `classifier.py` (238 líneas) — Clasificador de intención del usuario sin LLM (reglas léxicas + umbrales de confianza). Intents: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0 por defecto). Detección de cambio de tema.
-  - `pipeline.py` (585 líneas) — Orquestador: auto-evaluación de respuestas (18 trigger keywords, 9 indicadores no-memorizables), extracción de candidatos, clasificación en 3 categorías (operational, incident_pattern, staff_preference), detección de duplicados, formato de propuesta, procesamiento de respuesta.
+  - `pipeline.py` (611 líneas) — Orquestador: auto-evaluación de respuestas (18 trigger keywords, 9 indicadores no-memorizables), extracción de candidatos, clasificación en 3 categorías (operational, incident_pattern, staff_preference), detección de duplicados, formato de propuesta, procesamiento de respuesta.
   - `nodes.py` (259 líneas) — 3 nodos LangGraph + 3 routers que integran el sistema en el grafo.
   - `__init__.py` — Documento de arquitectura con 6 principios de diseño.
 
@@ -33,13 +33,17 @@
 - **Completado**: Auditoría 11/11 acceptance criteria cumplidos — documentada en `AUDITORIA_HITO8_MEMORIA.md`.
 
 - **Completado**: Documentación técnica:
-  - `agent-memory-harness-guard.md` (742 líneas) — 12 secciones, 7 preguntas de diseño, tabla comparativa de 5 alternativas, 4 ciclos completos (aprobado, rechazado, editado, PHI bloqueado), política de consolidación, diagramas de flujo, snippets de código.
+  - `agent-memory-harness-guard.md` (1002 líneas) — 12 secciones, 7 preguntas de diseño, tabla comparativa de 5 alternativas, 4 ciclos completos (aprobado, rechazado, editado, PHI bloqueado), política de consolidación, diagramas de flujo, snippets de código, tabla de 7 bugs corregidos.
   - `AUDITORIA_HITO8_MEMORIA.md` — 11/11 criterios con evidencia detallada por criterio.
 
-- **Completado**: Bugs corregidos:
+- **Completado**: Bugs corregidos (7 totales):
   1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.
-  2. Patrón regex PHI `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`.
+  2. PHI: falsos negativos — patrón regex `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`. Además se expandieron patrones PHI: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone.
   3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría, retornando None si se detecta PHI.
+  4. Clasificador: ambigüedad como aprobado — `"¿cambia el horario?"` y `"si llueve cancelo"` generaban propuestas. `_should_evaluate` reescrito: bloquea hipotéticas, requiere trigger keywords en combined text.
+  5. Consolidación: facts nunca expiraban — `add_fact()` no asignaba `expires_at` para facts no consolidados. Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None`.
+  6. Loop RAG+tool — `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes. Nueva `route_after_synthesis()` que va directo a `auto_evaluate_memory` o `__end__`.
+  7. CONTEXT examples bloqueados — `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"`.
 
 - **Tests**: Suite completa de 64 tests verificada: `uv run python -m pytest tests/pipelines/test_agent_graph.py -v`.
   - Memory tests: 32/32 pasan.

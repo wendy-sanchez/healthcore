@@ -41,6 +41,8 @@ from .store import (
     validate_phi_safe,
 )
 
+import re
+
 logger = logging.getLogger(__name__)
 
 # ── Categorías de hechos memorizables ───────────────────────────────
@@ -57,12 +59,37 @@ _MEMORIZE_TRIGGER_KEYWORDS: set[str] = {
     "recuerda", "importante", "atención",
     "procord", "protocolo",
     "excepción", "excepcional",
+    "reporte",  # "El reporte semanal debe incluir..." (declarativo)
+    "pidió",    # "Eso lo pidió hace dos semanas"
+    "debe",     # "debe incluir", "debe ser"
+    "alerta",   # "Esa alerta de no-show elevado"
+    "cierre",   # "cierre de carretera"
+    "no-show",  # Patrón de incidentes
+    "fue porque",  # Explicación causal
+    "hubo",     # "hubo un cierre"
 }
 
 # ── Señales de que NO hay nada que recordar ─────────────────────────
 _NON_MEMORIZABLE_INDICATORS: set[str] = {
-    "gracias", "reporte", "dashboard", "esta semana",
-    "este mes", "hoy", "ayer", "mañana",
+    "gracias",
+}
+
+# ── Señales de que la pregunta es una consulta, no un hecho memorable ──
+_QUERY_PHRASES: set[str] = {
+    "cuál es", "cuáles son", "dime", "lista", "muestra",
+    "qué pasó", "cuántos", "qué dice",
+    "cómo está", "cómo van", "qué tal",
+    "sabes", "conoces", "puedes",
+    "hay algún", "hay alguna",
+    "es posible", "es necesario",
+}
+
+# ── Verbos en condicional/hipotético que NO son hechos consumados ──
+_HYPOTHETICAL_INDICATORS: set[str] = {
+    "si llueve", "si pasa", "si ocurre", "si puede",
+    "si debería", "si tendría", "si hubiera", "si fuese",
+    "podría", "tendría", "debería",
+    "hipotéticamente", "supón", "suponga",
 }
 
 
@@ -162,34 +189,33 @@ def _should_evaluate(question: str, answer: str) -> bool:
     """Determina si esta interacción merece auto-evaluación.
 
     No todas las interacciones deben generar propuestas de memoria.
+    - Preguntas hipotéticas o condicionales no generan propuestas
+    - Consultas de datos puntuales no generan propuestas
+    - Preguntas con señal de cambio SÍ pueden generar si la respuesta confirma
     """
     combined = (question + " " + answer).lower()
+    q_lower = question.lower()
 
     # Señales de NO evaluar
     for indicator in _NON_MEMORIZABLE_INDICATORS:
         if indicator in combined:
             return False
 
+    # Si la pregunta es hipotética/condicional → no memorizar
+    for indicator in _HYPOTHETICAL_INDICATORS:
+        if indicator in q_lower:
+            return False
+
     # Señales de SÍ evaluar
-    for keyword in _MEMORIZE_TRIGGER_KEYWORDS:
-        if keyword in combined:
-            return True
+    has_trigger = any(keyword in combined for keyword in _MEMORIZE_TRIGGER_KEYWORDS)
 
-    # Si la respuesta es muy corta o genérica → no evaluar
-    if len(answer) < 50:
-        return False
+    if has_trigger:
+        # Si tiene trigger y no es una consulta genérica → evaluar
+        if any(phrase in q_lower for phrase in _QUERY_PHRASES):
+            return False
+        return True
 
-    # Si la pregunta es puntual (consulta de datos) → no evaluar
-    if any(
-        phrase in question.lower()
-        for phrase in [
-            "cuál es", "cuáles son", "dime", "lista", "muestra",
-            "qué pasó", "cuántos", "qué dice",
-        ]
-    ):
-        return False
-
-    # Por defecto, no generar propuesta (conservador)
+    # Sin trigger → no evaluar (conservador)
     return False
 
 

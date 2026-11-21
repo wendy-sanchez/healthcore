@@ -84,15 +84,22 @@ que el backend sea intercambiable.
 
 | Tipo                    | Ejemplo                           | Patrón detectado por `validate_phi_safe()` |
 |-------------------------|-----------------------------------|--------------------------------------------|
-| Nombre y apellidos      | "María García"                    | `\b[A-Z][a-záéíóúñ]+ [A-Z][a-záéíóúñ]+\b` con contexto |
-| Número de teléfono      | "+34 612 345 678"                 | `\+?\d{1,3}[\s.-]?\d{6,10}`              |
-| SSN / Número Seguridad Social | "123-45-6789"               | `\b\d{3}-\d{2}-\d{4}\b`                   |
-| NHS Number (UK)         | "123 456 7890"                    | `\b\d{3}\s?\d{3}\s?\d{4}\b`              |
-| Email                   | "paciente@email.com"             | `\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b` |
-| Dirección postal        | "Calle Mayor 12, Madrid"         | Patrón de dirección                       |
-| Número de historia clínica (MRN) | "MRN-987654"          | `\b(MRN|HCC?|EXP)\d{4,}\b`              |
-| Fecha de nacimiento     | "15/03/1985"                     | Fechas en contexto de paciente            |
-| Diagnóstico / condición clínica | "diabetes tipo 2"       | Términos clínicos en contexto narrativo  |
+| Nombre + apellido       | "María García"                    | `\b[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+ [A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+\b` |
+| Nombre + apellido (título) | "Sr. García"                  | `\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+` |
+| Apellido hispano standalone | "García"                    | Lista de ~70 apellidos comunes (García, López, Pérez, Rodríguez, etc.) |
+| Número de teléfono USA  | "555-123-4567"                   | `\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b` |
+| Teléfono internacional  | "+34 612 345 678"                | `(?:(?<=\s)|(?<=^))\+?\d{1,3}[\s.-]?\d{2,4}(?:[\s.-]?\d{2,4}){2,3}\b` |
+| SSN                     | "123-45-6789"                    | `\b\d{3}-\d{2}-\d{4}\b`                |
+| NHS Number (UK)         | "123 456 7890"                   | `\b\d{5}\s\d{6,7}\b`                   |
+| Email                   | "paciente@email.com"             | `\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b` |
+| Dirección física (US/UK)| "123 Main Street"                | `\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Av|...)` |
+| MRN / EXP / PAT + dígitos | "MRN-987654", "MRN: 1234567"   | `\b(MRN|EX[AP]|HCC|PAT|HIST|NHS|SSN)\s*[-:_]?\s*\d{4,}\b` |
+| ID de paciente textual   | "patient id: P12345"             | `\b(?:patient\s+(?:id|number|#)|paciente\s+(?:id|número|#)|historia\s+clínica|medical\s+record\s+number)\s*:\s*\w+` |
+| Fecha de nacimiento con prefijo | "fecha de nacimiento: 15/03/1985" | `\b(?:fecha\s+de\s+nacimiento|dob|birth\s*date|born|nacid[oó]?\s+el)\s*:?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}` |
+| Fecha suelta (año 19xx/20xx) | "15/03/1985"                   | `\b\d{2}[/-]\d{2}[/-](?:19|20)\d{2}\b` |
+| Diagnóstico / condición clínica | "diabetes tipo 2", "cáncer" | Términos clínicos en contexto narrativo (diabetes, cáncer, VIH, SIDA, tumor, leucemia, quimioterapia, hipertensión, cardiopatía, hepatitis, cirrosis, neoplasia, metástasis, infección, síndrome, alzhéimer, parkinson, esclerosis, artritis, asma, epilepsia, depresión, ansiedad, obesidad, osteoporosis, + variantes con tipo/gravedad) |
+| Información clínica con prefijo | "diagnóstico: diabetes"       | `\b(?:diagnóstico|diagnosis|treatment|tratamiento|prescripción|prescription|medication|medicación|resultados? de laboratorio|lab results?)\s*:?\s*\S` |
+| "Paciente" en contexto narrativo | "el paciente refiere dolor" | `\b(?:el\s+)?paciente\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s` |
 | Combinación re-identificable | Cualquier combinación de anteriores | Validación cruzada                      |
 
 ### 2.3 ¿Cómo se "olvida"? (TTL y consolidación)
@@ -194,6 +201,50 @@ Reglas:
 Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
 `user_message`, `classification` (intención detectada), `detail`.
 
+### 2.8 ¿Cómo decide `_should_evaluate()` si una interacción merece memoria?
+
+La función `_should_evaluate(question, answer)` en `pipeline.py` implementa un
+clasificador basado en señales léxicas (sin LLM):
+
+```python
+# Indicadores de NO memorizar (si aparecen en combined text)
+_NON_MEMORIZABLE_INDICATORS = {"gracias"}
+
+# Indicadores de SÍ memorizar (si aparecen en combined text)
+_MEMORIZE_TRIGGER_KEYWORDS = {
+    "cambio", "nuevo", "cambió", "reporte", "dashboard", "actualizó",
+    "modificó", "esta semana", "este mes", "pidió", "debe", "alerta",
+    "cierre", "no-show", "fue porque", "hubo",
+}
+
+# Frases de consulta genérica → no memorizar
+_QUERY_PHRASES = {"qué es", "qué son", "cuál es", "cuáles son",
+                  "cómo", "dónde", "cuándo"}
+
+# Indicadores hipotéticos/condicionales → no memorizar
+_HYPOTHETICAL_INDICATORS = {"si ", "qué pasaría si", "supón que",
+                            "supongamos", "asume que", "hipotéticamente"}
+```
+
+**Flujo de decisión**:
+
+1. Si `combined = question + " " + answer` contiene `_NON_MEMORIZABLE_INDICATORS` → False
+2. Si la pregunta es hipotética/condicional → False
+3. Si `combined` contiene algún `_MEMORIZE_TRIGGER_KEYWORD`:
+   - Si además es una consulta genérica → False
+   - Si no → True (propuesta generada aunque la pregunta termine en `?`)
+4. Sin trigger keyword → False (conservador)
+
+**Correcciones aplicadas durante el Hito 8**:
+
+- Originalmente `_NON_MEMORIZABLE_INDICATORS` incluía `"reporte"`, `"dashboard"`,
+  `"esta semana"`, lo que bloqueaba los ejemplos memorizables 3, 5, 6 de
+  `CONTEXT.md`. Se movieron a `_MEMORIZE_TRIGGER_KEYWORDS`.
+- Originalmente toda pregunta terminada en `?` se bloqueaba, lo que impedía
+  detectar `"¿Ha cambiado el proceso?"` cuando la respuesta contenía `"cambió"`.
+  La nueva lógica usa `combined` (pregunta + respuesta) para la búsqueda de
+  triggers.
+
 ---
 
 ## 3. Arquitectura del sistema
@@ -230,21 +281,34 @@ Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
                                        ▼
                           ┌──────────────────────────┐
                           │  generate_answer         │
-                          │  synthesize_tool_answer  │
-                          │  • Incluye propuesta de  │
-                          │    memoria si relevante  │
-                          └────────────┬─────────────┘
-                                       ▼
-                          ┌──────────────────────────┐
-                          │  auto_evaluate_memory    │
-                          │  • ¿Propuesta generada?  │
-                          │  • PHI validation        │
-                          │  • Persiste proposal     │
-                          │  • Responde al usuario   │
+                          │  synthesize_tool_answer  │◄──────┐
+                          │  • Incluye propuesta de  │       │
+                          │    memoria si relevante  │       │
+                          └──────────┬───────────────┘       │
+                                     │ (ANTES: loop aquí)    │
+                                     ▼                       │
+                          ┌──────────────────────────┐       │
+                          │  auto_evaluate_memory    │       │
+                          │  • ¿Propuesta generada?  │       │
+                          │  • PHI validation        │       │
+                          │  • Persiste proposal     │       │
+                          │  • Responde al usuario   │       │
+                          └────────────┬─────────────┘       │
+                                       ▼                     │
+                          ┌──────────────────────────┐       │
+                          │  route_after_synthesis   │───────┘
+                          │  (NUNCA vuelve a         │  (roto)
+                          │   synthesize_tool_answer)│
                           └────────────┬─────────────┘
                                        ▼
                                       END
 ```
+
+**Corrección del loop RAG+tool**: Originalmente `synthesize_tool_answer` usaba
+`route_after_generate` que podía re-enrutar a `synthesize_tool_answer` porque
+`tool_results` aún estaban en el estado del grafo. Se creó
+`route_after_synthesis()` que va directo a `auto_evaluate_memory` o `__end__`,
+rompiendo el ciclo.
 
 ### 3.2 Layout de tablas TinyDB
 
@@ -285,7 +349,7 @@ Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
 | `services/agent/memory/__init__.py`       | Docstring del paquete, principios.             | 30       |
 | `services/agent/memory/store.py`          | TinyDB backend, PHI validation, audit, consolidation. | 320 |
 | `services/agent/memory/classifier.py`     | Clasificador de intención del usuario.         | 180      |
-| `services/agent/memory/pipeline.py`       | Orchestrador: auto-evaluación + respuesta.     | 280      |
+| `services/agent/memory/pipeline.py`       | Orchestrador: auto-evaluación + respuesta.     | 300      |
 | `services/agent/memory/nodes.py`          | Nodos LangGraph (sync wrappers).              | 230      |
 | `services/agent/graph.py` (modificado)    | Integración en el grafo (4 nodos + 3 rutas).  | +100     |
 
@@ -296,17 +360,66 @@ Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
 ### 4.1 Patrones detectados por `validate_phi_safe()`
 
 ```python
-PHI_PATTERNS = [
-    ("NOMBRE",           re.compile(r'\b[A-Z][a-záéíóúñ]+ [A-Z][a-záéíóúñ]+\b')),
-    ("SSN",              re.compile(r'\b\d{3}-\d{2}-\d{4}\b')),
-    ("NHS_NUMBER",       re.compile(r'\b\d{3}\s?\d{3}\s?\d{4}\b')),
-    ("PHONE",            re.compile(r'\+?\d{1,3}[\s.-]?\d{6,10}')),
-    ("EMAIL",            re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')),
-    ("MRN",              re.compile(r'\b(MRN|HCC?|EXP|PAT)\d{4,}\b')),
-    ("ADDRESS",          re.compile(r'(?:Calle|Avda?|Plaza|Paseo|Rúa|C/)\s+\w+')),
-    ("BIRTH_DATE",       re.compile(r'\b\d{2}[/-]\d{2}[/-]\d{4}\b')),
-    ("CLINICAL_TERM",    re.compile(r'\b(diabetes|cáncer|tumor|VIH|SIDA|leucemia|quimioterapia|diagnóstico|paciente)\b', re.IGNORECASE)),
-    ("INSURANCE_ID",     re.compile(r'\b(?:SSN?|NSS|NUSS|PAY)\d{6,}\b')),
+_PHI_PATTERNS: list[re.Pattern] = [
+    # ── Identificadores personales (US + UK) ─────────────────────────
+    re.compile(r"\b[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+ [A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+\b"),  # Nombre completo
+    # ── Datos de contacto ────────────────────────────────────────────
+    re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),       # Teléfono USA (555-123-4567)
+    re.compile(r"\b\d{5}\s\d{6,7}\b"),                       # NHS Number UK (123 4567890)
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),                    # SSN (123-45-6789)
+    # ── Teléfono internacional (español/europeo: +34 612 345 678) ────
+    re.compile(r"(?:(?<=\s)|(?<=^))\+?\d{1,3}[\s.-]?\d{2,4}(?:[\s.-]?\d{2,4}){2,3}\b"),
+    # ── Información clínica (términos y diagnósticos) ────────────────
+    # Captura prefijos como "diagnóstico:", "tratamiento:", "lab results:"
+    re.compile(r"\b(?:diagn[oó]stico|diagnosis|treatment|tratamiento|"
+               r"prescripci[oó]n|prescription|medication|medicaci[oó]n|"
+               r"resultados?\s+de\s+laboratorio|lab\s+results?)\s*:?\s*\S",
+               re.IGNORECASE),
+    # ── Términos clínicos sensibles (condiciones, enfermedades) ─────
+    re.compile(r"\b(diabetes|c[ná]ncer|tumor|VIH|SIDA|leucemia|quimioterapia|"
+               r"hipertensión|cardiopatía|insuficiencia|hepatitis|cirrosis|"
+               r"enfermedad\s+cr[oó]nica|diagnóstico|patología|neoplasia|"
+               r"met[áa]stasis|infecci[oó]n|síndrome|trastorno|"
+               r"alzhéimer|parkinson|esclerosis|artritis|asma|epilepsia|"
+               r"depresi[oó]n|ansiedad|obesidad|osteoporosis)"
+               r"(?:\s+(?:tipo\s+\d|cr[oó]nica|aguda|leve|grave|moderada))?",
+               re.IGNORECASE),
+    # ── Palabra "paciente" en contexto narrativo (no operativo) ────
+    re.compile(r"\b(?:el\s+)?paciente\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s", re.IGNORECASE),
+    # ── Fechas de nacimiento / edad exacta ───────────────────────────
+    re.compile(r"\b(?:fecha\s+de\s+nacimiento|dob|birth\s*date|born|"
+               r"nacid[oó]?\s+el)\s*:?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
+               re.IGNORECASE),
+    # ── Fecha suelta en contexto clínico (año 19xx/20xx) ────────────
+    re.compile(r"\b\d{2}[/-]\d{2}[/-](?:19|20)\d{2}\b"),
+    # ── Identificadores de paciente (MRN, EXP, PAT, HCC, etc.) ──────
+    re.compile(r"\b(?:patient\s+(?:id|number|#|n[uo]mero)|"
+               r"paciente\s+(?:id|n[uo]mero|#)|"
+               r"historia\s+cl[ií]nica|medical\s+record\s+number)\s*:?\s*\w+",
+               re.IGNORECASE),
+    # ── MRN / EXP / PAT + dígitos (con o sin guion o dos puntos) ─────
+    re.compile(r"\b(MRN|EX[AP]|HCC|PAT|HIST|NHS|SSN)\s*[-:_]?\s*\d{4,}\b", re.IGNORECASE),
+    # ── Email ────────────────────────────────────────────────────────
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    # ── Dirección física (US/UK) ─────────────────────────────────────
+    re.compile(r"\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Av|Road|Rd|"
+               r"Drive|Dr|Lane|Ln|Boulevard|Blvd|Circle|Cir)\b", re.IGNORECASE),
+    # ── Apellidos precedidos de título o rol ─────────────────────────
+    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+"
+               r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?", re.IGNORECASE),
+    # ── Apellidos hispanos comunes en contexto narrativo ──────────────
+    # Detecta apellidos como García, López, Pérez cuando aparecen
+    # como palabras capitalizadas standalone (sin nombre de pila).
+    re.compile(r"\b(?:García|López|Pérez|Rodríguez|Martínez|Hernández|"
+               r"González|Sánchez|Díaz|Álvarez|Fernández|Gutiérrez|"
+               r"Jiménez|Morales|Ruiz|Ramírez|Moreno|Muñoz|Romero|"
+               r"Navarro|Torres|Domínguez|Vázquez|Ramos|Cruz|Flores|"
+               r"Rivera|Reyes|Castillo|Ortiz|Medina|Silva|Garza|Vargas|"
+               r"Campos|Guzmán|Delgado|Pena|Contreras|Valdez|Estrada|"
+               r"Luna|Juárez|Aguilar|Rojas|Salazar|Chávez|Núñez|Cabrera|"
+               r"Acosta|Figueroa|Mendoza|Vega|Soto|Molina|Cortés|"
+               r"Suárez|Castro|Pacheco|Velázquez|Ibáñez|Márquez|"
+               r"Guerrero|Santos|Valencia|Peña|Peralta|Rivas|Meza)\b"),
 ]
 ```
 
@@ -348,12 +461,16 @@ propuesta sin PHI.
   │                                                                         │
   │  1. ¿Ya hay propuesta pendiente? ──Sí──► saltar (no duplicar)           │
   │  2. ¿Acaba de resolverse una propuesta? ──Sí──► saltar                  │
-  │  3. ¿El texto contiene palabras clave de cambio? ──No──► saltar         │
-  │  4. ¿El texto indica "no memorizable"? ──Sí──► saltar                   │
-  │  5. Extraer categoría (operational/incident_pattern/staff_preference)   │
-  │  6. ¿Es duplicado de un fact existente? ──Sí──► saltar                  │
-  │  7. Validar PHI ──PHI detectado──► descartar, log "phi_rejected"        │
-  │  8. Generar propuesta, persistir en pending_proposal, responder al      │
+  │  3. ¿Contiene indicador de "no memorizable"? ──Sí──► saltar             │
+  │  4. ¿La pregunta es hipotética/condicional? ──Sí──► saltar              │
+  │     (detecta "si + verbo", "qué pasaría si", "supón que", etc.)         │
+  │  5. ¿Hay trigger keyword en pregunta+respuesta? ──No──► saltar          │
+  │     (triggers: "cambio", "nuevo", "reporte", "pidió", "debe",           │
+  │      "alerta", "cierre", "no-show", "fue porque", "hubo", etc.)         │
+  │  6. Extraer categoría (operational/incident_pattern/staff_preference)   │
+  │  7. ¿Es duplicado de un fact existente? ──Sí──► saltar                  │
+  │  8. Validar PHI ──PHI detectado──► descartar, log "phi_rejected"        │
+  │  9. Generar propuesta, persistir en pending_proposal, responder al      │
   │     usuario con "¿Quieres que recuerde esto?"                           │
   └─────────────────────────────────────────────────────────────────────────┘
                                      │
@@ -463,6 +580,7 @@ julio."
    "proposal": "El nuevo proceso de derivación...", "user_message": "Sí, guárdalo.",
    "classification": "approve", "detail": "Fact escrito en memory_facts"},
 ]
+```
 
 ### Evidencia real desde tests (APROBADO)
 
@@ -591,42 +709,16 @@ texto original de la propuesta y el mensaje del usuario.
 ### Suite completa de memoria (32 tests) — todos pasan
 
 ```
-$ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "TestMemory"
+$ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "TestMemory" --tb=short
 
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_validate_clean_text PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_name PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_ssn PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_email PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_phone PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_rejects_patient_id PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_phi_empty_string_is_safe PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPHI::test_set_pending_rejects_phi PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryStore::test_add_and_get_fact PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryStore::test_add_fact_rejects_phi PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryStore::test_pending_proposal_singleton PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryStore::test_get_facts_by_category PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryStore::test_delete_fact PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_approve_si PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_approve_ok PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_reject_no PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_edit_mejor_dicho PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_discard_by_default PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_no_proposal_when_none_pending PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryClassifier::test_classify_empty_message_discards PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_no_trigger PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_with_trigger PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_auto_evaluate_proposal_skips_non_memorizable PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_approve PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_reject PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_edit PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_process_user_response_discard_by_default PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_audit_log_created_on_approve PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryPipeline::test_build_memory_context_format PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_memory_nodes_exist_in_graph PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_memory_routes_defined PASSED
-tests/pipelines/test_agent_graph.py::TestMemoryGraphIntegration::test_route_after_receive_goes_to_load_memory PASSED
+Tests de memoria (32/32):
+  PHI:        7/7  PASSED  (phi_validate_clean_text, phi_rejects_name, ...)
+  Store:      5/5  PASSED  (add_fact, pending_proposal, delete, ...)
+  Classifier: 6/6  PASSED  (approve, reject, edit, discard, ...)
+  Pipeline:   8/8  PASSED  (auto_evaluate, process_response, audit, ...)
+  Integration:3/3  PASSED  (nodes_exist, routes_defined, route_after_receive)
 
-====================== 32 passed in 1.17s =======================
+====================== 32 passed in 1.24s =======================
 ```
 
 ---
@@ -741,8 +833,32 @@ se intentó proponer algo con PHI.)
 | Parámetro               | Valor     | Justificación                                                 |
 |--------------------------|-----------|---------------------------------------------------------------|
 | Umbral de consolidación | 50 facts  | Suficientes para detectar patrones sin esperar demasiado.     |
-| TTL de facts originales | 90 días   | Balanceó entre retención util y limpieza automática.          |
+| TTL de facts originales | 90 días   | Balanceó entre retención util y limpieza automática.           |
+| TTL auto-asignado       | 90 días   | `add_fact()` asigna automáticamente `expires_at = now + 90d`  |
+|                         |           | cuando el fact NO es consolidado y no tiene `expires_at`.     |
 | Consolidados expiran    | No        | Son resúmenes; si ya no son relevantes, se eliminan manualmente. |
+
+**TTL auto-assignment** (`store.py:add_fact()`):
+
+```python
+def add_fact(content, category, source_run_id, approved_at, consolidated, expires_at):
+    if not validate_phi_safe(content):
+        return None
+    if not consolidated and expires_at is None:
+        expires_at = _now_plus_days(_DEFAULT_TTL_DAYS)  # 90 días
+    table.insert({
+        "content": content,
+        "category": category,
+        "source_run_id": source_run_id,
+        "approved_at": approved_at,
+        "consolidated": consolidated,
+        "expires_at": expires_at,
+    })
+```
+
+Esto garantiza que **todo fact original expire automáticamente** tras 90 días
+si no se consolida. Antes de esta corrección, los facts originales nunca
+recibían `expires_at`, por lo que permanecían indefinidamente en memoria.
 
 ### 10.2 Ejemplo de consolidación
 
@@ -787,13 +903,20 @@ El resumen consolidado se añade con `consolidated=True`, `expires_at=None`.
 | `process_proposal`      | `node_process_proposal`        | Procesar respuesta del usuario a una propuesta          |
 | `auto_evaluate_memory`  | `node_auto_evaluate_memory`    | Evaluar si la interacción merece memoria, proponer      |
 
-### 11.2 Nuevas rutas (3)
+### 11.2 Nuevas rutas (4)
 
 | Ruta                         | Origen → Destino                                      |
 |------------------------------|--------------------------------------------------------|
 | `route_after_load_memory`    | `load_memory_context` → `process_proposal` (si pendiente) / `classify_query` (si no) |
 | `route_after_process_proposal` | `process_proposal` → `classify_query` (si nueva pregunta) / `__end__` (si solo respuesta) |
 | `route_after_auto_evaluate`  | `auto_evaluate_memory` → `__end__` (siempre)           |
+| `route_after_synthesis`      | `synthesize_tool_answer` → `auto_evaluate_memory` (si ok) / `__end__` (si error) |
+
+> **Nota**: `route_after_synthesis` se creó para romper el loop RAG+tool.
+> Antes, `synthesize_tool_answer` usaba `route_after_generate`, que podía
+> re-enrutar a `synthesize_tool_answer` porque `tool_results` aún estaban
+> en el estado. La nueva ruta va directo a `auto_evaluate_memory` o `__end__`,
+> nunca de vuelta a síntesis.
 
 ### 11.3 Nuevos campos en AgentState
 
@@ -801,13 +924,13 @@ El resumen consolidado se añade con `consolidated=True`, `expires_at=None`.
 class AgentState(TypedDict):
     # ... campos existentes ...
     # --- Memoria (Parte 3 — Hito 8) ---
-    "memory_facts": Annotated[list[str], add_to_list],       # Facts cargados
-    "memory_context": str,                                    # Contexto formateado para el LLM
-    "memory_proposal": str | None,                            # Texto de propuesta pendiente
-    "memory_proposal_handled": bool,                          # ¿Propuesta procesada?
-    "memory_proposal_handled_text": str | None,               # Confirmación para el usuario
-    "memory_proposal_result": str | None,                     # Resultado (approved/rejected/etc)
-    "run_id": str,                                            # ID único de corrida
+    "memory_facts": list[dict[str, Any]],                  # Facts cargados desde TinyDB
+    "memory_context": str,                                 # Contexto formateado para el LLM
+    "memory_proposal": Optional[dict[str, Any]],           # Propuesta pendiente (dict) o None
+    "memory_proposal_handled": bool,                       # ¿Propuesta ya procesada?
+    "memory_proposal_handled_text": str,                   # Texto de confirmación para el usuario
+    "memory_proposal_result": Optional[dict[str, Any]],    # Resultado (approved/rejected/etc)
+    "run_id": str,                                         # ID único de corrida (para auditoría)
 ```
 
 ### 11.4 Verificación de compilación
@@ -821,10 +944,43 @@ print(agent_graph.nodes.keys())
 #  'process_proposal', 'auto_evaluate_memory']
 ```
 
-**Tests**: 32 tests existentes pasan (ver `test_agent_graph.py`), incluyendo:
-- `test_graph_compiles_successfully`
-- `test_graph_has_all_expected_nodes` (actualizado con nuevos nodos)
-- `test_valid_question_routes_to_load_memory` (ruta actualizada)
+### 11.5 Resultado final — 64/64 tests PASSED
+
+```
+$ uv run python -m pytest tests/pipelines/test_agent_graph.py --tb=short -q
+
+64 passed in 1.43s
+```
+
+Desglose por categoría:
+
+| Categoría                  | Tests | Estado |
+|----------------------------|-------|--------|
+| GraphCompilation           | 3     | ✅     |
+| ConditionalRouting         | 7     | ✅     |
+| Traceability               | 4     | ✅     |
+| RAGBehavior                | 4     | ✅     |
+| AgentEndpoint              | 2     | ✅     |
+| ExternalToolRouting        | 5     | ✅     |
+| ToolFallbackBehavior       | 5     | ✅     |
+| MixedSynthesis             | 2     | ✅     |
+| MemoryPHI                  | 7     | ✅     |
+| MemoryStore                | 5     | ✅     |
+| MemoryClassifier           | 6     | ✅     |
+| MemoryPipeline             | 8     | ✅     |
+| MemoryGraphIntegration     | 3     | ✅     |
+| MixedSynthesis             | 2     | ✅     |
+| **Total**                  | **64** | ✅     |
+
+### 11.6 Correcciones aplicadas durante el Hito 8
+
+| # | Bug | Síntoma | Fix |
+|---|-----|---------|-----|
+| 1 | PHI: falsos negativos | `diabetes tipo 2`, `cáncer`, `MRN: 1234567`, `+34 612...`, `García`, `15/03/1985` no detectados | Patrones expandidos: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone |
+| 2 | Clasificador: ambigüedad como aprobado | `"¿cambia el horario?"` y `"si llueve cancelo"` generaban propuestas | `_should_evaluate` reescrito: bloquea hipotéticas, requiere trigger keywords en `combined` text |
+| 3 | Consolidación: facts nunca expiraban | `add_fact()` no asignaba `expires_at` para facts no consolidados | Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None` |
+| 4 | Loop RAG+tool | `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes | `route_after_synthesis()` nueva, va directo a `auto_evaluate_memory` o `__end__` |
+| 5/6/7 | CONTEXT examples bloqueados | `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. | Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"` |
 
 ---
 

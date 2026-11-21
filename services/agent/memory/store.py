@@ -88,6 +88,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _now_plus_days(days: int) -> str:
+    """Retorna timestamp ISO de ahora + N días."""
+    import datetime as dt
+    return (datetime.now(timezone.utc) + dt.timedelta(days=days)).isoformat()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  PHI Validation
 # ═══════════════════════════════════════════════════════════════════════
@@ -103,25 +109,58 @@ _PHI_PATTERNS: list[re.Pattern] = [
     re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),       # Teléfono USA (555-123-4567)
     re.compile(r"\b\d{5}\s\d{6,7}\b"),                       # NHS Number UK (123 4567890)
     re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),                    # SSN (123-45-6789)
-    # ── Información clínica ──────────────────────────────────────────
+    # ── Teléfono internacional (español/europeo: +34 612 345 678) ────
+    re.compile(r"(?:(?<=\s)|(?<=^))\+?\d{1,3}[\s.-]?\d{2,4}(?:[\s.-]?\d{2,4}){2,3}\b"),
+    # ── Información clínica (términos y diagnósticos) ────────────────
     re.compile(r"\b(?:diagn[oó]stico|diagnosis|treatment|tratamiento|"
                r"prescripci[oó]n|prescription|medication|medicaci[oó]n|"
                r"resultados?\s+de\s+laboratorio|lab\s+results?)\s*:?\s*\S",
                re.IGNORECASE),
+    # ── Términos clínicos sensibles (condiciones, enfermedades) ─────
+    re.compile(r"\b(diabetes|c[ná]ncer|tumor|VIH|SIDA|leucemia|quimioterapia|"
+               r"hipertensión|cardiopatía|insuficiencia|hepatitis|cirrosis|"
+               r"enfermedad\s+cr[oó]nica|diagnóstico|patología|neoplasia|"
+               r"met[áa]stasis|infecci[oó]n|síndrome|trastorno|"
+               r"alzhéimer|parkinson|esclerosis|artritis|asma|epilepsia|"
+               r"depresi[oó]n|ansiedad|obesidad|osteoporosis)"
+               r"(?:\s+(?:tipo\s+\d|cr[oó]nica|aguda|leve|grave|moderada))?",
+               re.IGNORECASE),
+    # ── Palabra "paciente" en contexto narrativo (no operativo) ────
+    re.compile(r"\b(?:el\s+)?paciente\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+\s", re.IGNORECASE),
     # ── Fechas de nacimiento / edad exacta ───────────────────────────
     re.compile(r"\b(?:fecha\s+de\s+nacimiento|dob|birth\s*date|born|"
-               r"nacid[oó]?\s+el)\s*:?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+               r"nacid[oó]?\s+el)\s*:?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
                re.IGNORECASE),
-    # ── Identificadores de paciente ──────────────────────────────────
+    # ── Fecha suelta en contexto clínico (sin prefijo, pero con año 19xx/20xx) ──
+    re.compile(r"\b\d{2}[/-]\d{2}[/-](?:19|20)\d{2}\b"),
+    # ── Identificadores de paciente (MRN, EXP, PAT, HCC, etc.) ──────
     re.compile(r"\b(?:patient\s+(?:id|number|#|n[uo]mero)|"
                r"paciente\s+(?:id|n[uo]mero|#)|"
-               r"mrn|historia\s+cl[ií]nica|medical\s+record\s+number)\s*:?\s*\w+",
+               r"historia\s+cl[ií]nica|medical\s+record\s+number)\s*:?\s*\w+",
                re.IGNORECASE),
+    # ── MRN / EXP / PAT + dígitos (con o sin guion o dos puntos) ─────
+    re.compile(r"\b(MRN|EX[AP]|HCC|PAT|HIST|NHS|SSN)\s*[-:_]?\s*\d{4,}\b", re.IGNORECASE),
     # ── Email ────────────────────────────────────────────────────────
     re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
-    # ── Dirección física ─────────────────────────────────────────────
+    # ── Dirección física (US/UK) ─────────────────────────────────────
     re.compile(r"\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Av|Road|Rd|"
                r"Drive|Dr|Lane|Ln|Boulevard|Blvd|Circle|Cir)\b", re.IGNORECASE),
+    # ── Apellidos precedidos de título o rol ─────────────────────────
+    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+"
+               r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?", re.IGNORECASE),
+    # ── Apellidos hispanos comunes en contexto narrativo ──────────────
+    # Detecta apellidos como García, López, Pérez, Rodríguez cuando aparecen
+    # como palabras capitalizadas standalone (sin nombre de pila).
+    re.compile(r"\b(?:García|López|Pérez|Rodríguez|Martínez|Hernández|"
+               r"González|Sánchez|Díaz|Álvarez|Fernández|Gutiérrez|"
+               r"Jiménez|Morales|Ruiz|Ramírez|Moreno|Muñoz|Romero|"
+               r"Navarro|Torres|Domínguez|Vázquez|Ramos|Cruz|Flores|"
+               r"Rivera|Reyes|Castillo|Ortiz|Medina|Silva|Garza|Vargas|"
+               r"Campos|Guzmán|Delgado|Pena|Contreras|Valdez|Estrada|"
+               r"Luna|Juárez|Aguilar|Rojas|Salazar|Chávez|Núñez|Cabrera|"
+               r"Acosta|Figueroa|Mendoza|Vega|Soto|Molina|Cortés|"
+               r"Suárez|Castro|Pacheco|Velázquez|Ibáñez|Márquez|"
+               r"Guerrero|Santos|Valencia|Peña|Peralta|Rivas|Meza)\b"),
 ]
 
 
@@ -235,7 +274,8 @@ def set_pending_proposal(
         "phi_validated": True,
     }
     doc_id = table.insert(doc)
-    doc["id"] = doc_id  # noqa: E226
+    table.update({"id": doc_id}, doc_ids=[doc_id])
+    doc["id"] = doc_id
 
     _record_audit(
         event_type="proposed",
@@ -268,7 +308,7 @@ def add_fact(
     approved_at: str | None = None,
     consolidated: bool = False,
     expires_at: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Agrega un hecho a la memoria del agente.
 
     Args:
@@ -304,6 +344,11 @@ def add_fact(
     if approved_at is None:
         approved_at = _now()
 
+    # Asignar TTL por defecto si no se especifica expiración
+    # y no es un hecho consolidado
+    if expires_at is None and not consolidated:
+        expires_at = _now_plus_days(_DEFAULT_TTL_DAYS)
+
     doc = {
         "content": content,
         "category": category,
@@ -313,7 +358,9 @@ def add_fact(
         "expires_at": expires_at,
     }
     doc_id = table.insert(doc)
-    doc["id"] = doc_id  # noqa: E226
+    # Persistir el doc_id como campo "id" en la BD para poder referenciarlo después
+    table.update({"id": doc_id}, doc_ids=[doc_id])
+    doc["id"] = doc_id
     logger.info("Hecho agregado a memoria (id=%s): '%s'", doc_id, content[:80])
     return _serializable(doc)
 

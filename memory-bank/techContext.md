@@ -643,13 +643,13 @@ services/agent/memory/
   3. `audit_log` — Documentos con: `event_type` (string: fact_added|fact_deleted|proposal_made|proposal_approved|proposal_rejected|proposal_edited|proposal_discarded|memory_consolidated|phi_blocked), `timestamp` (ISO), `content_preview` (primeros 100 chars), `metadata` (dict opcional)
 
 ### PHI Compliance
-- **8 patrones PHI** (HIPAA + UK GDPR):
+- **8+ patrones PHI** (HIPAA + UK GDPR, expandidos — términos clínicos ahora cubren 20+ condiciones, apellidos hispanos 70+, teléfono internacional con lookbehind, MRN con colon, fechas standalone):
   - `NOMBRE_PERSONA`: Nombres propios con caracteres acentuados `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`
   - `SSN_US`: `\b\d{3}-\d{2}-\d{4}\b`
   - `NHS_UK`: `\b\d{3}\s\d{3}\s\d{4}\b`
   - `EMAIL`: `[\w._%+-]+@[\w.-]+\.[a-zA-Z]{2,}`
   - `MRN_MEDICAL_RECORD`: `\bMRN[:\s-]?\d+\b`
-  - `CLINICAL_TERM`: Términos como 'diagnosis', 'prognosis', 'biopsy' en contexto
+  - `CLINICAL_TERM`: Términos como 'diagnosis', 'prognosis', 'biopsy', 'diabetes', 'cáncer', 'leucemia', etc. (20+ condiciones)
   - `BIRTH_DATE`: `\b\d{2}/\d{2}/\d{4}\b`
   - `PHONE_PATTERN`: `\+?\d{1,3}[\s-]?\d{1,4}[\s-]?\d{1,4}[\s-]?\d{1,4}`
   - `ADDRESS_PATTERN`: Direcciones con números y palabras clave (Street, Road, Avenue, etc.)
@@ -664,9 +664,9 @@ services/agent/memory/
 - **Regla crítica**: «Nunca se asume aprobación por silencio o ambigüedad» — discard es el default con confidence 0.0
 
 ### Pipeline de Memoria (pipeline.py)
-- **Auto-evaluación**: `auto_evaluate_proposal(question, answer, facts, tool_results, tool_errors)` se llama tras cada respuesta
-- **18 trigger keywords**: recuerda, aprende, guarda, memoriza, almacena, favorito, etc.
-- **9 indicadores de «no memorizable»**: saludos, preguntas sin proposición, respuestas <50 chars, frases puntuales
+- **Auto-evaluación**: `auto_evaluate_proposal(question, answer, facts, tool_results, tool_errors)` se llama tras cada respuesta. `_should_evaluate` reescrito con trigger keywords, detección hipotética/condicional, y query phrases de consulta.
+- **18 trigger keywords**: recuerda, aprende, guarda, memoriza, almacena, favorito, etc. (expandidos con "pidió", "debe", "alerta", "cierre", "no-show", "fue porque", "hubo")
+- **Indicador «no memorizable» reducido**: solo "gracias" — los anteriores ("reporte", "dashboard", "esta semana") se movieron a trigger keywords
 - **3 categorías**: operational, incident_pattern, staff_preference
 - **Formato de propuesta**: `📝 **¿Quieres que recuerde esto para la próxima vez?**` + candidate fact
 - **Máximo 1 propuesta pendiente**: Si ya hay pendiente, se omite evaluación para no reemplazarla
@@ -681,6 +681,7 @@ services/agent/memory/
 ### Política de Consolidación
 - **Threshold**: 50 facts (configurable en `consolidate_memory(force=False)`)
 - **TTL**: 90 días (facts con `expires_at < now` se purgan)
+- **Auto-asignación**: `add_fact()` asigna `_DEFAULT_TTL_DAYS` (90) via helper `_now_plus_days(days)` cuando `consolidated=False` y `expires_at` no se proporciona
 - **Determinista**: `_build_summary()` agrupa facts por categoría y genera resumen
 - **Resumen**: Se escribe como nuevo fact con categoría `consolidated_summary`; facts originales se marcan como consolidados
 
