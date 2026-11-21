@@ -102,6 +102,29 @@ def _now_plus_days(days: int) -> str:
 # Esta lista cubre tanto HIPAA (US) como UK GDPR (UK).
 # HIPAA: nombres, fechas de nacimiento, teléfonos, SSN, MRN, etc.
 # UK GDPR: NHS number, cualquier combinación re-identificable.
+
+# ── Lista blanca: términos que NUNCA deben ser PHI ─────────────────
+# HealthCore staff, clínicas y ubicaciones conocidas.
+# CONTEXT.md: preferencias de staff SÍ son memorables; datos operativos
+# de clínicas (Austin, Manchester, etc.) también.
+_PHI_WHITELIST: set[str] = {
+    # HealthCore Staff
+    "Diane Foster", "Claire Whitfield", "James Osei",
+    "Marcus Reid", "Sandra Okonkwo", "Priya Nair",
+    # Clínicas y ubicaciones operativas
+    "Austin", "Manchester", "London", "Miami",
+    "Dallas", "Houston", "San Antonio", "Orlando",
+    "Tampa", "Atlanta", "Savannah", "Central",
+    "Texas", "Florida", "Georgia",
+}
+# Combinaciones preposición+ubicación (ej. "En Austin") que NO son nombre
+_PHI_WHITELIST_PREFIXED: set[str] = {
+    "en austin", "en manchester", "en london", "en miami",
+    "en dallas", "en houston", "en san antonio", "en orlando",
+    "en tampa", "en atlanta", "en savannah",
+    "la austin", "la manchester", "la london",
+}
+
 _PHI_PATTERNS: list[re.Pattern] = [
     # ── Identificadores personales (US + UK) ─────────────────────────
     re.compile(r"\b[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+ [A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+\b"),  # Nombre completo (ej. "John Smith", "Juan Pérez")
@@ -183,9 +206,41 @@ def validate_phi_safe(text: str) -> tuple[bool, list[str]]:
         found = pattern.findall(text)
         matches.extend(found)
 
-    # Si hay coincidencias, no es seguro
-    if matches:
-        return False, list(set(matches))
+    # ── Filtrar falsos positivos contra lista blanca ────────────────
+    # HealthCore staff (Diane Foster, Claire Whitfield, etc.) y nombres
+    # de clínicas (Austin, Manchester, etc.) NO son PHI, incluso si
+    # coinciden con patrones de "Nombre Apellido".
+    # CONTEXT.md: preferencias de staff y datos operativos de clínicas
+    # SÍ son memorables y no deben ser bloqueados por PHI validation.
+    filtered: list[str] = []
+    for m in matches:
+        m_lower = m.lower().strip()
+        # Saltar si el match exacto está en whitelist
+        if m_lower in _PHI_WHITELIST or m_lower in _PHI_WHITELIST_PREFIXED:
+            continue
+        # Saltar si "preposición + ubicación" (ej. "en austin")
+        # Patrones de nombre completo como "En Austin" son preposición+ciudad
+        skip = False
+        for wp in _PHI_WHITELIST_PREFIXED:
+            if wp in m_lower:
+                skip = True
+                break
+        if skip:
+            continue
+        # Saltar si es una ubicación conocida como palabra suelta
+        # (ej. solo "Austin" sin apellido)
+        for loc in _PHI_WHITELIST:
+            loc_lower = loc.lower()
+            if m_lower == loc_lower or m_lower == loc_lower + " ":
+                skip = True
+                break
+        if skip:
+            continue
+        filtered.append(m)
+
+    # Si hay coincidencias no filtradas, no es seguro
+    if filtered:
+        return False, list(set(filtered))
 
     return True, []
 

@@ -67,6 +67,13 @@ _MEMORIZE_TRIGGER_KEYWORDS: set[str] = {
     "no-show",  # Patrón de incidentes
     "fue porque",  # Explicación causal
     "hubo",     # "hubo un cierre"
+    # Comandos explícitos de memorización (CONTEXT.md §Hito8)
+    # El usuario pide activamente guardar información
+    "apúntalo", "apunta",  # "apúntalo" / "apunta esto"
+    "guárdalo", "guarda",  # "guárdalo" / "guarda esto"
+    "recuérdalo", "recordar",  # "recuérdalo" / "para recordar"
+    "escribe", "escribir",  # "escribe que..."
+    "almacena", "almacenar",  # "almacena esta información"
 }
 
 # ── Señales de que NO hay nada que recordar ─────────────────────────
@@ -116,7 +123,10 @@ def auto_evaluate_proposal(
     Returns:
         Tupla (answer_con_propuesta, proposal_info o None).
         Si hay propuesta, answer_con_propuesta incluye la pregunta al usuario.
-        Si no hay propuesta, answer_con_propuesta == answer.
+        Si NO hay propuesta o es duplicado, answer_con_propuesta == answer.
+        Si la propuesta fue RECHAZADA POR PHI, answer_con_propuesta incluye
+            un mensaje explícito al usuario explicando por qué no se puede
+            recordar (requisito CONTEXT.md Hito8).
 
     La propuesta NO se guarda directamente — solo se prepara para
     mostrarse al usuario.  ``finalize_proposal()`` la escribe si el
@@ -158,7 +168,32 @@ def auto_evaluate_proposal(
             proposal=candidate,
             detail=f"Auto-evaluación rechazó propuesta por PHI: {phi_matches}",
         )
-        return answer, None
+
+        # ❗ REQUISITO CONTEXT.md Hito8:
+        #   "el agente debe rechazar la propuesta explícitamente,
+        #    no solo ignorarla en silencio, y explicarle al usuario
+        #    por qué no puede recordar eso"
+        rejection_msg = (
+            "\n\n---\n\n"
+            "⚠️ **No puedo guardar eso en mi memoria.**\n\n"
+            "La información que mencionas parece contener datos de salud "
+            "protegidos (PHI). Por cumplimiento de **HIPAA** y **UK GDPR**, "
+            "no está permitido almacenar identificadores de pacientes, "
+            "diagnósticos ni ningún dato que pueda re-identificar a una "
+            "persona en mi memoria persistente.\n\n"
+            "Puedo ayudarte a gestionar esta incidencia a través de los "
+            "canales estándar de HealthCore, pero no puedo «recordarlo» "
+            "como un hecho operativo.\n\n"
+            "*Si se trata de un cambio operativo sin datos de paciente, "
+            "por favor reformúlalo sin incluir información personal.*"
+        )
+        answer_rechazada = answer + rejection_msg
+
+        return answer_rechazada, {
+            "phi_rejected": True,
+            "phi_matches": phi_matches,
+            "category": candidate["category"],
+        }
 
     # 5. Construir la pregunta al usuario
     proposal_text = candidate["content"]
@@ -196,9 +231,11 @@ def _should_evaluate(question: str, answer: str) -> bool:
     combined = (question + " " + answer).lower()
     q_lower = question.lower()
 
-    # Señales de NO evaluar
+    # Señales de NO evaluar (solo en la pregunta del usuario)
+    # No revisamos la respuesta del agente porque podría contener
+    # cortesías como "gracias" que no indican despedida real.
     for indicator in _NON_MEMORIZABLE_INDICATORS:
-        if indicator in combined:
+        if indicator in q_lower:
             return False
 
     # Si la pregunta es hipotética/condicional → no memorizar
@@ -211,7 +248,12 @@ def _should_evaluate(question: str, answer: str) -> bool:
 
     if has_trigger:
         # Si tiene trigger y no es una consulta genérica → evaluar
-        if any(phrase in q_lower for phrase in _QUERY_PHRASES):
+        # Usamos regex con \b para evitar falsos positivos
+        # Ej: "lista" no debe matchear dentro de "especialista"
+        if any(
+            re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)
+            for phrase in _QUERY_PHRASES
+        ):
             return False
         return True
 
@@ -248,9 +290,11 @@ def _extract_memory_candidate(
 
     # ── Categoría: incident_pattern ──
     # Patrones de incidentes conocidos (sin datos de paciente)
+    # Incluye alertas, no-show, interrupciones, y explicaciones causales
     if any(
         word in combined
-        for word in ["incidente", "falla", "falló", "patrón", "suele", "típicamente", "lunes"]
+        for word in ["incidente", "falla", "falló", "patrón", "suele", "típicamente", "lunes",
+                      "alerta", "no-show", "hubo", "cierre", "hora falsa"]
     ):
         content = _extract_incident_pattern(question, answer, tool_results)
         if content:
@@ -273,6 +317,48 @@ def _extract_memory_candidate(
                 "category": "staff_preference",
                 "reason": "Preferencia de miembro del staff sobre presentación de información.",
             }
+
+    # ── Fallback: Si pasó _should_evaluate pero no tiene categoría específica ──
+    # Esto asegura que contenido con PHI (como "El paciente Johnson... apúntalo")
+    # llegue a la validación PHI para ser rechazado explícitamente, en lugar de
+    # ser ignorado en silencio (ver CONTEXT.md Hito8).
+    # También captura comandos directos como "guárdalo", "recuérdalo", "escribe".
+    if any(
+        word in combined
+        for word in ["apúntalo", "guárdalo", "recuérdalo", "escribe", "guarda", "almacena"]
+    ):
+        content = _extract_command_memory(question, answer)
+        if content:
+            return {
+                "content": content,
+                "category": "operational",
+                "reason": "El usuario solicitó explícitamente recordar esta información.",
+            }
+
+    # ── Fallback genérico ──
+    # Si _should_evaluate() ya determinó que es memorable pero ningún
+    # extractor específico lo clasificó, extraemos el contenido factual
+    # de la pregunta/respuesta para que al menos pase por validación PHI.
+    # Esto cubre casos como "alerta de no-show... hubo..." (Caso 3) y
+    # "reporte para Diane Foster debe incluir..." (Caso 4).
+    content = _extract_fallback_content(question, answer)
+    if content:
+        # Inferir categoría según palabras clave en el texto
+        combined_lower = (question + " " + answer).lower()
+        if any(w in combined_lower for w in ["alerta", "no-show", "incidente", "falla", "falló", "hubo", "cierre"]):
+            inferred = "incident_pattern"
+            reason = "Patrón operativo o alerta que puede ser útil en el futuro."
+        elif any(w in combined_lower for w in ["reporte", "prefiere", "incluir"]):
+            inferred = "staff_preference"
+            reason = "Preferencia o requerimiento de miembro del staff."
+        else:
+            inferred = "operational"
+            reason = "Información operativa que puede afectar futuras consultas."
+        return {
+            "content": content,
+            "category": inferred,
+            "reason": reason,
+        }
 
     return None
 
@@ -345,6 +431,81 @@ def _extract_staff_preference(question: str, answer: str) -> str | None:
     if m:
         staff_name = m.group(1)
         return f"Preferencia de {staff_name}: presentar información por rol, no solo por clínica."
+
+    return None
+
+
+def _extract_command_memory(question: str, answer: str) -> str | None:
+    """Extrae contenido de un comando explícito de memorización.
+
+    El usuario pide activamente guardar algo con verbos como
+    «apúntalo», «guárdalo», «recuérdalo», «escribe».
+    Extraemos el contenido factual quitando la parte del comando.
+    """
+    import re
+    combined = question + " " + answer
+
+    # Intentar extraer el hecho quitando el comando
+    # Patrón: "[contexto], [comando]" o "[comando]: [contenido]"
+    for cmd_pat in [r"apúntalo", r"guárdalo", r"recuérdalo", r"escribe\s+(?:que\s+)?", r"guarda\s+(?:esto\s+)?"]:
+        m = re.search(
+            r"(.+?)[,;.\s]*" + cmd_pat,
+            combined, re.IGNORECASE,
+        )
+        if m:
+            content = m.group(1).strip()
+            # Limpiar comando residual
+            content = re.sub(r"\b(?:apunta|guarda|escribe|recuerda|almacena)\s*", "", content, flags=re.IGNORECASE).strip()
+            if len(content) > 10:
+                return content
+
+    # Fallback: si el comando está al inicio
+    for cmd_pat in [r"apunta", r"guarda", r"escribe", r"recuerda", r"almacena"]:
+        m = re.search(
+            cmd_pat + r"\s+(?:que\s+)?(.+)$",
+            combined, re.IGNORECASE,
+        )
+        if m:
+            content = m.group(1).strip()
+            if len(content) > 10:
+                return content
+
+    # Último recurso: devolver la pregunta completa si es corta
+    # (para que al menos pase por validación PHI)
+    if len(question) > 15:
+        return question.strip()
+
+    return None
+
+
+def _extract_fallback_content(question: str, answer: str) -> str | None:
+    """Extrae contenido factual como fallback cuando ningún extractor
+    específico clasificó la interacción.
+
+    Usa heurísticas simples: toma la oración más informativa de la
+    pregunta o la combinación pregunta+respuesta.
+    """
+    import re
+
+    # Estrategia 1: buscar la oración más larga en la pregunta
+    # que contenga palabras clave del trigger
+    sentences = re.split(r'[.!?\n]', question)
+    best = ""
+    for s in sentences:
+        s = s.strip()
+        if len(s) > len(best) and len(s) > 20:
+            best = s
+
+    if best:
+        return best
+
+    # Estrategia 2: usar toda la pregunta si es sustancial
+    if len(question) > 20:
+        return question.strip()
+
+    # Estrategia 3: usar la respuesta si la pregunta es muy corta
+    if len(answer) > 20:
+        return answer.strip()
 
     return None
 

@@ -182,27 +182,35 @@ def node_auto_evaluate_memory(state: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
 
     if proposal_info:
-        # Guardar propuesta en BD
-        saved = set_pending_proposal(
-            proposal=proposal_info["proposal"],
-            reason=proposal_info["reason"],
-            category=proposal_info["category"],
-            source_run_id=state.get("run_id", "_unknown_"),
-            source_question=proposal_info["source_question"],
-        )
-        if saved:
+        if proposal_info.get("phi_rejected"):
+            # ❗ Rechazo explícito por PHI — usar respuesta con explicación
             result["answer"] = answer_with_proposal
-            result["memory_proposal"] = saved
-            result["memory_proposal_handled"] = False
             result["routing_log"] = [
-                f"auto_evaluate_memory → propuesta creada "
-                f"(categoría: {proposal_info['category']})"
+                "auto_evaluate_memory → propuesta RECHAZADA por PHI "
+                "(mensaje explicativo incluido en respuesta)"
             ]
         else:
-            # No se pudo guardar (probablemente PHI)
-            result["routing_log"] = [
-                "auto_evaluate_memory → propuesta rechazada (PHI)"
-            ]
+            # Propuesta limpia — guardar en BD (ya pasó validación PHI)
+            saved = set_pending_proposal(
+                proposal=proposal_info["proposal"],
+                reason=proposal_info["reason"],
+                category=proposal_info["category"],
+                source_run_id=state.get("run_id", "_unknown_"),
+                source_question=proposal_info["source_question"],
+            )
+            if saved:
+                result["answer"] = answer_with_proposal
+                result["memory_proposal"] = saved
+                result["memory_proposal_handled"] = False
+                result["routing_log"] = [
+                    f"auto_evaluate_memory → propuesta creada "
+                    f"(categoría: {proposal_info['category']})"
+                ]
+            else:
+                # No se pudo guardar (probablemente PHI)
+                result["routing_log"] = [
+                    "auto_evaluate_memory → propuesta rechazada (PHI)"
+                ]
     else:
         result["routing_log"] = [
             "auto_evaluate_memory → nada que recordar"

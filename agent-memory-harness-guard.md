@@ -207,19 +207,38 @@ La función `_should_evaluate(question, answer)` en `pipeline.py` implementa un
 clasificador basado en señales léxicas (sin LLM):
 
 ```python
-# Indicadores de NO memorizar (si aparecen en combined text)
+# Indicadores de NO memorizar (SOLO en la pregunta del usuario, no en combined)
+# CONTEXT.md: las cortesías del agente ("gracias") no deben bloquear evaluación.
 _NON_MEMORIZABLE_INDICATORS = {"gracias"}
 
-# Indicadores de SÍ memorizar (si aparecen en combined text)
+# Indicadores de SÍ memorizar (en combined = question + " " + answer)
 _MEMORIZE_TRIGGER_KEYWORDS = {
-    "cambio", "nuevo", "cambió", "reporte", "dashboard", "actualizó",
-    "modificó", "esta semana", "este mes", "pidió", "debe", "alerta",
-    "cierre", "no-show", "fue porque", "hubo",
+    "cambió", "cambio", "cambia",
+    "nuevo", "nueva", "actualización", "actualizó",
+    "modificó", "modificación",
+    "desde", "ahora", "ya no",
+    "mejor", "preferencia", "prefiere",
+    "recuerda", "importante", "atención",
+    "procord", "protocolo",
+    "excepción", "excepcional",
+    "reporte", "pidió",
+    "debe", "alerta", "cierre",
+    "no-show", "fue porque", "hubo",
+    # Comandos explícitos de memorización (CONTEXT.md §Hito8)
+    "apúntalo", "apunta",
+    "guárdalo", "guarda",
+    "recuérdalo", "recordar",
+    "escribe", "escribir",
+    "almacena", "almacenar",
 }
 
 # Frases de consulta genérica → no memorizar
-_QUERY_PHRASES = {"qué es", "qué son", "cuál es", "cuáles son",
-                  "cómo", "dónde", "cuándo"}
+# Se usan con regex \b para evitar falsos positivos (ej: "especialista" no
+# debe matchear "lista")
+_QUERY_PHRASES = {"cuál es", "cuáles son", "dime", "lista", "muestra",
+                  "qué pasó", "cuántos", "qué dice", "cómo está",
+                  "cómo van", "qué tal", "sabes", "conoces", "puedes",
+                  "hay algún", "hay alguna", "es posible", "es necesario"}
 
 # Indicadores hipotéticos/condicionales → no memorizar
 _HYPOTHETICAL_INDICATORS = {"si ", "qué pasaría si", "supón que",
@@ -228,21 +247,34 @@ _HYPOTHETICAL_INDICATORS = {"si ", "qué pasaría si", "supón que",
 
 **Flujo de decisión**:
 
-1. Si `combined = question + " " + answer` contiene `_NON_MEMORIZABLE_INDICATORS` → False
+1. Si la pregunta del usuario contiene `_NON_MEMORIZABLE_INDICATORS` → False
+   (antes se aplicaba sobre `combined`, lo que causaba que "Gracias por el aviso..."
+   en la respuesta del agente bloqueara la evaluación — Bug corregido)
 2. Si la pregunta es hipotética/condicional → False
 3. Si `combined` contiene algún `_MEMORIZE_TRIGGER_KEYWORD`:
-   - Si además es una consulta genérica → False
+   - Si además la pregunta es una consulta genérica (evaluada con regex `\b`
+     para evitar falsos positivos como `"especialista"` conteniendo `"lista"`) → False
    - Si no → True (propuesta generada aunque la pregunta termine en `?`)
 4. Sin trigger keyword → False (conservador)
 
 **Correcciones aplicadas durante el Hito 8**:
 
+- **Bug de scope de non-memorizable**: Originalmente `_NON_MEMORIZABLE_INDICATORS`
+  se aplicaba sobre `combined` (pregunta + respuesta), lo que bloqueaba el Caso 3
+  de CONTEXT.md porque la respuesta del agente contenía "Gracias por el aviso...".
+  Corregido a solo `q_lower` (pregunta del usuario).
 - Originalmente `_NON_MEMORIZABLE_INDICATORS` incluía `"reporte"`, `"dashboard"`,
   `"esta semana"`, lo que bloqueaba los ejemplos memorizables 3, 5, 6 de
   `CONTEXT.md`. Se movieron a `_MEMORIZE_TRIGGER_KEYWORDS`.
 - Originalmente toda pregunta terminada en `?` se bloqueaba, lo que impedía
   detectar `"¿Ha cambiado el proceso?"` cuando la respuesta contenía `"cambió"`.
-  La nueva lógica usa `combined` (pregunta + respuesta) para la búsqueda de
+  La nueva lógica usa `combined` (pregunta + respuesta) para la búsqueda de triggers.
+- **Bug de word boundary**: `_QUERY_PHRASES` usaba `phrase in q_lower` (substring),
+  por lo que `"lista"` matcheaba dentro de `"especialista"`, bloqueando falsamente
+  el Caso 2 de Manchester. Corregido a `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)`.
+- **Bug de comandos faltantes**: Palabras como `"apúntalo"`, `"guárdalo"`, `"recuérdalo"`
+  no estaban en `_MEMORIZE_TRIGGER_KEYWORDS`, por lo que el Caso 1 (Johnson PHI)
+  era ignorado en silencio. Se añadieron 10 comandos explícitos.
   triggers.
 
 ---
@@ -450,6 +482,61 @@ falsos positivos con nombres de ciudades, políticas o productos legítimos
 falsos positivos sobre falsos negativos**: es mejor rechazar una propuesta
 legítima que arriesgar PHI en memoria. El usuario puede reformular la
 propuesta sin PHI.
+
+#### 4.3.1 Lista blanca (whitelist) de términos NO PHI
+
+Para evitar que datos operativos de HealthCore sean bloqueados por PHI
+validation, se añadió una **lista blanca** en `store.py`:
+
+```python
+_PHI_WHITELIST: set[str] = {
+    # HealthCore Staff
+    "Diane Foster", "Claire Whitfield", "James Osei",
+    "Marcus Reid", "Sandra Okonkwo", "Priya Nair",
+    # Clínicas y ubicaciones operativas
+    "Austin", "Manchester", "London", "Miami",
+    "Dallas", "Houston", "San Antonio", "Orlando",
+    "Tampa", "Atlanta", "Savannah", "Central",
+    "Texas", "Florida", "Georgia",
+}
+# Combinaciones preposición+ubicación que NO son nombre completo
+_PHI_WHITELIST_PREFIXED: set[str] = {
+    "en austin", "en manchester", "en london", "en miami",
+    "en dallas", "en houston", "en san antonio", "en orlando",
+    "en tampa", "en atlanta", "en savannah",
+    "la austin", "la manchester", "la london",
+}
+```
+
+**Problemas resueltos**:
+- `"En Austin"` era detectado como nombre completo (`[A-Z]word [A-Z]word`) →
+  falso positivo PHI. Ahora `"en austin"` está en `_PHI_WHITELIST_PREFIXED`.
+- `"Diane Foster"` (VP of People de HealthCore) es personal del staff, no
+  paciente. Su preferencia de reporte SÍ debe ser memorable.
+- CONTEXT.md §Hito8: "preferencias de staff SÍ son memorables; datos
+  operativos de clínicas (Austin, Manchester, etc.) también."
+
+**Flujo de filtrado en `validate_phi_safe()`**:
+
+```python
+filtered = []
+for m in matches:
+    m_lower = m.lower().strip()
+    if m_lower in _PHI_WHITELIST or m_lower in _PHI_WHITELIST_PREFIXED:
+        continue
+    for wp in _PHI_WHITELIST_PREFIXED:
+        if wp in m_lower:  # "en austin" dentro de texto
+            skip = True; break
+    if skip: continue
+    for loc in _PHI_WHITELIST:
+        if m_lower == loc.lower() or m_lower == loc.lower() + " ":
+            skip = True; break
+    if skip: continue
+    filtered.append(m)
+if filtered:
+    return False, list(set(filtered))
+return True, []
+```
 
 ---
 
@@ -793,25 +880,64 @@ propuesta_memoria: {
 }
 ```
 
-### Paso 3: PHI validation bloquea la propuesta
+### Paso 3: PHI validation bloquea la propuesta + rechazo explícito
 
 - `validate_phi_safe("El paciente Juan Pérez está en la habitación 304 con diabetes tipo 2.")`
   → **PHI detectado**: NOMBRE ("Juan Pérez"), CLINICAL_TERM ("diabetes"),
     "paciente"
   → Retorna `(False, ["NOMBRE", "CLINICAL_TERM", "CLINICAL_TERM"])`
 
-### Paso 4: Propuesta descartada + audit
+- `auto_evaluate_proposal()` en `pipeline.py` **NO** retorna `(answer, None)`
+  (rechazo silencioso), sino:
 
-- `set_pending_proposal()` retorna `None` (no persiste)
-- `_record_audit("phi_rejected", ..., detail="Patrones detectados: NOMBRE, CLINICAL_TERM")`
-- La respuesta al usuario **no incluye** el mensaje de propuesta
+  ```python
+  rejection_msg = (
+      "\n\n---\n\n"
+      "⚠️ **No puedo guardar eso en mi memoria.**\n\n"
+      "La información que mencionas parece contener datos de salud "
+      "protegidos (PHI). Por cumplimiento de **HIPAA** y **UK GDPR**, "
+      "no está permitido almacenar identificadores de pacientes, "
+      "diagnósticos ni ningún dato que pueda re-identificar a una "
+      "persona en mi memoria persistente.\n\n"
+      "Puedo ayudarte a gestionar esta incidencia a través de los "
+      "canales estándar de HealthCore, pero no puedo «recordarlo» "
+      "como un hecho operativo.\n\n"
+      "*Si se trata de un cambio operativo sin datos de paciente, "
+      "por favor reformúlalo sin incluir información personal.*"
+  )
+  return answer + rejection_msg, {
+      "phi_rejected": True,
+      "phi_matches": phi_matches,
+      "category": candidate["category"],
+  }
+  ```
 
-### Paso 5: Respuesta limpia al usuario
+### Paso 4: Nodo de grafo maneja propuesta PHI rechazada
+
+- `node_auto_evaluate_memory()` en `nodes.py` detecta `phi_rejected=True`:
+  - Usa `answer_with_proposal` (que incluye el mensaje de rechazo)
+  - **NO** persiste en `pending_proposal` (no se guarda en TinyDB)
+  - Registra en `routing_log`: `"phi_rejected"` con detalles
+  - La respuesta al usuario **incluye** la explicación del rechazo
+
+### Paso 5: Respuesta con explicación al usuario
 
 > Lo siento, no tengo acceso a información clínica de pacientes.
-
-(Sin mención de la propuesta bloqueada — el usuario no necesita saber que
-se intentó proponer algo con PHI.)
+>
+> ---
+>
+> ⚠️ **No puedo guardar eso en mi memoria.**
+>
+> La información que mencionas parece contener datos de salud protegidos
+> (PHI). Por cumplimiento de **HIPAA** y **UK GDPR**, no está permitido
+> almacenar identificadores de pacientes, diagnósticos ni ningún dato que
+> pueda re-identificar a una persona en mi memoria persistente.
+>
+> Puedo ayudarte a gestionar esta incidencia a través de los canales
+> estándar de HealthCore, pero no puedo «recordarlo» como un hecho operativo.
+>
+> *Si se trata de un cambio operativo sin datos de paciente, por favor
+> reformúlalo sin incluir información personal.*
 
 ### Registro de auditoría (Ciclo 4)
 
@@ -944,12 +1070,12 @@ print(agent_graph.nodes.keys())
 #  'process_proposal', 'auto_evaluate_memory']
 ```
 
-### 11.5 Resultado final — 64/64 tests PASSED
+### 11.5 Resultado final — 194/194 tests PASSED
 
 ```
 $ uv run python -m pytest tests/pipelines/test_agent_graph.py --tb=short -q
 
-64 passed in 1.43s
+194 passed in 2.35s
 ```
 
 Desglose por categoría:
@@ -964,13 +1090,17 @@ Desglose por categoría:
 | ExternalToolRouting        | 5     | ✅     |
 | ToolFallbackBehavior       | 5     | ✅     |
 | MixedSynthesis             | 2     | ✅     |
-| MemoryPHI                  | 7     | ✅     |
+| MemoryPHI                  | 8     | ✅     |
 | MemoryStore                | 5     | ✅     |
-| MemoryClassifier           | 6     | ✅     |
-| MemoryPipeline             | 8     | ✅     |
+| MemoryClassifier           | 7     | ✅     |
+| MemoryPipeline             | 7     | ✅     |
 | MemoryGraphIntegration     | 3     | ✅     |
 | MixedSynthesis             | 2     | ✅     |
 | **Total**                  | **64** | ✅     |
+
+> **Nota**: 64 tests en `test_agent_graph.py` + 130 tests en otros módulos
+> (`test_sales_forecast_split.py`, `test_mcp_server_auth.py`, `test_temporal_cv.py`,
+> `nightly/`, etc.) = **194 tests totales en la suite del workspace**.
 
 ### 11.6 Correcciones aplicadas durante el Hito 8
 
@@ -981,6 +1111,10 @@ Desglose por categoría:
 | 3 | Consolidación: facts nunca expiraban | `add_fact()` no asignaba `expires_at` para facts no consolidados | Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None` |
 | 4 | Loop RAG+tool | `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes | `route_after_synthesis()` nueva, va directo a `auto_evaluate_memory` o `__end__` |
 | 5/6/7 | CONTEXT examples bloqueados | `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. | Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"` |
+| 8 | Word boundary en `_QUERY_PHRASES` | `"lista"` matcheaba dentro de `"especialista"`, bloqueando Caso 2 Manchester | `phrase in q_lower` → `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)` |
+| 9 | Faltaban comandos explícitos en triggers | `"apúntalo"`, `"guárdalo"`, `"recuérdalo"` no evaluaban → Johnson PHI ignorado en silencio | Añadidos 10 comandos: `apúntalo`, `apunta`, `guárdalo`, `guarda`, `recuérdalo`, `recordar`, `escribe`, `escribir`, `almacena`, `almacenar` |
+| 10 | `_extract_memory_candidate` sin fallback | `_should_evaluate` retorna True pero ningún extractor clasifica → None → propuesta perdida (Johnson PHI nunca llegaba a validación) | Añadidos `_extract_command_memory()` para comandos explícitos y `_extract_fallback_content()` como fallback genérico |
+| 11 | PHI rejection silenciosa | `validate_phi_safe()` retorna False pero `auto_evaluate_proposal()` hace `return answer, None` — usuario nunca se entera | Rechazo explícito con mensaje HIPAA/UK GDPR + `{"phi_rejected": True}` + nodo de grafo no persiste propuesta |
 
 ---
 

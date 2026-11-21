@@ -1,1 +1,1 @@
-{"pending_proposal": {}, "audit_log": {}, "memory_facts": {}}
+{"pending_proposal": {}, "audit_log": {"1": {"event_type": "phi_rejected", "run_id": "test_phi", "proposal": {"proposal": "El paciente Juan P\u00e9rez tiene cita ma\u00f1ana.", "reason": "test", "category": "operational"}, "user_message": null, "classification": null, "detail": "Conten\u00eda PHI: ['P\u00e9rez', 'Juan P\u00e9rez', 'El paciente Juan ', 'paciente Juan P\u00e9rez']", "timestamp": "2026-11-21T14:41:14.685352+00:00"}}, "memory_facts": {}}
