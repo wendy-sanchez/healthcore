@@ -85,6 +85,31 @@
 - **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, **5 ciclos completos con trazas (incluyendo Ciclo 5 — Unrelated)**, política de consolidación, tabla de **17 bugs corregidos**, whitelist PHI documentada, rechazo explícito PHI documentado, evento de auditoría `"unrelated"`.
 - **Branch**: `feature/agent-memory` (o rama activa del desarrollo).
 
+### Hito 8 · Parte 2 — Harness y Guardrails (2026-12)
+
+- **Entregable**: Blindaje del agente LangGraph contra inyección de prompt, jailbreaks, solicitudes fuera de dominio, y fugas de PHI mediante guardrails deterministas basados en regex (sin LLM en hot path).
+- **Stack**: `Python 3.14`, `re` (guardrails regex puros, sin dependencia LLM), `LangGraph >=1.2.22` (nodos de guardrail en el grafo).
+- **3 módulos** en `services/agent/guardrails/`:
+  - `harness.py` — **System prompt hardening**: 5 reglas de restricción (Prohibited behavior, Constrained capabilities, Query-response binding, Completeness, Tone and empathy). Funciones: `build_system_prompt()` retorna string completo; `wrap_rag_context(context)` aísla contenido RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS` + advertencia.
+  - `content_guard.py` — **Clasificación de entrada**: 6 categorías con prioridad estricta: `JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6)`. ~100 patrones regex. Función: `classify_input_scope(text)` retorna `GuardResult` con clasificación, blocked, confidence, reason, response.
+  - `output_guard.py` — **Validación de respuesta**: 3 checkers independientes — `check_format` (vacío/largo), `check_leaked_instructions` (14 patrones EN+ES), `check_sensitive_data` (6 patrones PHI + 3 confidenciales). Función: `validate_output(output)` retorna `OutputValidationResult`.
+- **Aislamiento de contenido externo** (`wrap_rag_context` + sección `RAG_TOOL_ISOLATION` en system prompt): contenido RAG/tools nunca se trata como instrucción. Verificado con 3 tests de inyección RAG.
+- **Integración en grafo LangGraph**:
+  - 3 nuevos campos en `AgentState`: `guardrail_result: Optional[dict]`, `guardrail_blocked: bool`, `guardrail_response: str`.
+  - Nodo `node_input_guardrail`: clasifica query; si no es DOMAIN, corta el flujo con respuesta predefinida.
+  - Nodo `node_output_guardrail`: valida respuesta del LLM; si detecta PHI/leaked/format, la reemplaza con fallback.
+  - Routing: `route_after_receive` → `input_guardrail`; `route_after_input_guardrail` → `load_memory_context` (si DOMAIN) o `__end__` (si bloqueado).
+- **Observabilidad**: `guardrail_summary(limit=100)` en `graph.py` lee trazas persistentes y retorna estadísticas agregadas (input/output activaciones por clasificación/tipo de issue). Cada nodo registra evento estructurado con `failure_type` (security/content/structural).
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` (7 harness + 26 content + 12 output + 17 edge cases). 94 tests en `test_agent_graph.py`. **Suite completa: 286 tests** (`uv run python -m pytest tests/ -v` → 286 passed).
+- **Nuevos tests de inyección RAG** (3):
+  1. `test_rag_content_injection_wrapped_as_data` — Chunk con `[SYSTEM]: ignore...` envuelto, verifica NO en system prompt.
+  2. `test_rag_content_injection_system_prompt_warns` — System prompt contiene advertencia "factual reference only".
+  3. `test_rag_injection_with_jailbreak_keywords_not_confused` — Query legítima DOMAIN, capas separadas.
+- **Auditoría**: ✅ 9/9 criterios de aceptación cumplidos. ✅ 100% contra solución de referencia (29/29 puntos). Gap en tests de inyección RAG cerrado.
+- **Archivos clave**: `services/agent/guardrails/{harness,content_guard,output_guard}.py`, `__init__.py`, `services/agent/graph.py`, `tests/pipelines/test_guardrails.py`.
+- **Documentación**: `agent-memory-harness-guard.md` — §13-19: arquitectura, 3 capas, aislamiento RAG, tests, observabilidad, integración, auditoría, referencias.
+- **Branch**: `feature/agent-memory`.
+
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
 - **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
 - **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.
