@@ -9,6 +9,7 @@ este módulo clasifica la intención del usuario mediante **reglas estructurales
   - ``reject``   — Rechaza la propuesta (confianza >= 0.75)
   - ``edit``     — Propone una edición (confianza >= 0.85)
   - ``discard``  — Cambia de tema sin responder (default)
+  - ``phi_rejected`` — El mensaje del usuario contiene PHI (confianza >= 0.99)
 
 Principios (CONTEXT.md + agent-memory-harness-guard.md §2.4):
   1. **Confirmación explícita necesaria**: sin un "sí" claro, no hay approve.
@@ -17,6 +18,9 @@ Principios (CONTEXT.md + agent-memory-harness-guard.md §2.4):
   4. La edición requiere texto alternativo explícito.
   5. Cortesías ("gracias", "saludos") NUNCA son aprobación.
   6. Preguntas y condicionales NUNCA son approve/edit.
+  7. **PHI (HIPAA/UK GDPR) siempre se valida antes que cualquier otra señal**:
+     si el mensaje del usuario contiene lo que parece PHI, se rechaza
+     explícitamente — nunca se ignora en silencio.
 
 En lugar de listas de palabras, el clasificador usa ejes estructurales:
   - **Eje de tonicidad**: "sí" (átono=condicional) vs "sí" (tónico=afirmación)
@@ -31,7 +35,7 @@ import logging
 import re
 from typing import Literal
 
-from .store import get_pending_proposal
+from .store import get_pending_proposal, validate_phi_safe
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ class IntentClassification:
 
     def __init__(
         self,
-        intent: Literal["approve", "reject", "edit", "discard", "no_proposal"],
+        intent: Literal["approve", "reject", "edit", "discard", "no_proposal", "phi_rejected"],
         confidence: float,
         edit_text: str | None = None,
         explanation: str = "",
@@ -74,12 +78,13 @@ _CONFIDENCE_APPROVE: float = 0.70  # Confirmación explícita del usuario
 _CONFIDENCE_REJECT: float = 0.75   # Rechazo explícito
 _CONFIDENCE_EDIT: float = 0.85     # Edición con texto alternativo
 _CONFIDENCE_DISCARD: float = 0.0   # Sin señal clara → descarte
+_CONFIDENCE_PHI_REJECTED: float = 0.99  # PHI detectado → rechazo explícito
 
 # ── Signos de pregunta (delatan que no es respuesta a la propuesta) ──
 _RE_QUESTION_END = re.compile(r"\?\s*$")
 _RE_QUESTION_WORDS = re.compile(
     r"\b(?:qui[eé]n|qu[eé]|c[uoá]l|c[uoá]les|"
-    r"d[oó]nde|c[oó]mo|por\s*qu[eé]|cu[aá]ndo|"
+    r"d[oó]nde|c[oó]mo|por\s+qué|cu[aá]ndo|"
     r"cu[aá]nto|cu[aá]ntos|cu[aá]ntas?)\b",
     re.IGNORECASE,
 )
@@ -169,8 +174,11 @@ _RE_REJECT_VERBS = re.compile(
     re.IGNORECASE,
 )
 # Frases compuestas de rechazo (estructura, no lista)
+# Incluye pronombres átonos (lo/la/los/las/le/les/me/te/se/nos) entre "no" y el verbo
+# Usa raíces de verbos (sin vocal de conjugación) para captar todas las formas
 _RE_REJECT_PHRASE = re.compile(
-    r"\b(?:no\s+(?:guard|quiero|hag[ae]s?|graba|recuerd|necesit))\w*\b",
+    r"\b(?:no\s+(?:(?:lo|la|los|las|le|les|me|te|se|nos)\s+)?"
+    r"(?:guard|quier|hag|grab|recuerd|necesit|apunt|escrib|almacen|anot))\w*\b",
     re.IGNORECASE,
 )
 
@@ -199,6 +207,7 @@ def _hay_rechazo(text: str) -> float:
         score += 0.3
 
     # Señal muy fuerte: frase compuesta "no + verbo de memoria"
+    # (incluye pronombres: "no lo guardes", "no la grabes", etc.)
     if _RE_REJECT_PHRASE.search(t):
         score += 0.3
 
@@ -242,6 +251,7 @@ def _hay_aprobacion(text: str) -> float:
       - Frases compuestas de consentimiento → approve
       - Comandos de memorización → approve implícito
       - "bien" como única palabra o al inicio de cortesía → NO approve
+      - Comandos de memorización NEGADOS por "no" → NO contribuyen
     """
     t = text.lower().strip()
     score = 0.0
@@ -260,8 +270,10 @@ def _hay_aprobacion(text: str) -> float:
 
     # Señal fuerte: comando de memorización (acción explícita de guardar)
     # "guárdalo", "recuérdalo", "apúntalo" → approve implícito
+    # PERO si está negado por "no" → NO contribuye
     if _RE_STORE_COMMANDS.search(t):
-        score += 0.8
+        if not _comando_memoria_negado(t):
+            score += 0.8
 
     # Señal fuerte: palabras cortas de afirmación internacional
     words_clean = [w.strip(",.!?¿¡;:") for w in t.split()]
@@ -295,6 +307,33 @@ def _hay_edicion(text: str) -> float:
     if _RE_EDIT_MARKERS.search(t):
         return 0.85  # Señal inequívoca de corrección
     return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Helper: detección de comandos de memoria negados
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _comando_memoria_negado(text: str) -> bool:
+    """Detecta si un comando de memoria está negado por un ``no`` precedente.
+
+    Ejemplos:
+      "no lo guardes" → True
+      "no guardes" → True
+      "no recuerdes eso" → True
+      "guárdalo" → False
+      "sí, guárdalo" → False
+      "recuérdalo" → False
+    """
+    t = text.lower()
+    return bool(
+        re.search(
+            r"\bno\s+(?:(?:lo|la|los|las|le|les|me|te|se|nos)\s+)?"
+            r"(?:guard|recuerd|apunt|escrib|almacen|anot)\w*\b",
+            t,
+            re.IGNORECASE,
+        )
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -364,6 +403,26 @@ def classify_user_intent(
     msg_lower = msg.lower()
 
     # ════════════════════════════════════════════════════════════════
+    # Paso 0: Validación PHI — requisito HIPAA/UK GDPR
+    # ════════════════════════════════════════════════════════════════
+    # CONTEXT.md Hito8: si el mensaje del usuario contiene PHI,
+    # debe rechazarse explícitamente, NO clasificarse como approve/reject/discard.
+    # Esto cubre casos como "El paciente Smith canceló su cita, apúntalo"
+    # (que contiene "apúntalo" pero también PHI) y
+    # "Dame la hora de la cita del paciente Johnson" (consulta con PHI).
+    phi_safe, phi_matches = validate_phi_safe(msg)
+    if not phi_safe:
+        return IntentClassification(
+            intent="phi_rejected",
+            confidence=_CONFIDENCE_PHI_REJECTED,
+            explanation=(
+                f"El mensaje del usuario contiene información de salud protegida (PHI). "
+                f"Coincidencias detectadas: {phi_matches}. "
+                f"Requisito HIPAA/UK GDPR: no puede almacenarse en memoria."
+            ),
+        )
+
+    # ════════════════════════════════════════════════════════════════
     # Paso 1: Descartar por estructura — preguntas y condicionales
     # ════════════════════════════════════════════════════════════════
     # Una pregunta NUNCA es approve/edit (no responde a la propuesta)
@@ -423,6 +482,22 @@ def classify_user_intent(
             explanation=(
                 "El mensaje contiene 'bien' sin frase compuesta de aprobación "
                 "(p.ej. 'está bien'). Se descarta por ambigüedad."
+            ),
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # Paso 5b: Detectar contradicciones — sí + no nunca es approve
+    # ════════════════════════════════════════════════════════════════
+    # Si el mensaje contiene tanto "sí" (aprobación) como "no" (rechazo),
+    # es contradictorio/ambiguo y se descarta.
+    if _RE_SI_TILDE.search(msg_lower) and _RE_NO_WORD.search(msg_lower):
+        return IntentClassification(
+            intent="discard",
+            confidence=_CONFIDENCE_DISCARD,
+            explanation=(
+                "El mensaje contiene tanto aprobación ('sí') como negación ('no'), "
+                "lo que es contradictorio. Se descarta por ambigüedad "
+                "— nunca se asume aprobación en presencia de negación."
             ),
         )
 

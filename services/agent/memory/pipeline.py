@@ -48,6 +48,90 @@ logger = logging.getLogger(__name__)
 # ── Categorías de hechos memorizables ───────────────────────────────
 MEMORIZABLE_CATEGORIES = ("operational", "incident_pattern", "staff_preference")
 
+
+def _process_llm_proposal(
+    llm_proposal: dict[str, Any],
+    question: str,
+    answer: str,
+    facts: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any] | None]:
+    """Procesa y valida una propuesta de memoria generada por el LLM.
+
+    Esta es la ruta prioritaria: el LLM ya evaluó la interacción y
+    determinó si hay algo memorable, todo en la misma llamada.
+    Solo hacemos validaciones PHI y de duplicados antes de mostrar
+    la propuesta al usuario.
+
+    Returns:
+        Tupla (answer_con_propuesta, proposal_info o None).
+    """
+    content = llm_proposal.get("proposal", "").strip()
+    if not content or len(content) < 10:
+        return answer, None
+
+    # 1. Verificar duplicado
+    if _is_duplicate(content, facts):
+        logger.info("Propuesta LLM descartada — ya existe: '%s'", content[:80])
+        return answer, None
+
+    # 2. Validación PHI
+    phi_safe, phi_matches = validate_phi_safe(content)
+    if not phi_safe:
+        logger.warning("Propuesta LLM rechazada por PHI: %s", phi_matches)
+        _record_audit(
+            event_type="phi_rejected",
+            run_id="_llm_structured_",
+            proposal=llm_proposal,
+            detail=f"Propuesta LLM rechazada por PHI: {phi_matches}",
+        )
+        rejection_msg = (
+            "\n\n---\n\n"
+            "⚠️ **No puedo guardar eso en mi memoria.**\n\n"
+            "La información que mencionas parece contener datos de salud "
+            "protegidos (PHI). Por cumplimiento de **HIPAA** y **UK GDPR**, "
+            "no está permitido almacenar identificadores de pacientes, "
+            "diagnósticos ni ningún dato que pueda re-identificar a una "
+            "persona en mi memoria persistente.\n\n"
+            "Puedo ayudarte a gestionar esta incidencia a través de los "
+            "canales estándar de HealthCore, pero no puedo «recordarlo» "
+            "como un hecho operativo.\n\n"
+            "*Si se trata de un cambio operativo sin datos de paciente, "
+            "por favor reformúlalo sin incluir información personal.*"
+        )
+        return answer + rejection_msg, {
+            "phi_rejected": True,
+            "phi_matches": phi_matches,
+            "category": llm_proposal.get("category", "operational"),
+        }
+
+    # 3. Validar categoría
+    valid_cats = {"operational", "incident_pattern", "staff_preference"}
+    category = llm_proposal.get("category", "operational")
+    if category not in valid_cats:
+        category = "operational"
+
+    reason = llm_proposal.get("reason", "Evaluado por el modelo.")
+
+    # 4. Construir pregunta al usuario
+    proposal_suffix = (
+        f"\n\n---\n\n"
+        f"📝 **¿Quieres que recuerde esto para la próxima vez?**\n\n"
+        f"> _{content}_\n\n"
+        f"_({reason})_\n\n"
+        f"*Responde con «sí», «no», o edita el texto si quieres cambiarlo.*"
+    )
+
+    proposal_info = {
+        "proposal": content,
+        "reason": reason,
+        "category": category,
+        "source_question": question,
+        "source": "llm_structured",
+    }
+
+    return answer + proposal_suffix, proposal_info
+
+
 # ── Palabras clave que sugieren "vale la pena recordar" ─────────────
 # Señales de que la interacción contiene información operativa duradera.
 _MEMORIZE_TRIGGER_KEYWORDS: set[str] = {
@@ -106,6 +190,7 @@ def auto_evaluate_proposal(
     facts: list[dict[str, Any]],
     tool_results: list[dict[str, Any]],
     tool_errors: list[str],
+    llm_proposal: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Evalúa si la interacción actual contiene algo memorable.
 
@@ -119,6 +204,9 @@ def auto_evaluate_proposal(
         facts: Hechos actuales en memoria (para evitar duplicados).
         tool_results: Resultados de tools externas.
         tool_errors: Errores de tools externas.
+        llm_proposal: Propuesta estructurada generada por el LLM en la misma
+            llamada (desde generate_answer_with_memory). Si se proporciona,
+            se prioriza sobre la heurística post-hoc.
 
     Returns:
         Tupla (answer_con_propuesta, proposal_info o None).
@@ -137,7 +225,11 @@ def auto_evaluate_proposal(
         logger.info("Ya hay una propuesta pendiente — no se genera otra.")
         return answer, None
 
-    # 1. Verificar si la interacción es candidata a generar propuesta
+    # 0. Si el LLM ya proveyó una propuesta estructurada, priorizarla
+    if llm_proposal is not None:
+        return _process_llm_proposal(llm_proposal, question, answer, facts)
+
+    # 1. Verificar si la interacción es candidata a generar propuesta (heurística)
     if not _should_evaluate(question, answer):
         return answer, None
 
@@ -272,7 +364,11 @@ def _should_evaluate(question: str, answer: str) -> bool:
             a_lower = answer.lower()
             has_confirmation = any(
                 word in a_lower
-                for word in ["ahora", "cambió", "cambio", "ya ", "actualmente", "sí,"]
+                for word in [
+                    "ahora", "cambió", "cambio", "ya ", "actualmente",
+                    "sí,", "correcto", "exacto", "así es", "efectivamente",
+                    "claro,", "exactamente",
+                ]
             )
             if not has_confirmation:
                 return False
@@ -639,6 +735,27 @@ def process_user_response(
         result["final_content"] = None
         result["audit_entry"] = audit
 
+    elif classification.intent == "phi_rejected":
+        # ❗ REQUISITO CONTEXT.md Hito8:
+        #   El mensaje del usuario contiene PHI — se rechaza la propuesta
+        #   explícitamente y se explica por qué no se puede recordar.
+        #   La propuesta pendiente SE MANTIENE (no se limpia) para que el
+        #   usuario pueda reformularla sin PHI.
+        audit = _record_audit(
+            event_type="phi_rejected",
+            run_id=proposal["source_run_id"],
+            proposal=proposal,
+            user_message=user_message,
+            classification=classification.intent,
+            detail=(
+                f"Propuesta no guardada — el mensaje del usuario contiene PHI. "
+                f"Coincidencias: {classification.explanation}"
+            ),
+        )
+        result["resolution"] = "phi_rejected"
+        result["final_content"] = None
+        result["audit_entry"] = audit
+
     elif classification.intent == "edit":
         # Usar la edición propuesta
         edit_text = classification.edit_text or proposal["proposal"]
@@ -757,6 +874,20 @@ def format_memory_confirmation(resolution: str, proposal: dict[str, Any] | None)
     elif resolution == "rejected":
         return (
             f"👌 De acuerdo, no lo guardo. La propuesta queda descartada."
+        )
+    elif resolution == "phi_rejected":
+        return (
+            f"⚠️ **No puedo guardar eso en mi memoria.**\n\n"
+            f"La información que mencionas parece contener datos de salud "
+            f"protegidos (PHI). Por cumplimiento de **HIPAA** y **UK GDPR**, "
+            f"no está permitido almacenar identificadores de pacientes, "
+            f"diagnósticos ni ningún dato que pueda re-identificar a una "
+            f"persona en mi memoria persistente.\n\n"
+            f"Puedo ayudarte a gestionar esta incidencia a través de los "
+            f"canales estándar de HealthCore, pero no puedo «recordarlo» "
+            f"como un hecho operativo.\n\n"
+            f"*Si se trata de un cambio operativo sin datos de paciente, "
+            f"por favor reformúlalo sin incluir información personal.*"
         )
     elif resolution == "edited":
         return (

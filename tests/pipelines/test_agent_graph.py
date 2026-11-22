@@ -133,15 +133,44 @@ def _fake_generate_answer_grounded(question: str, context: list[dict[str, Any]])
 
 
 def _mock_generate_answer(answer: str = "Respuesta simulada."):
-    """Patchea generate_answer dentro del módulo del grafo."""
-    return patch("services.agent.graph.generate_answer", return_value=answer)
+    """Patchea generate_answer_with_memory (primario) dentro del módulo del grafo.
+    
+    El nodo generate_answer ahora usa generate_answer_with_memory como primaria y
+    generate_answer como fallback. Este mock patcha la primaria.
+    """
+    return patch(
+        "services.agent.graph.generate_answer_with_memory",
+        return_value=(answer, None),
+    )
+
+
+def _mock_generate_answer_with_memory_proposal(
+    answer: str = "Respuesta.",
+    proposal: dict | None = None,
+):
+    """Patchea generate_answer_with_memory para que devuelva propuesta de memoria."""
+    if proposal is None:
+        proposal = {
+            "proposal": "El horario de la clínica de Austin cambió a las 8am.",
+            "category": "operational",
+            "reason": "Cambio de horario que puede afectar futuras consultas.",
+        }
+    return patch(
+        "services.agent.graph.generate_answer_with_memory",
+        return_value=(answer, proposal),
+    )
 
 
 def _mock_generate_answer_error():
-    """Patchea generate_answer para lanzar RuntimeError."""
-    return patch(
-        "services.agent.graph.generate_answer",
-        side_effect=RuntimeError("LLM API timeout"),
+    """Patchea generate_answer y generate_answer_with_memory para que fallen ambos."""
+    return patch.multiple(
+        "services.agent.graph",
+        generate_answer_with_memory=MagicMock(
+            side_effect=RuntimeError("LLM API timeout")
+        ),
+        generate_answer=MagicMock(
+            side_effect=RuntimeError("LLM API timeout (fallback)")
+        ),
     )
 
 
@@ -442,10 +471,14 @@ class TestRAGBehavior:
             ),
         )
 
-        # Usamos un fake LLM en lugar de mock: solo puede responder con el contexto
+        # Usamos un fake LLM en lugar de mock: solo puede responder con el contexto.
+        # Genera un tuple (answer, memory_proposal) como lo espera generate_answer_with_memory.
         with _mock_retrieve([medicare_chunk]), patch(
-            "services.agent.graph.generate_answer",
-            side_effect=_fake_generate_answer_grounded,
+            "services.agent.graph.generate_answer_with_memory",
+            side_effect=lambda question, context, **kwargs: (
+                _fake_generate_answer_grounded(question, context),
+                None,
+            ),
         ):
             result = await run_agent(
                 "¿Cobran cargo por no-show a pacientes de Medicare?",
@@ -752,8 +785,11 @@ class TestMixedSynthesis:
         with (
             _mock_retrieve([policy_chunk]),
             patch(
-                "services.agent.graph.generate_answer",
-                side_effect=_fake_generate_answer_grounded,
+                "services.agent.graph.generate_answer_with_memory",
+                side_effect=lambda question, context, **kwargs: (
+                    _fake_generate_answer_grounded(question, context),
+                    None,
+                ),
             ),
             patch(
                 "services.agent.graph.query_incident_by_id",
@@ -1166,6 +1202,71 @@ class TestMemoryClassifier:
 
         result = classify_user_intent("")
         assert result.intent == "discard"
+
+    # ── Tests de casos nuevos reportados como errores (2026-11-22) ─
+
+    def test_classify_no_lo_guardes_is_reject(self):
+        """"no lo guardes" con pronombre debe ser reject, NO approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no lo guardes")
+        assert result.intent == "reject", (
+            f"'no lo guardes' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_contradiccion_si_pero_no_guardes_is_reject(self):
+        """"sí, pero no lo guardes" debe ser reject (el 'no guardes' pesa más)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("sí, pero no lo guardes")
+        assert result.intent == "reject", (
+            f"'sí, pero no lo guardes' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_contradiccion_si_pero_no_is_discard(self):
+        """"sí, pero no" es contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("sí, pero no")
+        assert result.intent == "discard", (
+            f"'sí, pero no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_contradiccion_si_no_is_discard(self):
+        """"sí, no" es contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("sí, no")
+        assert result.intent == "discard", (
+            f"'sí, no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_la_grabes_is_reject(self):
+        """"no la grabes" con pronombre femenino debe ser reject."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no la grabes")
+        assert result.intent == "reject", (
+            f"'no la grabes' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_los_apuntes_is_reject(self):
+        """"no los apuntes" con pronombre plural debe ser reject."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no los apuntes")
+        assert result.intent == "reject", (
+            f"'no los apuntes' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_me_recuerdes_is_reject(self):
+        """"no me recuerdes" con pronombre debe ser reject."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no me recuerdes")
+        assert result.intent == "reject", (
+            f"'no me recuerdes' debe ser reject. Resultó: {result.intent}"
+        )
 
     # ── Tests de casos reportados como errores (2026-11-21) ─────────
 

@@ -297,3 +297,143 @@ def query(
 
     chunks = retrieve(question, k=k, min_score=min_score)
     return generate_answer(question=question, context=chunks)
+
+
+# ── generate_answer_with_memory() — structured output with memory proposal ──
+
+_MEMORY_SYSTEM_PROMPT_SUFFIX: str = (
+    "\n\n"
+    "=== Instrucción adicional: auto-evaluación de memoria ===\n"
+    "Además de responder la pregunta, evalúa si la interacción contiene "
+    "información operativa que valga la pena recordar para futuras consultas.\n\n"
+    "Al FINAL de tu respuesta (después de la respuesta al usuario), "
+    "añade una línea exactamente con este formato:\n"
+    "---MEMORY_PROPOSAL---\n"
+    "Sigue uno de estos dos formatos JSON:\n\n"
+    "Si HAY algo memorable:\n"
+    '{"proposal": "texto del hecho a recordar", '
+    '"category": "operational|incident_pattern|staff_preference", '
+    '"reason": "por qué es útil recordarlo"}\n\n'
+    "Si NO hay nada memorable:\n"
+    "null\n\n"
+    "Reglas para decidir qué es memorable:\n"
+    "1. SÍ memorable: cambios operativos, nuevos protocolos, excepciones por clínica, "
+    "patrones de incidentes conocidos, preferencias de staff sobre presentación.\n"
+    "2. NO memorable: consultas puntuales de datos, preguntas hipotéticas, "
+    "cierres de conversación (gracias, saludos), datos de pacientes (PHI).\n"
+    "3. NUNCA memorable: información de salud protegida (PHI) como nombres de pacientes, "
+    "diagnósticos, identificadores clínicos, números de seguro, o cualquier dato "
+    "que permita re-identificar a un paciente.\n\n"
+    "Ejemplos de SÍ memorable:\n"
+    '- "En la clínica de Manchester el proceso de referidos cambió"\n'
+    '- "La alerta de no-show en Austin fue por cierre de carretera, no por falla del sistema"\n'
+    '- "El reporte semanal para Diane debe incluir vacantes por rol"\n\n'
+    "Ejemplos de NO memorable:\n"
+    '- "¿Cuál es la tasa de no-show?" (consulta puntual)\n'
+    '- "Gracias, con eso resuelvo mi reporte" (cierre)\n'
+    '- "El paciente Johnson canceló su cita" (contiene PHI)\n'
+    '- "Si llueve mañana" (hipotético/condicional)\n\n'
+    "IMPORTANTE: Si no estás seguro, responde null (nunca asumas que algo es memorable)."
+)
+
+
+def generate_answer_with_memory(
+    question: str,
+    context: list[dict[str, Any]],
+    memory_facts: list[dict[str, Any]] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Generate answer AND auto-evaluate memory in a single LLM call.
+
+    This is the **structured output** version of ``generate_answer()``.
+    It returns both the answer the user sees and an optional memory
+    proposal — all from the same model call (no second call needed).
+
+    Args:
+        question: The original user question.
+        context: List of chunk dicts returned by retrieve().
+        memory_facts: Current memory facts (for context).
+                      Passing them lets the LLM know what's already
+                      remembered and avoid duplicates.
+
+    Returns:
+        Tuple (answer, memory_proposal_or_None).
+        memory_proposal is a dict with keys: proposal, category, reason.
+        None means nothing worth remembering.
+    """
+    if not context:
+        logger.info("generate_answer_with_memory called with empty context.")
+        return generate_answer(question, context), None
+
+    context_str = _build_context(context)
+    base_prompt = SYSTEM_PROMPT.format(context=context_str, question=question)
+
+    # Add memory facts context if available
+    memory_context = ""
+    if memory_facts:
+        lines = ["Hechos ya recordados en memoria:"]
+        for f in memory_facts:
+            lines.append(f"- {f.get('content', '')}")
+        memory_context = "\n".join(lines) + "\n\n"
+
+    prompt = memory_context + base_prompt + _MEMORY_SYSTEM_PROMPT_SUFFIX
+
+    client = _get_gen_client()
+    try:
+        resp = client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=2500,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Generation+memory API call failed: {exc}") from exc
+
+    message = resp.choices[0].message
+    content = message.content
+
+    if content is None:
+        logger.warning("Generation+memory returned content=None.")
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning:
+            sentences = reasoning.strip().split(". ")
+            if len(sentences) > 1:
+                fallback = sentences[-1].rstrip(".")
+                if fallback:
+                    return fallback.strip(), None
+        return NO_INFO_MESSAGE, None
+
+    if not content.strip():
+        logger.warning("Generation+memory returned empty content.")
+        return NO_INFO_MESSAGE, None
+
+    # Parse the ---MEMORY_PROPOSAL--- marker
+    marker = "---MEMORY_PROPOSAL---"
+    if marker in content:
+        parts = content.split(marker, 1)
+        answer = parts[0].strip()
+        proposal_raw = parts[1].strip()
+
+        import json
+        try:
+            proposal_data = json.loads(proposal_raw)
+            if proposal_data is None:
+                return answer, None
+            if isinstance(proposal_data, dict) and "proposal" in proposal_data:
+                # Validate category
+                valid_cats = {"operational", "incident_pattern", "staff_preference"}
+                cat = proposal_data.get("category", "operational")
+                if cat not in valid_cats:
+                    cat = "operational"
+                return answer, {
+                    "proposal": proposal_data["proposal"],
+                    "category": cat,
+                    "reason": proposal_data.get("reason", "Evaluado por el modelo."),
+                }
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to parse memory proposal JSON: %s", proposal_raw[:100])
+
+        # Fallback: if marker present but unparseable, return answer without proposal
+        return answer, None
+
+    # No marker → no proposal
+    return content.strip(), None

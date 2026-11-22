@@ -1,0 +1,63 @@
+{
+  "run_id": "b7bb3d59-26dd-4ef1-b661-0b6819c020bb",
+  "question": "¿Cobran cargo por no-show a pacientes de Medicare?",
+  "answer": "No tengo información suficiente en la base de conocimiento para responder esta pregunta.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "check_pending_proposal → continue (sin propuesta pendiente)",
+    "classify_query → rag",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada)"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-22T13:33:15.667248+00:00",
+      "metadata": {
+        "question_length": 50
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T13:33:15.668551+00:00",
+      "metadata": {
+        "num_memory_facts": 5,
+        "has_pending_proposal": false
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-22T13:33:15.669807+00:00",
+      "metadata": {
+        "decision": "rag",
+        "has_incident": false,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T13:33:15.674111+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-22T13:33:16.992505+00:00",
+      "metadata": {
+        "answer_length": 88,
+        "llm_proposal": false
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 88,
+  "timestamp": "2026-11-22T13:33:16.994591+00:00"
+}

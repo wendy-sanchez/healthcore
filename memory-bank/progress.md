@@ -6,26 +6,35 @@
 
 - **Completado**: Paquete `services/agent/memory/` con 5 módulos:
   - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas, validación PHI dual con **lista blanca** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`), consolidación automática (50 facts, TTL 90 días), auditoría con 6 eventos (`proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`).
-  - `classifier.py` (~514 líneas) — **Clasificador estructural** rediseñado con **6 ejes analíticos** y **pipeline de 8 pasos** en `classify_user_intent()`. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`. Umbrales: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0).
+  - `classifier.py` (~567 líneas) — **Clasificador estructural** rediseñado con **6 ejes analíticos** y **pipeline de 10 pasos** en `classify_user_intent()`. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0). Guardas adicionales: negación con pronombres entre "no" y verbo, contradicciones sí+no → discard, comandos de memoria negados no suman approve.
   - `pipeline.py` (~802 líneas) — Orquestador con 28 trigger keywords, 3 extractores + 2 de respaldo, clasificación en 3 categorías, rechazo PHI explícito con mensaje HIPAA/UK GDPR.
   - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers.
   - `__init__.py` — 6 principios de diseño.
 
 - **Completado**: Integración en grafo LangGraph:
-  - 7 nuevos campos en `AgentState`.
+  - 8 nuevos campos en `AgentState` (nuevo: `llm_memory_proposal`).
   - Entrypoint actualizado y grafo ampliado de 10 a 13 nodos.
+
+- **Completado**: Evaluación de memoria por LLM (Mejora 17):
+  - `rag.py`: Nueva función `generate_answer_with_memory()` que devuelve `(answer, proposal_or_None)`.
+  - El LLM decide si hay información memorable usando instrucción estructurada (`_MEMORY_SYSTEM_PROMPT_SUFFIX`).
+  - Elimina dependencia de triggers heurísticos para decidir qué es memorable.
+  - `graph.py`: `node_generate_answer()` usa `generate_answer_with_memory()` como primaria, `generate_answer()` como fallback.
+  - `pipeline.py`: `auto_evaluate_proposal()` acepta `llm_proposal`, con `_process_llm_proposal()` que prioriza juicio LLM.
+  - `nodes.py`: Pasa `llm_memory_proposal` desde el estado.
+  - Tests: 89/89 pasan (fix de sintaxis en `_MEMORY_SYSTEM_PROMPT_SUFFIX`).
 
 - **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
 
-- **Completado**: **50 tests de memoria** en 5 clases (antes 32):
+- **Completado**: **57 tests de memoria** en 5 clases (antes 32):
   - `TestMemoryPHI` (8 tests)
   - `TestMemoryStore` (5 tests)
-  - `TestMemoryClassifier` (**17 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente)
+  - `TestMemoryClassifier` (**24 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no**)
   - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
   - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
-  - **50/50 tests de memoria pasan + 32 tests originales = 82 tests en test_agent_graph.py.**
+  - **57/57 tests de memoria pasan + 32 tests originales = 89 tests en test_agent_graph.py.**
 
-- **Completado**: **212 tests totales** en la suite del workspace (82 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
+- **Completado**: **219 tests totales** en la suite del workspace (89 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
 
 - **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
   - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
@@ -39,9 +48,9 @@
   - ❌ Trigger keywords en archivo externo — descartado (constantes en módulo es suficiente, sin valor real en externalizar)
 
 - **Completado**: Documentación técnica actualizada:
-  - `agent-memory-harness-guard.md` (~1100+ líneas) — 12 secciones, clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos, eventos de auditoría corregidos a valores reales (`proposed`/`approved`/`rejected`/`discarded`/`edited`), conteos de tests actualizados (47 memoria, 209 total), tabla ampliada a **15 bugs corregidos** (bugs 12-15 documentados).
+  - `agent-memory-harness-guard.md` (~1100+ líneas) — 12 secciones, clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos (incluyendo 6 nuevos casos de negación y contradicción), eventos de auditoría corregidos a valores reales (`proposed`/`approved`/`rejected`/`discarded`/`edited`), conteos de tests actualizados (57 memoria, 219 total), tabla ampliada a **16 bugs corregidos** (bugs 12-16 documentados), 24 tests de clasificador, suite summary actualizado.
 
-- **Completado**: Bugs corregidos (11 totales):
+- **Completado**: Bugs corregidos (16 totales):
   1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.
   2. PHI: falsos negativos — patrón regex `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`. Además se expandieron patrones PHI: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone.
   3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría, retornando None si se detecta PHI.
@@ -54,9 +63,14 @@
   10. **`_extract_memory_candidate` sin fallback** — Incluso cuando `_should_evaluate()` retornaba True, si ningún extractor específico clasificaba la interacción, retornaba `None` y la propuesta se perdía antes de llegar a validación PHI. Añadidos `_extract_command_memory()` para comandos explícitos y `_extract_fallback_content()` como fallback genérico con inferencia de categoría.
   11. **PHI rejection silenciosa** — `auto_evaluate_proposal()` retornaba `(answer, None)` cuando `validate_phi_safe()` detectaba PHI, sin informar al usuario. Corregido a rechazo explícito con mensaje HIPAA/UK GDPR y `{"phi_rejected": True}`. El nodo de grafo detecta esto y no persiste la propuesta.
   - **Además**: **Lista blanca PHI** añadida en `store.py` (`_PHI_WHITELIST` y `_PHI_WHITELIST_PREFIXED`) para evitar falsos positivos con staff de HealthCore (Diane Foster, Claire Whitfield, Marcus Reid, Sandra Okonkwo, Priya Nair, James Osei) y ubicaciones operativas (Austin, Manchester, London, Miami, Dallas, etc.). Esto resolvió 2 falsos positivos: "En Austin" y "Diane Foster".
+  - Bugs 12-15: **Rediseño del clasificador** (de listas planas a clasificador estructural con 6 ejes analíticos). Resuelve de raíz 3 bugs reportados por el usuario:
+    - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
+    - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
+    - Bug 14: "cambia el horario" → ahora edit (eje edición)
+  - Bug 16: **Negación con pronombres no se detecta** — "no lo guardes", "sí, pero no" → approve. `_RE_REJECT_PHRASE` no aceptaba pronombres entre "no" y el verbo; comandos de memoria negados sumaban approve; contradicciones sí+no se resolvían como approve. Corregido con ampliación de regex, `_comando_memoria_negado()`, y paso 5b de contradicción. 7 nuevos tests de clasificador. Pipeline ampliado de 8 a 10 pasos.
 
-- **Tests**: Suite completa de **194 tests** verificada: `uv run python -m pytest tests/ -v`.
-  - Memory tests: 32/32 pasan (incluyendo PHI patterns, store CRUD, classifier, pipeline, graph integration).
+- **Tests**: Suite completa de **219 tests** verificada: `uv run python -m pytest tests/ -v`.
+  - Memory tests: 57/57 pasan (incluyendo PHI patterns, store CRUD, classifier con 24 tests, pipeline, graph integration).
   - Non-memory agent tests: 32/32 heredados siguen pasando.
   - Tests adicionales: 130 tests en sales_forecast, MCP auth, nightly, temporal_cv, etc.
   - **6/6 ejemplos de CONTEXT.md verificados** al nivel de flujo completo:

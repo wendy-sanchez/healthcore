@@ -129,11 +129,16 @@ def node_process_proposal(state: dict[str, Any]) -> dict[str, Any]:
     memory_proposal_handled = confirmation or ""
 
     from services.agent.graph import _make_trace_event
+
+    # Cuando se rechaza por PHI, la propuesta NO se limpia — el usuario
+    # puede reformularla sin PHI.  El resto de resoluciones limpian.
+    keep_proposal = result["resolution"] == "phi_rejected"
+
     return {
-        "memory_proposal_handled": True,
+        "memory_proposal_handled": not keep_proposal,
         "memory_proposal_handled_text": memory_proposal_handled,
         "memory_proposal_result": result,
-        "memory_proposal": None,  # Ya no hay pendiente
+        "memory_proposal": proposal if keep_proposal else None,
         "routing_log": [
             f"process_proposal → {result['resolution']} "
             f"({(result.get('final_content') or '')[:60]})"
@@ -169,14 +174,16 @@ def node_auto_evaluate_memory(state: dict[str, Any]) -> dict[str, Any]:
     facts = state.get("memory_facts", get_all_facts())
     tool_results = state.get("tool_results", [])
     tool_errors = state.get("tool_errors", [])
+    llm_memory_proposal = state.get("llm_memory_proposal")
 
-    # Auto-evaluar
+    # Auto-evaluar: pasar propuesta del LLM si está disponible
     answer_with_proposal, proposal_info = _auto_evaluate(
         question=question,
         answer=answer,
         facts=facts,
         tool_results=tool_results,
         tool_errors=tool_errors,
+        llm_proposal=llm_memory_proposal,
     )
 
     result: dict[str, Any] = {}
@@ -196,7 +203,7 @@ def node_auto_evaluate_memory(state: dict[str, Any]) -> dict[str, Any]:
                 reason=proposal_info["reason"],
                 category=proposal_info["category"],
                 source_run_id=state.get("run_id", "_unknown_"),
-                source_question=proposal_info["source_question"],
+                source_question=proposal_info.get("source_question", question),
             )
             if saved:
                 result["answer"] = answer_with_proposal

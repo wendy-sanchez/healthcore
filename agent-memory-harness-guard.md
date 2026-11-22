@@ -126,11 +126,15 @@ que el backend sea intercambiable.
 4. **Single pending proposal**: si el usuario ignora la propuesta y cambia de
    tema, la propuesta se descarta.
 5. **Clasificador conservador**: el clasificador de intención (`classifier.py`,
-   ~514 líneas) usa **6 ejes analíticos estructurales** en lugar de listas
+   ~567 líneas) usa **6 ejes analíticos estructurales** en lugar de listas
    planas de patrones. Evalúa la respuesta del usuario mediante un pipeline de
-   **8 pasos secuenciales**: pregunta/condicional → cortesía → rechazo →
-   aprobación → edición → falsos positivos → comparación con umbrales
-   (aprobación ≥0.70, rechazo ≥0.75, edición ≥0.85). Por defecto → `discard`.
+   **8 pasos secuenciales**: pregunta/condicional → rechazo → edición →
+   cortesía → falsos positivos → contradicciones → aprobación → "si" corto.
+   Por defecto → `discard`. Incorpora 3 guardas adicionales:
+   - **Negación con pronombres**: "no lo guardes", "no la grabes" → reject
+   - **Contradicciones**: "sí, pero no" → discard por ambigüedad
+   - **Comandos negados**: "guardes" en "no lo guardes" no suma approve
+   (Umbrales: aprobación ≥0.70, rechazo ≥0.75, edición ≥0.85).
 6. **Sin escritura en RAG**: la memoria usa TinyDB, **no** las colecciones
    Qdrant de la empresa. Esto aísla completamente el riesgo de poison en
    retrieval.
@@ -138,16 +142,27 @@ que el backend sea intercambiable.
    rechazo queda registrado en `audit_log`. Es posible detectar inyectores
    a posteriori.
 
-### 2.5 ¿Por qué NO un segundo agente o grafo separado? (No multi-agente)
+### 2.5 ¿Por qué NO un segundo agente o grafo separado? (No multi-agente → LLM directo)
 
 La auto-evaluación es una **extensión del mismo modelo de lenguaje**, no un
-segundo agente. El prompt del LLM incluye un campo estructurado opcional
-`propuesta_memoria` en la respuesta. Esto significa:
+segundo agente. El prompt del LLM incluye un bloque de instrucciones
+(`_MEMORY_SYSTEM_PROMPT_SUFFIX` en `rag.py`) que le pide evaluar, al final de
+su respuesta, si la interacción contiene información memorable, y devolverlo
+como JSON estructurado. Esto significa:
 
-- Una sola llamada al LLM → answer + optional memory proposal.
+- Una sola llamada al LLM → answer + optional memory proposal en formato JSON.
 - Sin latencia adicional de round-trip.
 - Sin estado compartido entre agentes.
 - Sin complejidad de orquestación.
+
+**Antes (heurístico → reemplazado)**: El pipeline post-hoc (`_should_evaluate`)
+usaba triggers léxicos y extractores de contexto que fallaban en casos como
+`"porque"` matcheando como `"por qué"`, o conversaciones sin palabras clave
+explícitas pero con información operativa valiosa.
+
+**Ahora (LLM → primario)**: `generate_answer_with_memory()` en `rag.py` añade
+instrucciones al system prompt para que el LLM decida si algo es memorable.
+El pipeline tradicional queda como **fallback** en `auto_evaluate_proposal()`.
 
 Si se usara un segundo agente LangGraph para evaluar la memoria, se necesitaría:
 
@@ -158,10 +173,10 @@ Si se usara un segundo agente LangGraph para evaluar la memoria, se necesitaría
 3. Evaluar si el mensaje es "memorizable" requiere el mismo LLM → no hay
    ahorro de calidad.
 
-**Decisión**: la propuesta de memoria se genera en `node_generate_answer` /
-`node_synthesize_tool_answer` como un campo adicional en la respuesta
-estructurada. `node_auto_evaluate_memory` extrae este campo y orquesta el
-flujo de confirmación.
+**Decisión**: la propuesta de memoria se genera en `node_generate_answer`
+como campo estructurado (`llm_memory_proposal`) en la misma llamada LLM.
+`node_auto_evaluate_memory` procesa este campo — si el LLM devolvió propuesta,
+la prioriza sobre las heurísticas.
 
 ### 2.6 ¿Cómo se maneja "solo puede haber una propuesta pendiente"?
 
@@ -203,81 +218,54 @@ Reglas:
 Cada entrada incluye: `event_type`, `run_id`, `timestamp`, `proposal_text`,
 `user_message`, `classification` (intención detectada), `detail`.
 
-### 2.8 ¿Cómo decide `_should_evaluate()` si una interacción merece memoria?
+### 2.8 ¿Cómo decide si una interacción merece memoria? (LLM + fallback heurístico)
 
-La función `_should_evaluate(question, answer)` en `pipeline.py` implementa un
-clasificador basado en señales léxicas (sin LLM):
+**Mecanismo primario (Mejora 17)**: El LLM evalúa la memoria durante la
+generación de respuesta. `generate_answer_with_memory()` en `rag.py` añade
+el bloque `_MEMORY_SYSTEM_PROMPT_SUFFIX` al system prompt, instruyendo al LLM
+a devolver opcionalmente una propuesta JSON estructurada al final de su respuesta.
 
 ```python
-# Indicadores de NO memorizar (SOLO en la pregunta del usuario, no en combined)
-# CONTEXT.md: las cortesías del agente ("gracias") no deben bloquear evaluación.
-_NON_MEMORIZABLE_INDICATORS = {"gracias"}
-
-# Indicadores de SÍ memorizar (en combined = question + " " + answer)
-_MEMORIZE_TRIGGER_KEYWORDS = {
-    "cambió", "cambio", "cambia",
-    "nuevo", "nueva", "actualización", "actualizó",
-    "modificó", "modificación",
-    "desde", "ahora", "ya no",
-    "mejor", "preferencia", "prefiere",
-    "recuerda", "importante", "atención",
-    "procord", "protocolo",
-    "excepción", "excepcional",
-    "reporte", "pidió",
-    "debe", "alerta", "cierre",
-    "no-show", "fue porque", "hubo",
-    # Comandos explícitos de memorización (CONTEXT.md §Hito8)
-    "apúntalo", "apunta",
-    "guárdalo", "guarda",
-    "recuérdalo", "recordar",
-    "escribe", "escribir",
-    "almacena", "almacenar",
-}
-
-# Frases de consulta genérica → no memorizar
-# Se usan con regex \b para evitar falsos positivos (ej: "especialista" no
-# debe matchear "lista")
-_QUERY_PHRASES = {"cuál es", "cuáles son", "dime", "lista", "muestra",
-                  "qué pasó", "cuántos", "qué dice", "cómo está",
-                  "cómo van", "qué tal", "sabes", "conoces", "puedes",
-                  "hay algún", "hay alguna", "es posible", "es necesario"}
-
-# Indicadores hipotéticos/condicionales → no memorizar
-_HYPOTHETICAL_INDICATORS = {"si ", "qué pasaría si", "supón que",
-                            "supongamos", "asume que", "hipotéticamente"}
+_MEMORY_SYSTEM_PROMPT_SUFFIX: str = (
+    "\n\n"
+    "=== Instrucción adicional: auto-evaluación de memoria ===\n"
+    "Además de responder la pregunta, evalúa si la interacción contiene "
+    "información operativa que valga la pena recordar para futuras consultas.\n\n"
+    "Al FINAL de tu respuesta (después de la respuesta al usuario), "
+    "añade una línea exactamente con este formato:\n"
+    "---MEMORY_PROPOSAL---\n"
+    "Sigue uno de estos dos formatos JSON:\n\n"
+    'Si HAY algo memorable:\n'
+    '{"proposal": "texto del hecho a recordar", '
+    '"category": "operational|incident_pattern|staff_preference", '
+    '"reason": "por qué es útil recordarlo"}\n\n'
+    'Si NO hay nada memorable:\n'
+    "null\n\n"
+    "Reglas para decidir qué es memorable:\n"
+    "1. SÍ memorable: cambios operativos, nuevos protocolos, excepciones por clínica, "
+    "patrones de incidentes conocidos, preferencias de staff sobre presentación.\n"
+    "2. NO memorable: consultas puntuales de datos, preguntas hipotéticas, "
+    "cierres de conversación (gracias, saludos), datos de pacientes (PHI).\n"
+    "3. NUNCA memorable: información de salud protegida (PHI) como nombres de pacientes, "
+    "diagnósticos, identificadores clínicos, números de seguro, o cualquier dato "
+    "que permita re-identificar a un paciente.\n\n"
+    "Ejemplos de SÍ memorable:\n"
+    '- "En la clínica de Manchester el proceso de referidos cambió"\n'
+    '- "La alerta de no-show en Austin fue por cierre de carretera, no por falla del sistema"\n'
+    '- "El reporte semanal para Diane debe incluir vacantes por rol"\n\n'
+    'Ejemplos de NO memorable:\n'
+    '- "¿Cuál es la tasa de no-show?" (consulta puntual)\n'
+    '- "Gracias, con eso resuelvo mi reporte" (cierre)\n'
+    '- "El paciente Johnson canceló su cita" (contiene PHI)\n'
+    '- "Si llueve mañana" (hipotético/condicional)\n\n'
+    "IMPORTANTE: Si no estás seguro, responde null (nunca asumas que algo es memorable)."
+)
 ```
 
-**Flujo de decisión**:
-
-1. Si la pregunta del usuario contiene `_NON_MEMORIZABLE_INDICATORS` → False
-   (antes se aplicaba sobre `combined`, lo que causaba que "Gracias por el aviso..."
-   en la respuesta del agente bloqueara la evaluación — Bug corregido)
-2. Si la pregunta es hipotética/condicional → False
-3. Si `combined` contiene algún `_MEMORIZE_TRIGGER_KEYWORD`:
-   - Si además la pregunta es una consulta genérica (evaluada con regex `\b`
-     para evitar falsos positivos como `"especialista"` conteniendo `"lista"`) → False
-   - Si no → True (propuesta generada aunque la pregunta termine en `?`)
-4. Sin trigger keyword → False (conservador)
-
-**Correcciones aplicadas durante el Hito 8**:
-
-- **Bug de scope de non-memorizable**: Originalmente `_NON_MEMORIZABLE_INDICATORS`
-  se aplicaba sobre `combined` (pregunta + respuesta), lo que bloqueaba el Caso 3
-  de CONTEXT.md porque la respuesta del agente contenía "Gracias por el aviso...".
-  Corregido a solo `q_lower` (pregunta del usuario).
-- Originalmente `_NON_MEMORIZABLE_INDICATORS` incluía `"reporte"`, `"dashboard"`,
-  `"esta semana"`, lo que bloqueaba los ejemplos memorizables 3, 5, 6 de
-  `CONTEXT.md`. Se movieron a `_MEMORIZE_TRIGGER_KEYWORDS`.
-- Originalmente toda pregunta terminada en `?` se bloqueaba, lo que impedía
-  detectar `"¿Ha cambiado el proceso?"` cuando la respuesta contenía `"cambió"`.
-  La nueva lógica usa `combined` (pregunta + respuesta) para la búsqueda de triggers.
-- **Bug de word boundary**: `_QUERY_PHRASES` usaba `phrase in q_lower` (substring),
-  por lo que `"lista"` matcheaba dentro de `"especialista"`, bloqueando falsamente
-  el Caso 2 de Manchester. Corregido a `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)`.
-- **Bug de comandos faltantes**: Palabras como `"apúntalo"`, `"guárdalo"`, `"recuérdalo"`
-  no estaban en `_MEMORIZE_TRIGGER_KEYWORDS`, por lo que el Caso 1 (Johnson PHI)
-  era ignorado en silencio. Se añadieron 10 comandos explícitos.
-  triggers.
+**Mecanismo de respaldo (heurístico tradicional)**: Si el LLM no devuelve
+propuesta, `auto_evaluate_proposal()` en `pipeline.py` usa la función
+`_should_evaluate()` que implementa un clasificador basado en señales léxicas
+(sin LLM) como fallback. Ver sección 5.1 para el flujo completo.
 
 ---
 
@@ -385,6 +373,7 @@ rompiendo el ciclo.
 | `services/agent/memory/classifier.py`     | Clasificador estructural de intención (6 ejes analíticos, 8 pasos). | ~514     |
 | `services/agent/memory/pipeline.py`       | Orchestrador: auto-evaluación + respuesta.     | ~802     |
 | `services/agent/memory/nodes.py`          | Nodos LangGraph (sync wrappers).              | ~267     |
+| `data/pipelines/rag.py` (modificado)      | `generate_answer_with_memory()` — LLM devuelve answer + propuesta. | +140    |
 | `services/agent/graph.py` (modificado)    | Integración en el grafo (4 nodos + 3 rutas).  | +100     |
 
 ---
@@ -552,17 +541,26 @@ return True, []
   │                                                                         │
   │  1. ¿Ya hay propuesta pendiente? ──Sí──► saltar (no duplicar)           │
   │  2. ¿Acaba de resolverse una propuesta? ──Sí──► saltar                  │
-  │  3. ¿Contiene indicador de "no memorizable"? ──Sí──► saltar             │
-  │  4. ¿La pregunta es hipotética/condicional? ──Sí──► saltar              │
-  │     (detecta "si + verbo", "qué pasaría si", "supón que", etc.)         │
-  │  5. ¿Hay trigger keyword en pregunta+respuesta? ──No──► saltar          │
-  │     (triggers: "cambio", "nuevo", "reporte", "pidió", "debe",           │
-  │      "alerta", "cierre", "no-show", "fue porque", "hubo", etc.)         │
-  │  6. Extraer categoría (operational/incident_pattern/staff_preference)   │
-  │  7. ¿Es duplicado de un fact existente? ──Sí──► saltar                  │
-  │  8. Validar PHI ──PHI detectado──► descartar, log "phi_rejected"        │
-  │  9. Generar propuesta, persistir en pending_proposal, responder al      │
-  │     usuario con "¿Quieres que recuerde esto?"                           │
+  │                                                                         │
+  │  ┌─── RUTA PRIMARIA (Mejora 17): LLM ya evaluó ────────────────────┐    │
+  │  │  3. ¿LLM devolvió propuesta? (llm_proposal != None)             │    │
+  │  │     ──Sí──► _process_llm_proposal()                             │    │
+  │  │              • Valida PHI + deduplicación                       │    │
+  │  │              • Construye texto de propuesta para el usuario     │    │
+  │  │              • Persiste en pending_proposal                     │    │
+  │  │              • Responde con "¿Quieres que recuerde esto?"       │    │
+  │  │     ──No──► continuar con ruta secundaria                       │    │
+  │  └─────────────────────────────────────────────────────────────────┘    │
+  │                                                                         │
+  │  ┌─── RUTA SECUNDARIA (fallback heurístico tradicional) ───────────┐    │
+  │  │  4. ¿Contiene indicador de "no memorizable"? ──Sí──► saltar     │    │
+  │  │  5. ¿La pregunta es hipotética/condicional? ──Sí──► saltar      │    │
+  │  │  6. ¿Hay trigger keyword en pregunta+respuesta? ──No──► saltar  │    │
+  │  │  7. Extraer categoría (operational/incident_pattern/...)        │    │
+  │  │  8. ¿Es duplicado de un fact existente? ──Sí──► saltar          │    │
+  │  │  9. Validar PHI ──PHI detectado──► descartar, phi_rejected      │    │
+  │  │  10. Persistir en pending_proposal, responder al usuario        │    │
+  │  └─────────────────────────────────────────────────────────────────┘    │
   └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -575,10 +573,12 @@ depender de listas planas de patrones:
 **Ejes analíticos**:
 1. **Estructura gramatical**: ¿La frase es una pregunta o condicional? →
    descartar inmediatamente (función `_es_pregunta_o_condicional()`).
-2. **Señales de rechazo**: ¿Hay «no», «no hace falta», «no guardes»,
+2. **Señales de rechazo**: ¿Hay «no», «no lo guardes», «no hace falta»,
    «mejor no»? → puntuar como `reject` (función `_hay_rechazo()`).
+   Incluye pronombres entre «no» y el verbo (lo/la/los/las/le/les/me/te).
 3. **Señales de aprobación**: ¿Hay «sí», «ok», «de acuerdo», «correcto»,
    «guárdalo»? → puntuar como `approve` (función `_hay_aprobacion()`).
+   Los comandos negados («no lo guardes») NO contribuyen.
 4. **Señales de edición**: ¿Hay «mejor», «mejor dicho», «corrige»,
    «cambia»? → puntuar como `edit` (función `_hay_edicion()`).
 5. **Cortesía sola**: ¿La frase es solo «gracias», «bien gracias»,
@@ -592,16 +592,14 @@ depender de listas planas de patrones:
 ```
   1. Texto vacío / solo espacios        → discard   (0.0)
   2. ¿Es pregunta o condicional?        → discard   (0.0)
-  3. ¿Solo cortesía?                    → discard   (0.0)
-  4. Computar ejes de rechazo (axis 2)  → score_reject (0-3 señales)
-  5. Computar ejes de aprobación (axis 3)→ score_approve (0-4 señales)
-  6. Computar ejes de edición (axis 4)  → score_edit (0-2 señales)
-  7. Evaluar falsos positivos (axis 6)  → si aplica, anula approve
-  8. Comparar scores con umbrales:
-       score_approve ≥ 0.70  → approve
-       score_reject  ≥ 0.75  → reject
-       score_edit    ≥ 0.85  → edit
-       default               → discard
+  3. Evaluar señales de rechazo         → score_reject
+  4. Evaluar señales de edición         → score_edit
+  5. Descartar cortesías sin approve     → discard   (0.0)
+  6. Falsos positivos de approve        → discard   (0.0)
+  7. ¿Contradicción (sí + no)?          → discard   (0.0)
+  8. Evaluar señales de aprobación      → score_approve
+  9. "si" sin tilde en respuesta corta  → approve   (0.70)
+ 10. Por defecto                        → discard   (0.0)
 ```
 
 **Umbrales de confianza**:
@@ -860,25 +858,27 @@ assert len(facts) == initial_count  # ← NO se escribió en memoria
 nada en `memory_facts`). El audit_log registra el evento `rejected` con el
 texto original de la propuesta y el mensaje del usuario.
 
-### Suite completa de memoria (47 tests) — todos pasan
+### Suite completa de memoria (50 tests) — todos pasan
 
 ```
 $ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "TestMemory" --tb=short
 
-Tests de memoria (47/47):
+Tests de memoria (50/50):
   PHI:        8/8  PASSED  (phi_validate_clean_text, phi_rejects_name, ...)
   Store:      5/5  PASSED  (add_fact, pending_proposal, delete, ...)
-  Classifier: 17/17 PASSED  (6 ejes estructurales, approve, reject, edit,
+  Classifier: 24/24 PASSED  (6 ejes estructurales, approve, reject, edit,
                               discard, falso positivo approve, cortesía sola,
-                              pregunta/condicional, texto vacío, sin propuesta)
+                              pregunta/condicional, texto vacío, sin propuesta,
+                              NEGACIÓN CON PRONOMBRES y CONTRADICCIONES)
   Pipeline:   11/11 PASSED  (auto_evaluate, process_response, audit,
                               e2e_approve_cycle, e2e_reject_cycle,
                               e2e_discard_cycle)
-  Integration:6/6  PASSED  (graph_E2E_approve_cycle, graph_E2E_reject_cycle,
-                             graph_E2E_discard_cycle, nodes_exist,
+  Integration:9/9  PASSED  (graph_E2E_approve_cycle, graph_E2E_reject_cycle,
+                             graph_E2E_discard_cycle, graphs_E2E_PHI-rejected (2),
+                             graph_E2E_consolidation, nodes_exist,
                              routes_defined, route_after_receive)
 
-====================== 47 passed in 1.24s =======================
+====================== 50 passed in 1.24s =======================
 ```
 
 ---
@@ -1129,6 +1129,7 @@ class AgentState(TypedDict):
     "memory_proposal_handled": bool,                       # ¿Propuesta ya procesada?
     "memory_proposal_handled_text": str,                   # Texto de confirmación para el usuario
     "memory_proposal_result": Optional[dict[str, Any]],    # Resultado (approved/rejected/etc)
+    "llm_memory_proposal": Optional[dict[str, Any]],       # Propuesta del LLM (Mejora 17)
     "run_id": str,                                         # ID único de corrida (para auditoría)
 ```
 
@@ -1143,12 +1144,12 @@ print(agent_graph.nodes.keys())
 #  'process_proposal', 'auto_evaluate_memory']
 ```
 
-### 11.5 Resultado final — 212/212 tests PASSED
+### 11.5 Resultado final — 219/219 tests PASSED
 
 ```
 $ uv run python -m pytest tests/ --tb=short -q
 
-212 passed in 4.34s
+219 passed in 4.34s
 ```
 
 Desglose por categoría (tests en `test_agent_graph.py`):
@@ -1165,13 +1166,13 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | MixedSynthesis             | 2     | ✅     |
 | MemoryPHI                  | 8     | ✅     |
 | MemoryStore                | 5     | ✅     |
-| MemoryClassifier           | 17    | ✅     |
+| MemoryClassifier           | 24    | ✅     |
 | MemoryPipeline             | 11    | ✅     |
 | MemoryGraphIntegration     | 9     | ✅     |
-| **Total (agente+memoria)** | **82**| ✅     |
-| **Total suite completa**   | **212**| ✅     |
+| **Total (agente+memoria)** | **89**| ✅     |
+| **Total suite completa**   | **219**| ✅     |
 
-### 11.6 Historial de bugs corregidos (15 totales)
+### 11.6 Historial de bugs corregidos (16 totales)
 
 | #  | Bug | Síntoma | Causa raíz | Corrección |
 |----|-----|---------|------------|------------|
@@ -1190,11 +1191,13 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | 13 | **"bien gracias" → discard** | "bien" daba approve falso | `\bbien\b` en patrones de aprobación | Añadir eje de cortesía sola en §5.2 |
 | 14 | **"cambia el horario" → discard** | "cambia" daba approve en vez de edit | "cambia" listado como trigger de memorize | Rediseño completo a 6 ejes estructurales |
 | 15 | **Clasificador basado en listas planas** | Múltiples falsos positivos por patrón | Arquitectura de pattern lists | Rediseño total: clasificador estructural con 6 ejes analíticos y pipeline de 8 pasos |
+| 16 | **Negación con pronombres no se detecta** | "no lo guardes" → approve, "sí, pero no" → approve | `_RE_REJECT_PHRASE` no aceptaba pronombres `lo/la/los/las` entre "no" y el verbo; comandos de memoria negados sumaban puntaje de approve; contradicciones sí+no se resolvían como approve | `_RE_REJECT_PHRASE` ampliado con raíces de verbos; `_hay_aprobacion` ignora comandos negados vía `_comando_memoria_negado()`; nuevo paso 5b de contradicción → discard. 7 nuevos tests añadidos. |
 
 **Bugs 12-14**: Reportados por el usuario después del Hito 8 inicial.
-**Bug 15**: Corrección estructural que resuelve los bugs 12-14 de raíz, eliminando la dependencia de listas planas de patrones. Implementado en `classifier.py` (~514 líneas) con 6 funciones analíticas y pipeline de 8 pasos en `classify_user_intent()`.
+**Bug 15**: Corrección estructural que resuelve los bugs 12-14 de raíz, eliminando la dependencia de listas planas de patrones. Implementado en `classifier.py` (~567 líneas) con 6 funciones analíticas y pipeline de 10 pasos en `classify_user_intent()`.
+**Bug 16**: Corrección de alcance de negación: (a) `_RE_REJECT_PHRASE` ahora acepta pronombres átonos entre "no" y el verbo, (b) `_hay_aprobacion` ignora comandos de memoria que estén negados por un "no" precedente, (c) nuevo paso de detección de contradicciones (sí + no = discard). 7 nuevos tests de clasificador. 219/219 tests totales.
 
-> **Nota**: 82 tests en `test_agent_graph.py` (50 de memoria + 32 de agente) +
+> **Nota**: 89 tests en `test_agent_graph.py` (57 de memoria + 32 de agente) +
 > 130 tests en otros módulos (`test_sales_forecast_split.py`,
 > `test_mcp_server_auth.py`, `test_temporal_cv.py`, `nightly/`, etc.) =
 > **212 tests totales en la suite del workspace**.

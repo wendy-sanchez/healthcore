@@ -34,7 +34,7 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 # Reutilizamos las funciones RAG existentes — sin duplicar lógica.
-from data.pipelines.rag import generate_answer, retrieve
+from data.pipelines.rag import generate_answer, generate_answer_with_memory, retrieve
 
 # Tools externas (Parte 2) — MCP Client
 from services.agent.tools.mcp_client import (
@@ -98,6 +98,7 @@ class AgentState(TypedDict):
         memory_proposal_handled:  Si la propuesta pendiente ya se procesó.
         memory_proposal_handled_text: Texto de confirmación de manejo.
         memory_proposal_result:   Resultado del procesamiento de propuesta.
+        llm_memory_proposal:     Propuesta generada por el LLM en la misma llamada (salida estructurada).
         run_id:                   Identificador único de la corrida (para auditoría).
     """
 
@@ -119,6 +120,7 @@ class AgentState(TypedDict):
     memory_proposal_handled: bool
     memory_proposal_handled_text: str
     memory_proposal_result: Optional[dict[str, Any]]
+    llm_memory_proposal: Optional[dict[str, Any]]
     run_id: str
 
 
@@ -142,6 +144,7 @@ def build_initial_state(question: str, run_id: str = "") -> AgentState:
         memory_proposal_handled=True,
         memory_proposal_handled_text="",
         memory_proposal_result=None,
+        llm_memory_proposal=None,
         run_id=run_id,
     )
 
@@ -266,14 +269,19 @@ def node_retrieve_context(state: AgentState) -> dict[str, Any]:
 
 
 def node_generate_answer(state: AgentState) -> dict[str, Any]:
-    """Genera la respuesta final a partir del contexto ya recuperado.
+    """Genera la respuesta final y evalúa memoria en una sola llamada LLM.
 
-    Reutiliza ``data.pipelines.rag.generate_answer(question, context)``
-    con los chunks que el nodo retrieve_context ya produjo.
-    NO ejecuta retrieve() internamente.
+    Usa ``generate_answer_with_memory()`` en lugar de ``generate_answer()``
+    para que el LLM decida si hay algo memorable (salida estructurada)
+    en la misma llamada que genera la respuesta.
+
+    El resultado de la auto-evaluación del LLM se almacena en
+    ``llm_memory_proposal`` para que el nodo ``auto_evaluate_memory``
+    lo procese directamente, sin duplicar heurísticas post-hoc.
     """
     question = state["question"]
     chunks = state.get("retrieved_chunks", [])
+    memory_facts = state.get("memory_facts", [])
 
     if not chunks:
         return {
@@ -287,20 +295,36 @@ def node_generate_answer(state: AgentState) -> dict[str, Any]:
         }
 
     try:
-        answer = generate_answer(question=question, context=chunks)
+        answer, llm_proposal = generate_answer_with_memory(
+            question=question,
+            context=chunks,
+            memory_facts=memory_facts,
+        )
     except RuntimeError as exc:
-        return {
-            "error": f"Error al generar la respuesta: {exc}",
-            "answer": "",
-            "routing_log": ["generate_answer → error"],
-            "trace_events": [_make_trace_event("generate_answer", "error", {"error": str(exc)})],
-        }
+        # Fallback: usar generate_answer tradicional
+        logger.warning("generate_answer_with_memory falló, usando fallback: %s", exc)
+        try:
+            answer = generate_answer(question=question, context=chunks)
+            llm_proposal = None
+        except RuntimeError as exc2:
+            return {
+                "error": f"Error al generar la respuesta: {exc2}",
+                "answer": "",
+                "routing_log": ["generate_answer → error"],
+                "trace_events": [_make_trace_event("generate_answer", "error", {"error": str(exc2)})],
+            }
 
-    return {
+    result: dict[str, Any] = {
         "answer": answer,
+        "llm_memory_proposal": llm_proposal,
         "routing_log": ["generate_answer → END (respuesta generada)"],
-        "trace_events": [_make_trace_event("generate_answer", "ok", {"answer_length": len(answer)})],
+        "trace_events": [_make_trace_event("generate_answer", "ok", {
+            "answer_length": len(answer),
+            "llm_proposal": llm_proposal is not None,
+        })],
     }
+
+    return result
 
 
 def node_respond_no_info(state: AgentState) -> dict[str, Any]:
