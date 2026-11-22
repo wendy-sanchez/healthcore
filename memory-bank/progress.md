@@ -26,15 +26,15 @@
 
 - **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
 
-- **Completado**: **57 tests de memoria** en 5 clases (antes 32):
-  - `TestMemoryPHI` (8 tests)
-  - `TestMemoryStore` (5 tests)
-  - `TestMemoryClassifier` (**24 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no**)
-  - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
-  - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
-  - **57/57 tests de memoria pasan + 32 tests originales = 89 tests en test_agent_graph.py.**
+- **Completado**: **62 tests de memoria** en 5 clases (antes 32):
+    - `TestMemoryPHI` (8 tests)
+    - `TestMemoryStore` (5 tests)
+    - `TestMemoryClassifier` (**29 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no, contradicción no+comando con separadores**)
+    - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
+    - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
+    - **62/62 tests de memoria pasan + 32 tests originales = 94 tests en test_agent_graph.py.**
 
-- **Completado**: **219 tests totales** en la suite del workspace (89 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
+  - **Completado**: **224 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
 
 - **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
   - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)

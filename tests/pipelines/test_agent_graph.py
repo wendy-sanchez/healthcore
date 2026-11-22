@@ -1204,6 +1204,56 @@ class TestMemoryClassifier:
         assert result.intent == "discard"
 
     # ── Tests de casos nuevos reportados como errores (2026-11-22) ─
+    # ── Tests de casos bloqueantes: negación + comando contradictorio (2026-11-22) ─
+
+    def test_classify_no_pero_guardalo_is_discard(self):
+        """"no, pero guárdalo" es contradictorio → discard, NO approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no, pero guárdalo")
+        assert result.intent == "discard", (
+            f"'no, pero guárdalo' debe ser discard (contradicción: "
+            f"no + separador + comando de memoria). Resultó: {result.intent}"
+        )
+
+    def test_classify_no_coma_guardalo_is_discard(self):
+        """"no, guárdalo" es contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no, guárdalo")
+        assert result.intent == "discard", (
+            f"'no, guárdalo' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_bueno_no_guardalo_is_discard(self):
+        """"bueno no, guárdalo mejor" es contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("bueno no, guárdalo mejor")
+        assert result.intent == "discard", (
+            f"'bueno no, guárdalo mejor' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_ellipsis_guardalo_is_discard(self):
+        """"no... guárdalo" es contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no... guárdalo")
+        assert result.intent == "discard", (
+            f"'no... guárdalo' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_store_command_inverted_order_is_approve(self):
+        """"guárdalo, no" — orden invertida: comando ANTES que no → approve (ambigüedad aceptada)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, no")
+        # El comando aparece antes que "no", así que paso 5c no aplica
+        # y el approve_score = 0.8 del comando gana
+        assert result.intent == "approve", (
+            f"'guárdalo, no' debe ser approve (comando antes que negación). "
+            f"Resultó: {result.intent}"
+        )
 
     def test_classify_no_lo_guardes_is_reject(self):
         """"no lo guardes" con pronombre debe ser reject, NO approve."""

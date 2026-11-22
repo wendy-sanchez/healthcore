@@ -9,6 +9,19 @@
     - Nueva función `_comando_memoria_negado()` detecta "no + pronombre opcional + verbo de memoria"
     - Nuevo paso 5b en el pipeline: detección de contradicciones — si el mensaje contiene tanto "sí" como "no", se descarta como ambiguo (discard)
     - 7 nuevos tests en `TestMemoryClassifier` para los casos: "no lo guardes", "sí, pero no lo guardes", "sí, pero no", "sí, no", "no la grabes", "no los apuntes", "no me recuerdes"
+  - **Bug 18 corregido — Comando de memoria contradictorio con negación** (2026-11-22):
+    - **Problema**: Mensajes como "no, pero guárdalo" se clasificaban como `approve`, creando un fact (`facts_delta=1`). El clasificador detectaba contradicciones solo cuando aparecían "sí" y "no" juntos (Paso 5b), pero no cuando "no" iba seguido de un comando de memoria con separadores (coma, puntos suspensivos, conjunciones).
+    - **Causa raíz**: `_comando_memoria_negado()` solo detectaba negación cuando "no" precede DIRECTAMENTE al verbo (con pronombre opcional). Cuando hay separadores como "pero", "," o "..." entre "no" y el comando, no se detectaba y el comando sumaba 0.8 de approve.
+    - Tampoco se detectaba la contradicción semántica entre el "no" de negación y el comando de memoria que pide guardar.
+    - **Solución**: Nuevo Paso 5c en el pipeline que detecta cuando "no" aparece ANTES de un comando de memoria en el texto (considerando cualquier separador). Si `no.start() < comando.start()`, la intención es contradictoria → discard. Una contradicción o negación debe ser reject/discard y nunca escribir.
+    - **Nuevos tests**: 5 tests en `TestMemoryClassifier`:
+      - `"no, pero guárdalo"` → discard
+      - `"no, guárdalo"` → discard
+      - `"bueno no, guárdalo mejor"` → discard
+      - `"no... guárdalo"` → discard
+      - `"guárdalo, no"` → approve (orden invertido, comando antes que no)
+    - **Pipeline ampliado**: de 10 a 11 pasos (nuevo paso 8: contradicción no+comando).
+    - **classifier.py**: ~580 líneas (antes ~567).
   - **Mejora 17 — Auto-evaluación LLM en lugar de heurística post-hoc** (2026-12):
     - ... (contenido existente)
   - **Bug 17 corregido — Mensajes "unrelated" ahora limpian la propuesta pendiente** (2026-11-22):
@@ -34,15 +47,15 @@
 - **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador estructural, sin LLM).
 - **Arquitectura**: 6 módulos en `services/agent/memory/` + `rag.py`:
   - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas: `memory_facts`, `pending_proposal`, `audit_log` (8 eventos: `proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`, `unrelated`). Validación PHI dual (antes de mostrar propuesta y antes de escribir). **Lista blanca PHI** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`). Consolidación automática (50 facts, TTL 90 días).
-  - `classifier.py` (~567 líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 10 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`. Guardas adicionales: negación con pronombres, contradicciones sí+no, comandos negados no suman approve.
+  - `classifier.py` (~580 líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 11 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`. Guardas adicionales: negación con pronombres, contradicciones sí+no, contradicción no+comando de memoria con separadores, comandos negados no suman approve.
   - `pipeline.py` (~802 líneas) — Orquestador con **28 trigger keywords** incluyendo 10 comandos explícitos. 3 extractores específicos + 2 de respaldo. Clasifica en 3 categorías (`operational`, `incident_pattern`, `staff_preference`). Rechazo PHI explícito con mensaje HIPAA/UK GDPR. **Nuevo**: `_process_llm_proposal()` que prioriza juicio del LLM sobre heurísticas.
   - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers condicionales. `node_auto_evaluate_memory` maneja `phi_rejected` sin persistir. **Nuevo**: pasa `llm_memory_proposal` del estado a `_auto_evaluate()`.
   - `rag.py` — **Nueva función `generate_answer_with_memory()`**: devuelve `(answer, proposal_or_None)` en una sola llamada LLM. El LLM evalúa si la interacción contiene información memorable al final de la respuesta con formato JSON estructurado.
   - `__init__.py` — 6 principios: PHI-free, audit trail, no silent writes, no assumption by default, single pending proposal, dual PHI validation.
 - **Integración en grafo**: `AgentState` con 8 campos (nuevo `llm_memory_proposal: Optional[dict]`). Flujo: `receive_question → load_memory_context → process_proposal` (si pendiente) / `classify_query` → ... → `generate_answer` (LLM produce answer + memory proposal) → `auto_evaluate_memory` (procesa propuesta LLM, valida PHI, presenta al usuario) → END.
 - **PHI Compliance**: 8 patrones PHI. Validación TWICE + re-validación consolidación. **Lista blanca** para staff HealthCore. Marco HIPAA (US) + UK GDPR.
-- **Tests**: **219 tests en toda la suite** (89 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**24** tests, cubriendo 6 ejes estructurales + pipeline 10 pasos + negación con pronombres + contradicciones), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**9** tests, incluyendo **5 E2E** de ciclo completo: approve, reject, discard, **PHI-rejected (2 rutas)**, **consolidación**). **Todos pasan**.
-- **Bugs corregidos durante desarrollo (17 totales)**:
+- **Tests**: **224 tests en toda la suite** (94 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**29** tests, cubriendo 6 ejes estructurales + pipeline 11 pasos + negación con pronombres + contradicciones sí+no + contradicción no+comando con separadores), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**9** tests, incluyendo **5 E2E** de ciclo completo: approve, reject, discard, **PHI-rejected (2 rutas)**, **consolidación**). **Todos pasan**.
+- **Bugs corregidos durante desarrollo (18 totales)**:
   1. `route_after_receive` → KeyError en aristas del grafo.
   2. PHI: falsos negativos acentos → expandido a `áéíóúñ`.
   3. `add_fact()` sin validación PHI → validación dual.
@@ -60,7 +73,8 @@
   15. **Clasificador basado en listas planas**: Rediseño total a 6 ejes estructurales (resuelve bugs 12-14 de raíz).
   16. **Negación con pronombres no se detecta**: "no lo guardes", "sí, pero no" → approve. `_RE_REJECT_PHRASE` no aceptaba pronombres; comandos de memoria negados sumaban approve; contradicciones sí+no se resolvían como approve. Corregido con ampliación de regex, `_comando_memoria_negado()`, y paso 5b de contradicción. 7 nuevos tests.
   17. **Mensajes "unrelated" no limpiaban propuesta pendiente**: Mensaje de Diane Foster devolvía discard pero la propuesta quedaba atrapada. `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"`, limpia propuesta y redirige a flujo normal.
-- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1350+ líneas, 13 secciones, tabla de 17 bugs corregidos, clasificador estructural documentado en §5.2, 5 ciclos completos documentados (incluyendo Ciclo 5 — Unrelated), 24 tests de clasificador).
+  18. **Comando de memoria contradictorio con negación con separadores**: "no, pero guárdalo" → approve (creaba fact). `_comando_memoria_negado()` no detectaba negación cuando "no" y el verbo estaban separados por coma, "pero", puntos suspensivos. Nuevo Paso 5c en classifier.py detecta contradicción semántica por posición: si `no.start() < comando.start()` → discard. 5 nuevos tests.
+- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1370+ líneas, 13 secciones, tabla de 18 bugs corregidos, clasificador estructural documentado en §5.2, 5 ciclos completos documentados (incluyendo Ciclo 5 — Unrelated), 29 tests de clasificador).
 - **Verificación CONTEXT.md**: 6/6 ejemplos verificados al nivel de flujo completo (pipeline completo, no solo `_should_evaluate`):
   - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
   - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente

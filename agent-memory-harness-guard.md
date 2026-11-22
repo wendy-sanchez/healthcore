@@ -588,7 +588,7 @@ depender de listas planas de patrones:
    (ej. «sí cambia algo...», «sí hay un problema...»)? → descartar
    (función `_es_falso_positivo_aprobacion()`).
 
-**Pipeline de 8 pasos** (`classify_user_intent()`):
+**Pipeline de 10 pasos** (`classify_user_intent()`):
 
 ```
   1. Texto vacío / solo espacios        → discard   (0.0)
@@ -598,9 +598,10 @@ depender de listas planas de patrones:
   5. Descartar cortesías sin approve     → discard   (0.0)
   6. Falsos positivos de approve        → discard   (0.0)
   7. ¿Contradicción (sí + no)?          → discard   (0.0)
-  8. Evaluar señales de aprobación      → score_approve
-  9. "si" sin tilde en respuesta corta  → approve   (0.70)
- 10. Por defecto                        → discard   (0.0)
+  8. ¿Contradicción (no + comando)?     → discard   (0.0)
+  9. Evaluar señales de aprobación      → score_approve
+ 10. "si" sin tilde en respuesta corta  → approve   (0.70)
+ 11. Por defecto                        → discard   (0.0)
 ```
 
 **Umbrales de confianza**:
@@ -626,6 +627,9 @@ depender de listas planas de patrones:
 | "sí cambia algo, avísame"   | falso positivo approve                  | discard    | 0.0       |
 | "¿qué has guardado?"        | pregunta                               | discard    | 0.0       |
 | "cambia el horario"         | edit (cambia)                           | edit       | 0.85      |
+| "no, pero guárdalo"         | contradicción (no + comando)            | discard    | 0.0       |
+| "no, guárdalo"              | contradicción (no + comando)            | discard    | 0.0       |
+| "no... guárdalo"            | contradicción (no + comando)            | discard    | 0.0       |
 
 ```
   ┌─────────────────────────────────────────────────────────────────────────┐

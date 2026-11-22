@@ -21,6 +21,11 @@ Principios (CONTEXT.md + agent-memory-harness-guard.md §2.4):
   7. **PHI (HIPAA/UK GDPR) siempre se valida antes que cualquier otra señal**:
      si el mensaje del usuario contiene lo que parece PHI, se rechaza
      explícitamente — nunca se ignora en silencio.
+  8. **Contradicción "no" + comando de memoria**: si el mensaje contiene "no"
+     y también un comando de memoria ("guárdalo", "apúntalo", etc.) con el "no"
+     apareciendo antes en el texto (incluso con separadores como comas,
+     conjunciones o puntos suspensivos), es contradictorio y se descarta.
+     Una negación seguida de un comando contradictorio nunca es approve.
 
 En lugar de listas de palabras, el clasificador usa ejes estructurales:
   - **Eje de tonicidad**: "sí" (átono=condicional) vs "sí" (tónico=afirmación)
@@ -377,6 +382,19 @@ def classify_user_intent(
       5. Edición (marcadores de corrección + texto alternativo)
       6. Falsos positivos
 
+    Pipeline de 11 pasos:
+      1. Texto vacío → discard
+      2. Pregunta/condicional → discard
+      3. Señales de rechazo → score_reject (umbral: 0.75)
+      4. Señales de edición → score_edit (umbral: 0.85)
+      5. Cortesía sin approve → discard
+      6. Falsos positivos de approve → discard
+      7. Contradicción "sí + no" → discard
+      8. Contradicción "no + comando de memoria" → discard
+      9. Señales de aprobación → score_approve (umbral: 0.70)
+     10. "si" sin tilde en respuesta corta → approve
+     11. Por defecto → discard
+
     Args:
         user_message: El mensaje completo del usuario.
 
@@ -500,6 +518,41 @@ def classify_user_intent(
                 "— nunca se asume aprobación en presencia de negación."
             ),
         )
+
+    # ════════════════════════════════════════════════════════════════
+    # Paso 5c: Detectar comando de memoria contradictorio con "no"
+    # ════════════════════════════════════════════════════════════════
+    # Si el mensaje contiene "no" (negación) Y también un comando de
+    # memoria ("guárdalo", "apúntalo", etc.) en la misma oración, es
+    # contradictorio: el usuario dice "no" pero luego pide guardar.
+    # Esto cubre casos como:
+    #   "no, pero guárdalo" — no seguido de separador + comando
+    #   "no, guárdalo"     — no + separador + comando
+    #   "no... apúntalo"   — no + elipsis + comando
+    #   "bueno no, guárdalo mejor" — no + separador + comando
+    # Todas estas son negaciones seguidas de un comando contradictorio.
+    # Una contradicción o negación debe ser reject/discard y nunca escribir.
+    has_no = bool(_RE_NO_WORD.search(msg_lower))
+    has_store_command = bool(_RE_STORE_COMMANDS.search(msg_lower))
+    if has_no and has_store_command:
+        # Si el mensaje tiene "no" ANTES del comando de memoria
+        # (considerando separadores como comas, puntos, conjunciones),
+        # es una contradicción: primero niega, luego ordena guardar.
+        # Buscamos la posición del "no" y del comando en el texto
+        no_match = _RE_NO_WORD.search(msg_lower)
+        store_match = _RE_STORE_COMMANDS.search(msg_lower)
+        if no_match and store_match and no_match.start() < store_match.start():
+            # "no" aparece antes del comando de memoria en el texto
+            return IntentClassification(
+                intent="discard",
+                confidence=_CONFIDENCE_DISCARD,
+                explanation=(
+                    f"El mensaje contiene una negación ('no') seguida de un "
+                    f"comando de memoria ('{store_match.group()}'), lo que es "
+                    f"contradictorio. Se descarta por ambigüedad "
+                    f"— nunca se asume aprobación cuando hay negación presente."
+                ),
+            )
 
     # ════════════════════════════════════════════════════════════════
     # Paso 6: Evaluar señales de aprobación
