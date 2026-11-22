@@ -21,11 +21,14 @@ Principios (CONTEXT.md + agent-memory-harness-guard.md §2.4):
   7. **PHI (HIPAA/UK GDPR) siempre se valida antes que cualquier otra señal**:
      si el mensaje del usuario contiene lo que parece PHI, se rechaza
      explícitamente — nunca se ignora en silencio.
-  8. **Contradicción "no" + comando de memoria**: si el mensaje contiene "no"
-     y también un comando de memoria ("guárdalo", "apúntalo", etc.) con el "no"
-     apareciendo antes en el texto (incluso con separadores como comas,
-     conjunciones o puntos suspensivos), es contradictorio y se descarta.
-     Una negación seguida de un comando contradictorio nunca es approve.
+  - **Contradicción comando de memoria + negación**: si el mensaje contiene tanto
+     un comando de memoria ("guárdalo", "apúntalo", etc.) como una negación
+     ("no", "nunca", "jamás", "tampoco"), es SEMÁNTICAMENTE CONTRADICTORIO
+     independientemente del orden en que aparezcan. Las únicas excepciones son:
+     - Tag questions: "guárdalo, ¿no?" ("no?" al final buscando confirmación)
+     - Doble negación: "no olvides", "no te olvides" (son afirmativas)
+     En cualquier otro caso, la coexistencia de comando + negación es
+     ambigua/contradictoria y se descarta. Nunca es approve.
 
 En lugar de listas de palabras, el clasificador usa ejes estructurales:
   - **Eje de tonicidad**: "sí" (átono=condicional) vs "sí" (tónico=afirmación)
@@ -123,11 +126,18 @@ def _es_pregunta_o_condicional(text: str) -> bool:
       - Contiene palabras WH (qué, quién, cómo, etc.) → es pregunta
       - Contiene verbos en condicional (podría, sería, etc.) → es hipótesis
       - Empieza con "si " sin tilde y tiene más de 2 palabras → condicional
+
+    NOTA: Las coletillas \"¿no?\" al final de una frase (tag questions)
+    NO convierten la frase en pregunta. \"guárdalo, ¿no?\" es una
+    afirmación que busca confirmación, no una pregunta real.
     """
     t = text.lower().strip()
 
     # Regla 1: Signo de interrogación
     if _RE_QUESTION_END.search(t):
+        # Excluir tag questions: "... ¿no?" que son coletillas de confirmación
+        if _RE_TAG_QUESTION.search(t):
+            return False
         return True
 
     # Regla 2: Palabras WH que indican pregunta
@@ -172,7 +182,20 @@ def _es_solo_cortesia(text: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 
+# Palabras de negación explícita ("no", "nunca", "jamás", "tampoco")
+# Cualquiera de estas palabras indica rechazo o contradicción.
+# "no" requiere word boundary porque puede aparecer como prefijo ("nota", "noche", "norte")
+# "nunca", "jamás", "tampoco" son palabras completas — no necesitan boundary complejo
 _RE_NO_WORD = re.compile(r"(?<!\w)no(?!\w)", re.IGNORECASE)
+_RE_NUNCA = re.compile(r"\b(?:nunca|jam[aá]s|tampoco)\b", re.IGNORECASE)
+# Negación general: "no", "nunca", "jamás", "tampoco"
+_RE_NEGACION = re.compile(
+    r"(?:{no}|{nunca})".format(
+        no=_RE_NO_WORD.pattern,
+        nunca=_RE_NUNCA.pattern,
+    ),
+    re.IGNORECASE,
+)
 # Verbos de rechazo semántico (no son listas, son raíces semánticas)
 _RE_REJECT_VERBS = re.compile(
     r"\b(?:olv[ií]d|descart[aá]|elimin[aá]|quit[aá]|ignor[aá]|cancel[aá]|anul[aá]|borr[aá]|tir[aá])\w*\b",
@@ -192,9 +215,17 @@ def _hay_rechazo(text: str) -> float:
     """Evalúa la fuerza de la señal de rechazo en el texto.
 
     Retorna confianza 0.0 (sin rechazo) a 1.0 (rechazo inequívoco).
+
+    NOTA: \"no olvides\" / \"no te olvides\" son dobles negaciones con
+    significado POSITIVO (\"no olvides\" = \"recuerda\"), por lo que NO
+    se consideran rechazo aunque lexicalmente contengan la raíz \"olvid\".
     """
     t = text.lower().strip()
     score = 0.0
+
+    # Excluir \"no olvides\" — es doble negación afirmativa, no rechazo
+    if _RE_NO_OLVIDES.search(t):
+        return 0.0  # \"no olvides\" = \"recuerda\" — no es rechazo
 
     # Señal fuerte: "no" como palabra independiente
     if _RE_NO_WORD.search(t):
@@ -206,6 +237,10 @@ def _hay_rechazo(text: str) -> float:
             score += 0.75  # "no gracias" → reject
         else:
             score += 0.5  # "no" en frase más larga
+
+    # Señal adicional: "nunca", "jamás", "tampoco" como negación
+    if _RE_NUNCA.search(t):
+        score += 0.5  # Negación equivalente a "no"
 
     # Señal fuerte: verbo de rechazo
     if _RE_REJECT_VERBS.search(t):
@@ -265,6 +300,11 @@ def _hay_aprobacion(text: str) -> float:
     if _RE_SI_TILDE.search(t):
         score += 0.7
 
+    # Señal fuerte: doble negación afirmativa "no olvides" = "recuerda"
+    # "no olvides", "no te olvides" son mandatos POSITIVOS de recuerdo
+    if _RE_NO_OLVIDES.search(t):
+        score += 0.7
+
     # Señal fuerte: verbo de aprobación
     if _RE_APPROVE_VERBS.search(t):
         score += 0.4
@@ -317,6 +357,18 @@ def _hay_edicion(text: str) -> float:
 # ══════════════════════════════════════════════════════════════════════
 #  Helper: detección de comandos de memoria negados
 # ══════════════════════════════════════════════════════════════════════
+
+# Frase que invierte la negación: "no olvides" / "no te olvides"
+# son comandos POSITIVOS ("no olvides" = "recuerda").
+_RE_NO_OLVIDES = re.compile(
+    r"\bno\s+(?:te\s+)?olvid(?:es|éis|e|en)",
+    re.IGNORECASE,
+)
+
+# Tag question: "¿no?" al final — es confirmación, no negación.
+# Requiere signo de interrogación EXPLÍCITO para no confundir
+# "guárdalo, no" (retractación) con "guárdalo, ¿no?" (confirmación).
+_RE_TAG_QUESTION = re.compile(r"[¿]?\s*no\s*[?]\s*$", re.IGNORECASE)
 
 
 def _comando_memoria_negado(text: str) -> bool:
@@ -520,37 +572,53 @@ def classify_user_intent(
         )
 
     # ════════════════════════════════════════════════════════════════
-    # Paso 5c: Detectar comando de memoria contradictorio con "no"
+    # Paso 5c: Detectar contradicción comando de memoria + negación
     # ════════════════════════════════════════════════════════════════
-    # Si el mensaje contiene "no" (negación) Y también un comando de
-    # memoria ("guárdalo", "apúntalo", etc.) en la misma oración, es
-    # contradictorio: el usuario dice "no" pero luego pide guardar.
-    # Esto cubre casos como:
-    #   "no, pero guárdalo" — no seguido de separador + comando
-    #   "no, guárdalo"     — no + separador + comando
-    #   "no... apúntalo"   — no + elipsis + comando
-    #   "bueno no, guárdalo mejor" — no + separador + comando
-    # Todas estas son negaciones seguidas de un comando contradictorio.
-    # Una contradicción o negación debe ser reject/discard y nunca escribir.
-    has_no = bool(_RE_NO_WORD.search(msg_lower))
+    # PRINCIPIO: cualquier mensaje que contenga TANTO un comando de memoria
+    # ("guárdalo", "apúntalo", "recuérdalo") COMO una negación ("no",
+    # "nunca", "jamás", "tampoco") es SEMÁNTICAMENTE CONTRADICTORIO,
+    # INDEPENDIENTEMENTE DEL ORDEN.
+    #
+    #   "guárdalo, no"       → comando + retractación → discard
+    #   "guárdalo, nunca"    → comando + retractación → discard
+    #   "apúntalo, jamás"    → comando + retractación → discard
+    #   "recuérdalo, tampoco" → comando + retractación → discard
+    #   "apúntalo, pero no"   → comando + pero + negación → discard
+    #   "recuérdalo, no gracias" → comando + cortesía negativa → discard
+    #   "guárdalo, no, olvida"   → comando + negación refuerzo → discard
+    #   "no, pero guárdalo"  → negación + comando contradictorio → discard
+    #   "nunca, guárdalo"    → negación + comando contradictorio → discard
+    #   "jamás, apúntalo"    → negación + comando contradictorio → discard
+    #   "tampoco lo guardes" → negación + comando contradictorio → discard
+    #
+    # Excepciones válidas (NO son contradicción):
+    #   "guárdalo, ¿no?"     — tag question, "¿no?" busca confirmación
+    #   "no olvides"         — doble negación, semánticamente afirmativo
+    #   "no te olvides"      — idem
+    #
+    # No importa qué aparezca primero: si ambos están presentes, y no es
+    # una excepción, es contradictorio → discard. Nunca approve.
+    has_negacion = bool(_RE_NEGACION.search(msg_lower))
     has_store_command = bool(_RE_STORE_COMMANDS.search(msg_lower))
-    if has_no and has_store_command:
-        # Si el mensaje tiene "no" ANTES del comando de memoria
-        # (considerando separadores como comas, puntos, conjunciones),
-        # es una contradicción: primero niega, luego ordena guardar.
-        # Buscamos la posición del "no" y del comando en el texto
-        no_match = _RE_NO_WORD.search(msg_lower)
-        store_match = _RE_STORE_COMMANDS.search(msg_lower)
-        if no_match and store_match and no_match.start() < store_match.start():
-            # "no" aparece antes del comando de memoria en el texto
+    if has_negacion and has_store_command:
+        # Excepción 1: "no olvides" / "no te olvides" — son semánticamente
+        # afirmativos ("no olvides" = "recuerda").
+        if _RE_NO_OLVIDES.search(msg_lower):
+            pass  # Dejar pasar — no es contradicción real
+        # Excepción 2: Tag question "¿no?" al final — el usuario pregunta
+        # confirmación, no está negando el comando.
+        elif _RE_TAG_QUESTION.search(msg_lower):
+            pass  # Dejar pasar — "guárdalo, ¿no?" es aprobación con duda
+        else:
             return IntentClassification(
                 intent="discard",
                 confidence=_CONFIDENCE_DISCARD,
                 explanation=(
-                    f"El mensaje contiene una negación ('no') seguida de un "
-                    f"comando de memoria ('{store_match.group()}'), lo que es "
-                    f"contradictorio. Se descarta por ambigüedad "
-                    f"— nunca se asume aprobación cuando hay negación presente."
+                    "El mensaje contiene tanto un comando de memoria como una "
+                    "negación ('no', 'nunca', 'jamás', 'tampoco'), lo que es "
+                    "semánticamente contradictorio independientemente del orden "
+                    "en que aparezcan. Se descarta por ambigüedad — nunca se "
+                    "asume aprobación cuando hay negación presente."
                 ),
             )
 

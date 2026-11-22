@@ -1255,15 +1255,15 @@ class TestMemoryClassifier:
             f"'no... guárdalo' debe ser discard. Resultó: {result.intent}"
         )
 
-    def test_classify_no_store_command_inverted_order_is_approve(self):
-        """"guárdalo, no" — orden invertida: comando ANTES que no → approve (ambigüedad aceptada)."""
+    def test_classify_no_store_command_inverted_order_is_discard(self):
+        """"guárdalo, no" — orden invertida: comando ANTES que no → discard (contradicción semántica)."""
         from services.agent.memory.classifier import classify_user_intent
 
         result = classify_user_intent("guárdalo, no")
-        # El comando aparece antes que "no", así que paso 5c no aplica
-        # y el approve_score = 0.8 del comando gana
-        assert result.intent == "approve", (
-            f"'guárdalo, no' debe ser approve (comando antes que negación). "
+        # Ahora el paso 5c detecta contradicción INDEPENDIENTEMENTE del orden:
+        # tanto comando como "no" están presentes, y "no?" no es tag question.
+        assert result.intent == "discard", (
+            f"'guárdalo, no' debe ser discard (contradicción semántica). "
             f"Resultó: {result.intent}"
         )
 
@@ -1328,6 +1328,191 @@ class TestMemoryClassifier:
         result = classify_user_intent("no me recuerdes")
         assert result.intent == "reject", (
             f"'no me recuerdes' debe ser reject. Resultó: {result.intent}"
+        )
+
+    # ── Tests de contradicción comando + "no" en CUALQUIER orden (2026-11-22) ──
+    # PRINCIPIO: si el mensaje contiene TANTO comando de memoria COMO "no",
+    # es semánticamente contradictorio → discard, INDEPENDIENTEMENTE del orden.
+    # Únicas excepciones: tag question ("¿no?") y "no olvides" (que es afirmativo).
+
+    def test_classify_guardalo_pero_no_is_discard(self):
+        """"guárdalo, pero no" — comando seguido de 'pero no' → contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, pero no")
+        assert result.intent == "discard", (
+            f"'guárdalo, pero no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_apuntalo_pero_no_is_discard(self):
+        """"apúntalo, pero no" — comando + 'pero no' → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("apúntalo, pero no")
+        assert result.intent == "discard", (
+            f"'apúntalo, pero no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_recuerdalo_pero_no_is_discard(self):
+        """"recuérdalo, pero no" — comando + 'pero no' → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("recuérdalo, pero no")
+        assert result.intent == "discard", (
+            f"'recuérdalo, pero no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_guardalo_no_gracias_is_discard(self):
+        """"guárdalo, no gracias" — comando + cortesía negativa → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, no gracias")
+        assert result.intent == "discard", (
+            f"'guárdalo, no gracias' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_guardalo_no_olvida_is_reject(self):
+        """"guárdalo, no, olvida" — comando + refuerzo negativo → reject
+        (\"olvida\" es verbo de rechazo explícito)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, no, olvida")
+        assert result.intent == "reject", (
+            f"'guárdalo, no, olvida' debe ser reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_store_command_then_no_with_conjunction_is_discard(self):
+        """"guárdalo, pero ya no" — comando + conjunción + negación → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, pero ya no")
+        assert result.intent == "discard", (
+            f"'guárdalo, pero ya no' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_apuntalo_no_me_digas_is_discard(self):
+        """"apúntalo, no me digas" — comando + frase negativa → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("apúntalo, no me digas")
+        assert result.intent == "discard", (
+            f"'apúntalo, no me digas' debe ser discard. Resultó: {result.intent}"
+        )
+
+    # ── Tests de expansión de negación: nunca, jamás, tampoco (2026-11-22) ──
+    # PRINCIPIO: "nunca", "jamás" y "tampoco" son semánticamente equivalentes
+    # a "no" para el propósito de detección de contradicción. Si aparecen
+    # junto a un comando de memoria, es contradictorio → discard.
+
+    def test_classify_guardalo_nunca_is_discard(self):
+        """"guárdalo, nunca" — comando + 'nunca' → contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, nunca")
+        assert result.intent == "discard", (
+            f"'guárdalo, nunca' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_guardalo_jamas_is_discard(self):
+        """"guárdalo, jamás" — comando + 'jamás' → contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, jamás")
+        assert result.intent == "discard", (
+            f"'guárdalo, jamás' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_guardalo_tampoco_is_discard(self):
+        """"guárdalo, tampoco" — comando + 'tampoco' → contradictorio → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, tampoco")
+        assert result.intent == "discard", (
+            f"'guárdalo, tampoco' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_apuntalo_nunca_is_discard(self):
+        """"apúntalo, nunca" — comando + 'nunca' → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("apúntalo, nunca")
+        assert result.intent == "discard", (
+            f"'apúntalo, nunca' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_recuerdalo_jamas_is_discard(self):
+        """"recuérdalo, jamás" — comando + 'jamás' → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("recuérdalo, jamás")
+        assert result.intent == "discard", (
+            f"'recuérdalo, jamás' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_nunca_guardalo_is_discard(self):
+        """"nunca, guárdalo" — negación ANTES que comando → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("nunca, guárdalo")
+        assert result.intent == "discard", (
+            f"'nunca, guárdalo' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_jamas_apuntalo_is_discard(self):
+        """"jamás, apúntalo" — negación ANTES que comando → discard."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("jamás, apúntalo")
+        assert result.intent == "discard", (
+            f"'jamás, apúntalo' debe ser discard. Resultó: {result.intent}"
+        )
+
+    def test_classify_tampoco_lo_guardes_is_reject(self):
+        """"tampoco lo guardes" — 'tampoco' + comando en imperativo → reject."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("tampoco lo guardes")
+        # Puede salir discard (por contradicción Paso 5c) o reject (por _hay_rechazo)
+        assert result.intent in ("discard", "reject"), (
+            f"'tampoco lo guardes' debe ser discard o reject. Resultó: {result.intent}"
+        )
+
+    def test_classify_nunca_jamas_is_discard(self):
+        """"nunca jamás" — doble negación sin comando → discard (no es approve)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("nunca jamás")
+        assert result.intent == "discard", (
+            f"'nunca jamás' debe ser discard. Resultó: {result.intent}"
+        )
+
+    # Excepciones: tag question y "no olvides" SÍ son válidas
+
+    def test_classify_guardalo_tag_question_is_approve(self):
+        """"guárdalo, ¿no?" — tag question con '¿no?' → approve (confirmación, no negación)."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("guárdalo, ¿no?")
+        assert result.intent == "approve", (
+            f"'guárdalo, ¿no?' debe ser approve. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_olvides_is_approve(self):
+        """"no olvides" — doble negación afirmativa → approve ("no olvides" = "recuerda")."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no olvides")
+        assert result.intent == "approve", (
+            f"'no olvides' debe ser approve. Resultó: {result.intent}"
+        )
+
+    def test_classify_no_te_olvides_is_approve(self):
+        """"no te olvides" — doble negación con pronombre → approve."""
+        from services.agent.memory.classifier import classify_user_intent
+
+        result = classify_user_intent("no te olvides")
+        assert result.intent == "approve", (
+            f"'no te olvides' debe ser approve. Resultó: {result.intent}"
         )
 
     # ── Tests de casos reportados como errores (2026-11-21) ─────────

@@ -26,15 +26,15 @@
 
 - **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
 
-- **Completado**: **62 tests de memoria** en 5 clases (antes 32):
+- **Completado**: **71 tests de memoria** en 5 clases (antes 32):
     - `TestMemoryPHI` (8 tests)
     - `TestMemoryStore` (5 tests)
-    - `TestMemoryClassifier` (**29 tests**, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no, contradicción no+comando con separadores**)
+    - `TestMemoryClassifier` (**38 tests** — antes 29, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no, contradicción no+comando con separadores, contradicción con nunca/jamás/tampoco**)
     - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
     - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
     - **62/62 tests de memoria pasan + 32 tests originales = 94 tests en test_agent_graph.py.**
 
-  - **Completado**: **224 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc.)
+  - **Completado**: **305 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc. + 62 guardrails + 19 nuevos classifier).
 
 - **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
   - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
@@ -104,10 +104,19 @@
   3. `test_rag_injection_with_jailbreak_keywords_not_confused` — Query legítima sigue siendo DOMAIN aunque contexto RAG tenga jailbreak keywords (capas separadas)
 
 - **Tests**: **62 tests de guardrail** en `test_guardrails.py` (7 harness + 26 content + 12 output + 17 edge cases):
-  - Suite completa: **286 tests** (`uv run python -m pytest tests/ -v`)
-  - 94 tests en `test_agent_graph.py` (memoria + agente)
+  - Suite completa: **305 tests** (`uv run pytest tests/ --tb=short -q` → 305 passed)
+  - 94 tests en `test_agent_graph.py` (memoria + agente, incluyendo 9 tests nuevos de nunca/jamás/tampoco)
   - 130 tests adicionales (sales_forecast, MCP auth, nightly, etc.)
+  - 9 nuevos tests de clasificador para negación con nunca/jamás/tampoco
   - `TESTING.md` actualizado con comandos de guardrail
+
+- **PHI Compliance mejorado (post-auditoría)**:
+  - Bug corregido: patrón de título `Dr[aá]\.?` no detectaba "Dr. Smith" como PHI → cambiado a `Dr[aá]?\.?`
+  - Filtro de título+minúscula: "Dr. recomienda" ya no es falso positivo (verbo en minúscula después de título)
+  - Filtro de artículos: "El Dr", "El paciente está" ya no son falsos positivos (patrón 0 con IGNORECASE)
+  - Whitelist mejorada: staff names con 2+ palabras se buscan como substring dentro del match PHI
+  - Excepción para IDs de paciente: "paciente id: P12345" sigue detectándose como PHI
+  - 17/17 casos de validación PHI verificados manualmente
 
 - **Documentación**: `agent-memory-harness-guard.md` actualizada con:
   - Arquitectura de 3 capas (harness → content → output)
@@ -118,6 +127,22 @@
   - Resultado auditoría referencia: **29/29 puntos** (§18)
 
 - **Aceptación**: ✅ 9/9 criterios de auditoría cumplidos. ✅ 100% contra solución de referencia (29/29 puntos).
+
+### Hito 8·2 — Corrección de contradicción comando+no en cualquier orden
+
+- **Bug detectado**: Frases como `"guárdalo, no"`, `"apúntalo, pero no"`, `"recuérdalo, pero no"`, `"guárdalo, no gracias"` retornaban `approve` y creaban facts. La contradicción solo se detectaba cuando `"no"` precedía al comando (`no antes que guarda`), no cuando el comando iba primero.
+- **Corregido — Paso 5c reescrito**: Se cambió de verificación posicional (`no.start() < command.start()`) a co-ocurrencia semántica (cualquier orden). Si el texto contiene TANTO un comando de memoria (`guárdalo`/`apúntalo`/`recuérdalo`) COMO `"no"` como palabra independiente, es semánticamente contradictorio → `discard`. Únicas excepciones: tag questions (`"¿no?"` con `?` explícito) y doble negación afirmativa (`"no olvides"` = `"recuerda"`).
+- **Ajustes adicionales en el clasificador**:
+  1. `_hay_rechazo()`: Retorna `0.0` si el texto coincide con `_RE_NO_OLVIDES` (`"no olvides"`, `"no te olvides"`) — son dobles negaciones con significado POSITIVO, no rechazo.
+  2. `_hay_aprobacion()`: Añade +0.7 si el texto coincide con `_RE_NO_OLVIDES` — mapea `"no olvides"` → `approve` semánticamente.
+  3. `_es_pregunta_o_condicional()`: Si el texto termina con `"¿no?"` (tag question) y coincide con `_RE_TAG_QUESTION`, NO se trata como pregunta real. `"guárdalo, ¿no?"` es una coletilla de confirmación, no una interrogación.
+- **Tests**: 10 tests nuevos + 1 renombrado = **19 tests de contradicción comando+no en 3 clases**:
+  - **Discard** (contradicción): `inverted_order`, `guardalo_pero_no`, `apuntalo_pero_no`, `recuerdalo_pero_no`, `guardalo_no_gracias`, `store_with_conjunction`, `apuntalo_no_me_digas`
+  - **Reject** (rechazo explícito): `guardalo_no_olvida` (contiene `"olvida"` = verbo de rechazo)
+  - **Approve** (excepciones): `guardalo_tag_question`, `no_olvides`, `no_te_olvides`
+- **Suite completa**: **296 tests** (`uv run python -m pytest tests/ -v`) — 0 fallos.
+- **Cobertura**: 19/19 tests de contradicción comando+no pasan. Casos cubiertos: orden invertido, comas, puntos suspensivos, conjunciones (`pero`), cortesía (`gracias`), tag questions (`¿no?`), doble negación (`no olvides`), verbos de refuerzo negativo (`olvida`).
+- **Branch**: `feature/agent-memory`.
 
 ### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
 - **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.

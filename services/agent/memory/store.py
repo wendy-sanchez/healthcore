@@ -169,7 +169,9 @@ _PHI_PATTERNS: list[re.Pattern] = [
     re.compile(r"\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Av|Road|Rd|"
                r"Drive|Dr|Lane|Ln|Boulevard|Blvd|Circle|Cir)\b", re.IGNORECASE),
     # ── Apellidos precedidos de título o rol ─────────────────────────
-    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+"
+    # NOTA: Dr[aá]?\.? — el ? después de [aá] es crucial: "Dra." y "Dr." deben
+    # detectarse. Sin el ?, "Dr. Smith" pasaría como PHI-safe.
+    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]?\.?|Paciente|Socio|Cliente)\s+"
                r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?", re.IGNORECASE),
     # ── Apellidos hispanos comunes en contexto narrativo ──────────────
     # Detecta apellidos como García, López, Pérez, Rodríguez cuando aparecen
@@ -236,7 +238,73 @@ def validate_phi_safe(text: str) -> tuple[bool, list[str]]:
                 break
         if skip:
             continue
-        filtered.append(m)
+        # Saltar si el match contiene un nombre de staff whitelisted
+        # (ej. "Dr. Marcus Reid" contiene "Marcus Reid")
+        staff_skip = False
+        for wl in _PHI_WHITELIST:
+            wl_lower = wl.lower()
+            if len(wl_lower.split()) >= 2 and wl_lower in m_lower:
+                staff_skip = True
+                break
+        if staff_skip:
+            continue
+        # Saltar patrones de título sin nombre propio real
+        # "Dr. recomienda" (título + verbo en minúscula) NO es PHI.
+        # Solo cuando el título es seguido DIRECTAMENTE de una palabra en minúscula.
+        # NO aplicar cuando el título va seguido de "id:", "número:", "#" etc. (identificadores).
+        _TITULOS = ("sr", "sra", "dr", "dra", "paciente", "socio", "cliente", "mr", "mrs", "ms")
+        _es_titulo_sin_nombre = False
+        for t in _TITULOS:
+            idx = m_lower.find(t)
+            if idx >= 0:
+                if idx > 0 and m_lower[idx - 1].isalpha():
+                    continue
+                end_of_title = idx + len(t)
+                rest_of_m = m[end_of_title:]
+                if rest_of_m.startswith("."):
+                    rest_of_m = rest_of_m[1:]
+                rest_of_m = rest_of_m.lstrip()
+                if rest_of_m and rest_of_m[0].islower():
+                    # Verificar que lo que sigue NO es un identificador (id, número, #)
+                    next_word = rest_of_m.split(None, 1)[0].rstrip(".:,#")
+                    if next_word.lower() not in ("id", "número", "numero", "#", "no", "nº"):
+                        _es_titulo_sin_nombre = True
+                        break
+        if _es_titulo_sin_nombre:
+            continue
+        # Saltar falsos positivos del patrón de Nombre Completo (patrón 0)
+        # "El Dr", "El paciente", "La clínica" no son nombres de persona.
+        # Con re.IGNORECASE, \b[A-Z][a-z]+ [A-Z][a-z]+ matchea artículos + palabras.
+        _NO_NAME_PREFIXES = ("el ", "la ", "los ", "las ", "un ", "una ", "en ")
+        m_for_check = m_lower
+        for prefix in _NO_NAME_PREFIXES:
+            if m_for_check.startswith(prefix):
+                # Saltar solo si NO es un nombre claro
+                # "El paciente Johnson" debe seguir siendo PHI
+                second_word = m_for_check[len(prefix):].split(None, 1)
+                if second_word and second_word[0] in ("dr", "sr", "sra", "paciente", "señor", "señora"):
+                    # "El Dr", "El paciente" — no son PHI por sí solos
+                    break
+                elif second_word and second_word[0][0].isalpha():
+                    # Verificar si la siguiente palabra después del artículo es un título
+                    # o si el match total sigue siendo sospechoso
+                    rest_after_article = m[len(prefix):].lstrip()
+                    if rest_after_article and rest_after_article[0].islower():
+                        # "El paciente está..." — comienza con minúscula después del artículo
+                        # Esto significa que el matcheo es por IGNORECASE de una palabra en minúscula
+                        break
+                    # Si la palabra después del artículo empieza con mayúscula real
+                    # podría ser nombre propio o podría ser "El Dr" (Dr con mayúscula)
+                    # Solo saltar si es muy corto (1-2 palabras)
+                    words = m_for_check.split()
+                    if len(words) <= 3:
+                        # "El Dr" de 2 palabras → probable falso positivo
+                        break
+                break
+        else:
+            filtered.append(m)
+            continue
+        continue
 
     # Si hay coincidencias no filtradas, no es seguro
     if filtered:

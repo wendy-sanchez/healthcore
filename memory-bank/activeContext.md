@@ -22,6 +22,27 @@
       - `"guárdalo, no"` → approve (orden invertido, comando antes que no)
     - **Pipeline ampliado**: de 10 a 11 pasos (nuevo paso 8: contradicción no+comando).
     - **classifier.py**: ~580 líneas (antes ~567).
+  - **Bug 19 corregido — Contradicción comando+no en cualquier orden** (2026-12):
+    - **Problema**: Frases como `"guárdalo, no"`, `"apúntalo, pero no"`, `"recuérdalo, pero no"`, `"guárdalo, no gracias"` retornaban `approve` porque el Paso 5c original solo detectaba contradicción cuando `"no"` precedía al comando (`no.start() < command.start()`). El orden inverso (comando primero) no se detectaba.
+    - **Causa raíz**: Verificación posicional rígida — `if no_match.start() < store_match.start()` solo capturaba una dirección.
+    - **Solución**: Paso 5c reescrito de verificación posicional a **co-ocurrencia semántica** (cualquier orden). Si el texto contiene TANTO un comando de memoria COMO `"no"`, es semánticamente contradictorio → `discard`. Excepciones: (a) tag questions `"¿no?"` con `?` explícito → coletilla de confirmación, no negación; (b) `"no olvides"` / `"no te olvides"` → doble negación afirmativa = `"recuerda"`.
+    - **Ajustes adicionales**: `_hay_rechazo()` retorna 0.0 para `"no olvides"`; `_hay_aprobacion()` suma +0.7 para `"no olvides"`; `_es_pregunta_o_condicional()` excluye tag questions `"¿no?"`.
+    - **Nuevos tests**: 10 tests nuevos + 1 renombrado. 19 tests de contradicción comando+no en total.
+  - **Bug 20 corregido — Expansión de detección de negación** (2026-11-22):
+    - **Problema**: El clasificador solo detectaba "no" como negación. Los testers estaban probando con "nunca", "jamás" y "tampoco", que al no ser detectados, permitían que el sistema clasificara como `approve` mensajes contradictorios como "guárdalo, nunca".
+    - **Causa raíz**: `_RE_NEGACION` solo incluía `_RE_NO_WORD`. Paso 5c usaba `_RE_NO_WORD` exclusivamente.
+    - **Solución**: Nuevo regex `_RE_NUNCA = re.compile(r"\b(?:nunca|jam[aá]s|tampoco)\b")` que se integra en `_RE_NEGACION` (combinación de `_RE_NO_WORD` + `_RE_NUNCA`). Paso 5c ahora usa `_RE_NEGACION` en lugar de `_RE_NO_WORD`. `_hay_rechazo()` suma +0.5 también para "nunca"/"jamás"/"tampoco".
+    - **Nuevos tests**: 9 tests nuevos en `TestMemoryClassifier`:
+      - `"guárdalo, nunca"` → discard
+      - `"guárdalo, jamás"` → discard
+      - `"guárdalo, tampoco"` → discard
+      - `"apúntalo, nunca"` → discard
+      - `"recuérdalo, jamás"` → discard
+      - `"nunca, guárdalo"` → discard
+      - `"jamás, apúntalo"` → discard
+      - `"tampoco lo guardes"` → discard|reject
+      - `"nunca jamás"` → discard
+    - **Tests totales de contradicción**: 28 (19 "no" + 9 "nunca/jamás/tampoco").
   - **Mejora 17 — Auto-evaluación LLM en lugar de heurística post-hoc** (2026-12):
     - ... (contenido existente)
   - **Bug 17 corregido — Mensajes "unrelated" ahora limpian la propuesta pendiente** (2026-11-22):
@@ -47,7 +68,7 @@
 - **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador estructural, sin LLM).
 - **Arquitectura**: 6 módulos en `services/agent/memory/` + `rag.py`:
   - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas: `memory_facts`, `pending_proposal`, `audit_log` (8 eventos: `proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`, `unrelated`). Validación PHI dual (antes de mostrar propuesta y antes de escribir). **Lista blanca PHI** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`). Consolidación automática (50 facts, TTL 90 días).
-  - `classifier.py` (~580 líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 11 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`. Guardas adicionales: negación con pronombres, contradicciones sí+no, contradicción no+comando de memoria con separadores, comandos negados no suman approve.
+  - `classifier.py` (~590+ líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 11 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`. Guardas adicionales: negación con pronombres, contradicciones sí+no, contradicción no+comando de memoria (cualquier orden), comandos negados no suman approve, `"no olvides"` como approve, tag questions `"¿no?"` como confirmación.
   - `pipeline.py` (~802 líneas) — Orquestador con **28 trigger keywords** incluyendo 10 comandos explícitos. 3 extractores específicos + 2 de respaldo. Clasifica en 3 categorías (`operational`, `incident_pattern`, `staff_preference`). Rechazo PHI explícito con mensaje HIPAA/UK GDPR. **Nuevo**: `_process_llm_proposal()` que prioriza juicio del LLM sobre heurísticas.
   - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers condicionales. `node_auto_evaluate_memory` maneja `phi_rejected` sin persistir. **Nuevo**: pasa `llm_memory_proposal` del estado a `_auto_evaluate()`.
   - `rag.py` — **Nueva función `generate_answer_with_memory()`**: devuelve `(answer, proposal_or_None)` en una sola llamada LLM. El LLM evalúa si la interacción contiene información memorable al final de la respuesta con formato JSON estructurado.
@@ -73,8 +94,20 @@
   15. **Clasificador basado en listas planas**: Rediseño total a 6 ejes estructurales (resuelve bugs 12-14 de raíz).
   16. **Negación con pronombres no se detecta**: "no lo guardes", "sí, pero no" → approve. `_RE_REJECT_PHRASE` no aceptaba pronombres; comandos de memoria negados sumaban approve; contradicciones sí+no se resolvían como approve. Corregido con ampliación de regex, `_comando_memoria_negado()`, y paso 5b de contradicción. 7 nuevos tests.
   17. **Mensajes "unrelated" no limpiaban propuesta pendiente**: Mensaje de Diane Foster devolvía discard pero la propuesta quedaba atrapada. `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"`, limpia propuesta y redirige a flujo normal.
-  18. **Comando de memoria contradictorio con negación con separadores**: "no, pero guárdalo" → approve (creaba fact). `_comando_memoria_negado()` no detectaba negación cuando "no" y el verbo estaban separados por coma, "pero", puntos suspensivos. Nuevo Paso 5c en classifier.py detecta contradicción semántica por posición: si `no.start() < comando.start()` → discard. 5 nuevos tests.
-- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1370+ líneas, 13 secciones, tabla de 18 bugs corregidos, clasificador estructural documentado en §5.2, 5 ciclos completos documentados (incluyendo Ciclo 5 — Unrelated), 29 tests de clasificador).
+  18. **Comando de memoria contradictorio con negación con separadores**: "no, pero guárdalo" → approve (creaba fact). `_comando_memoria_negado()` no detectaba negación cuando "no" y el verbo estaban separados por coma, "pero", puntos suspensivos. Nuevo Paso 5c detecta contradicción por posición: si `no.start() < comando.start()` → discard. 5 nuevos tests.
+  19. **Contradicción comando+no en cualquier orden**: "guárdalo, no", "apúntalo, pero no" → approve (creaban facts). Paso 5c original solo detectaba cuando "no" precedía al comando; el orden inverso pasaba. Corregido a co-ocurrencia semántica (cualquier orden). Excepciones: tag questions `"¿no?"` y `"no olvides"`. 10 tests nuevos.
+- **Auditoría post-auditoría (2026-11-22)**:
+  - **PHI Bug 21 — Patrón de título Dr[aá].? sin ? en [aá]**: El patrón `Dr[aá]\.?` requería "a" entre "Dr" y el punto, por lo que "Dr. Smith" NO se detectaba como PHI — pasaba como safe. Corregido a `Dr[aá]?\.?` (con `?` después de `[aá]`). Esto era un bug crítico de compliance.
+  - **PHI Bug 22 — Falsos positivos de título sin nombre**: "Dr. recomienda", "El Dr", "El paciente está estable" se detectaban como PHI porque:
+    1. Patrón 0 (`\b[A-Z][a-z]+ [A-Z][a-z]+\b` con `re.IGNORECASE`) matchea "El Dr", "El paciente está" como nombres completos
+    2. Patrón 7 (`paciente\s+[A-Z][a-z]+\s`) con IGNORECASE matchea "paciente está" 
+    3. Patrón 11 (título + nombre) matchea "Dr. recomienda" porque IGNORECASE hace que "r" minúscula pase como mayúscula
+  - **Solución**: Filtro en `validate_phi_safe()` que detecta cuando un título conocido (Dr, Sr, Sra, Paciente) va seguido de una palabra en minúscula → no es nombre propio → no es PHI. También se agregó filtro de prefijos ("El ", "La ", "En ") para falsos positivos del patrón 0 con IGNORECASE.
+  - **Whitelist mejorada**: Staff names con 2+ palabras ahora se buscan como substrings dentro del match PHI. Ej: "Dr. Marcus Reid" → se busca "Marcus Reid" en whitelist → safe.
+  - **Falso positivo "paciente id: P12345" corregido**: El filtro de título+minúscula descartaba incorrectamente IDs de paciente con "id:", "número:" — se agregó excepción para identificadores.
+  - **PHI Bug 23 — Runtime `NameError` en filtro de artículos**: La variable `m_stripped` se referenció sin estar definida en el bloque de filtro de prefijos ("El ", "La ", "En "). Hubiera causado `NameError` con matches como "El Doctor García". Detectado por revisión manual post-tests. Corregido: `m_stripped` → `m`.
+  - **Verificación**: 19/19 casos de prueba de PHI pasan (10 safe + 9 PHI), suite completa 305 tests.
+- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1370+ líneas, 13 secciones, tabla de 19 bugs corregidos, clasificador estructural documentado en §5.2, 5 ciclos completos documentados (incluyendo Ciclo 5 — Unrelated), 29+ tests de clasificador).
 - **Verificación CONTEXT.md**: 6/6 ejemplos verificados al nivel de flujo completo (pipeline completo, no solo `_should_evaluate`):
   - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
   - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente
@@ -100,7 +133,7 @@
   - Nodo `node_output_guardrail`: valida respuesta del LLM; si detecta PHI/leaked/format, la reemplaza con fallback.
   - Routing: `route_after_receive` → `input_guardrail`; `route_after_input_guardrail` → `load_memory_context` (si DOMAIN) o `__end__` (si bloqueado).
 - **Observabilidad**: `guardrail_summary(limit=100)` en `graph.py` lee trazas persistentes y retorna estadísticas agregadas (input/output activaciones por clasificación/tipo de issue). Cada nodo registra evento estructurado con `failure_type` (security/content/structural).
-- **Tests**: **62 tests de guardrail** en `test_guardrails.py` (7 harness + 26 content + 12 output + 17 edge cases). 94 tests en `test_agent_graph.py`. **Suite completa: 286 tests** (`uv run python -m pytest tests/ -v` → 286 passed).
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` (7 harness + 26 content + 12 output + 17 edge cases). 104 tests en `test_agent_graph.py` (62 memory + 32 agent + 10 contradicción). **Suite completa: 296 tests** (`uv run python -m pytest tests/ -v` → 296 passed).
 - **Nuevos tests de inyección RAG** (3):
   1. `test_rag_content_injection_wrapped_as_data` — Chunk con `[SYSTEM]: ignore...` envuelto, verifica NO en system prompt.
   2. `test_rag_content_injection_system_prompt_warns` — System prompt contiene advertencia "factual reference only".

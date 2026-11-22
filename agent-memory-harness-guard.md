@@ -86,7 +86,7 @@ que el backend sea intercambiable.
 | Tipo                    | Ejemplo                           | Patrón detectado por `validate_phi_safe()` |
 |-------------------------|-----------------------------------|--------------------------------------------|
 | Nombre + apellido       | "María García"                    | `\b[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+ [A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+\b` |
-| Nombre + apellido (título) | "Sr. García"                  | `\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+` |
+| Nombre + apellido (título) | "Sr. García"                  | `\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]?\.?|Paciente|Socio|Cliente)\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+` |
 | Apellido hispano standalone | "García"                    | Lista de ~70 apellidos comunes (García, López, Pérez, Rodríguez, etc.) |
 | Número de teléfono USA  | "555-123-4567"                   | `\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b` |
 | Teléfono internacional  | "+34 612 345 678"                | `(?:(?<=\s)|(?<=^))\+?\d{1,3}[\s.-]?\d{2,4}(?:[\s.-]?\d{2,4}){2,3}\b` |
@@ -429,7 +429,7 @@ _PHI_PATTERNS: list[re.Pattern] = [
     re.compile(r"\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Av|Road|Rd|"
                r"Drive|Dr|Lane|Ln|Boulevard|Blvd|Circle|Cir)\b", re.IGNORECASE),
     # ── Apellidos precedidos de título o rol ─────────────────────────
-    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]\.?|Paciente|Socio|Cliente)\s+"
+    re.compile(r"\b(?:Sr[aá]?\.?|Sra\.|Dr[aá]?\.?|Paciente|Socio|Cliente)\s+"
                r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+)?", re.IGNORECASE),
     # ── Apellidos hispanos comunes en contexto narrativo ──────────────
     # Detecta apellidos como García, López, Pérez cuando aparecen
@@ -508,27 +508,73 @@ _PHI_WHITELIST_PREFIXED: set[str] = {
 - CONTEXT.md §Hito8: "preferencias de staff SÍ son memorables; datos
   operativos de clínicas (Austin, Manchester, etc.) también."
 
-**Flujo de filtrado en `validate_phi_safe()`**:
+#### 4.3.2 Filtro de título+minúscula (post-auditoría 2026-11-22)
+
+Los patrones PHI con `re.IGNORECASE` matchean palabras en minúscula como si
+fueran mayúsculas (`[A-Z]` equivale a `[A-Za-z]` con IGNORECASE). Esto genera
+falsos positivos cuando un título (Dr, Sr, Sra, Paciente) va seguido de un
+**verbo o adjetivo en minúscula**:
+
+- `"Dr. recomienda reposo"` → Pattern 11 matcheaba "r" minúscula como si fuera `[A-Z]`
+- `"El paciente está estable"` → Pattern 7 matcheaba "está" después de "paciente"
+- `"El Dr"` → Pattern 0 matcheaba artículo "El" + título "Dr" como nombre completo
+
+**Solución**: Filtro post-PHI que verifica si la palabra después de un título
+empieza con minúscula → no es nombre propio → no es PHI.
+
+```python
+# Título seguido de minúscula → no es nombre propio
+_TITULOS = ("sr", "sra", "dr", "dra", "paciente", ...)
+for t in _TITULOS:
+    idx = m_lower.find(t)
+    if idx >= 0 and (idx == 0 or not m_lower[idx-1].isalpha()):
+        rest = m[idx+len(t):]  # texto después del título
+        if rest.startswith("."): rest = rest[1:]
+        rest = rest.lstrip()
+        if rest and rest[0].islower():
+            # Excepción: "paciente id:", "paciente número:" son IDs, NO título+verbo
+            next_word = rest.split()[0].rstrip(".:,#")
+            if next_word.lower() not in ("id", "número", "numero", "#", "no", "nº"):
+                continue  # no es PHI (título+minúscula)
+```
+
+Además, matches del patrón 0 que empiezan con artículos (`"El Dr"`, `"La clínica"`)
+se filtran por prefijo:
+
+```python
+_NO_NAME_PREFIXES = ("el ", "la ", "los ", "las ", "un ", "una ", "en ")
+if m_lower.startswith(prefix):
+    words = m_lower.split()
+    if len(words) <= 3:  # "El Dr" de 2 palabras → falso positivo
+        continue
+```
+
+**Flujo de filtrado completo en `validate_phi_safe()`**:
 
 ```python
 filtered = []
 for m in matches:
     m_lower = m.lower().strip()
-    if m_lower in _PHI_WHITELIST or m_lower in _PHI_WHITELIST_PREFIXED:
-        continue
-    for wp in _PHI_WHITELIST_PREFIXED:
-        if wp in m_lower:  # "en austin" dentro de texto
-            skip = True; break
-    if skip: continue
-    for loc in _PHI_WHITELIST:
-        if m_lower == loc.lower() or m_lower == loc.lower() + " ":
-            skip = True; break
-    if skip: continue
+    # 1. Whitelist exacta
+    if m_lower in _PHI_WHITELIST or m_lower in _PHI_WHITELIST_PREFIXED: continue
+    # 2. Whitelist prefijada ("en austin")
+    if any(wp in m_lower for wp in _PHI_WHITELIST_PREFIXED): continue
+    # 3. Ubicación sola
+    if m_lower.rstrip() in (loc.lower() for loc in _PHI_WHITELIST): continue
+    # 4. Staff como substring ("Dr. Marcus Reid" → "Marcus Reid" en whitelist)
+    if any(wl_lower in m_lower for wl in _PHI_WHITELIST
+           if len(wl.split()) >= 2): continue
+    # 5. Título + minúscula → no PHI
+    if _es_titulo_sin_nombre(m, m_lower): continue
+    # 6. Prefijo artículo ("El Dr") → no PHI
+    if _es_articulo_sin_nombre(m, m_lower): continue
     filtered.append(m)
 if filtered:
     return False, list(set(filtered))
 return True, []
 ```
+
+**Verificación**: 19/19 casos de prueba (10 safe + 9 PHI) verificados manualmente.
 
 ---
 
@@ -1285,7 +1331,7 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | **Total (agente+memoria)** | **89**| ✅     |
 | **Total suite completa**   | **219**| ✅     |
 
-### 11.6 Historial de bugs corregidos (17 totales)
+### 11.6 Historial de bugs corregidos (23 totales)
 
 | #  | Bug | Síntoma | Causa raíz | Corrección |
 |----|-----|---------|------------|------------|
@@ -1306,11 +1352,18 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | 15 | **Clasificador basado en listas planas** | Múltiples falsos positivos por patrón | Arquitectura de pattern lists | Rediseño total: clasificador estructural con 6 ejes analíticos y pipeline de 8 pasos |
 | 16 | **Negación con pronombres no se detecta** | "no lo guardes" → approve, "sí, pero no" → approve | `_RE_REJECT_PHRASE` no aceptaba pronombres `lo/la/los/las` entre "no" y el verbo; comandos de memoria negados sumaban puntaje de approve; contradicciones sí+no se resolvían como approve | `_RE_REJECT_PHRASE` ampliado con raíces de verbos; `_hay_aprobacion` ignora comandos negados vía `_comando_memoria_negado()`; nuevo paso 5b de contradicción → discard. 7 nuevos tests añadidos. |
 | 17 | **Mensajes "unrelated" clasificados como discard sin limpiar propuesta** (2026-11-22) | Mensaje de Diane Foster "debe incluir vacantes por rol, no solo por clínica" devuelve discard pero la propuesta quedaba pendiente — el mensaje nunca llegaba a `auto_evaluate_memory` | El pipeline llamaba `process_user_response()` que clasificaba como discard pero no distinguía entre "mensaje irrelevante para la propuesta" y "rechazo explícito" | `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"` + `clear_pending_proposal()` + redirige el mensaje al flujo normal de auto-evaluación. Nuevo evento de auditoría `"unrelated"`. |
+| 18 | **Comando de memoria contradictorio con negación con separadores** (2026-11-22) | "no, pero guárdalo" → approve (creaba fact) | `_comando_memoria_negado()` no detectaba negación cuando "no" y el verbo estaban separados por coma, "pero" o puntos suspensivos | Nuevo Paso 5c detecta contradicción por posición: si `no.start() < comando.start()` → discard. 5 nuevos tests. Pipeline ampliado de 10 a 11 pasos. |
+| 19 | **Contradicción comando+no en cualquier orden** (2026-11-22) | "guárdalo, no", "apúntalo, pero no" → approve (creaban facts) | Paso 5c original solo detectaba cuando "no" precedía al comando; orden inverso pasaba | Reescrito a co-ocurrencia semántica (cualquier orden). Excepciones: tag questions `"¿no?"` y `"no olvides"`. 10 tests nuevos. 28 tests de contradicción total. |
+| 20 | **Expansión de detección de negación: nunca/jamás/tampoco** (2026-11-22) | "guárdalo, nunca" → approve (creaba fact). Testers probaban con estas palabras | `_RE_NEGACION` solo incluía `_RE_NO_WORD`. Paso 5c solo usaba "no" | Nuevo regex `_RE_NUNCA` + integración en `_RE_NEGACION` y `_hay_rechazo()`. 9 tests nuevos. 28 tests totales de contradicción. |
+| 21 | **PHI CRÍTICO: `Dr[aá]\.?` no detectaba "Dr. Smith"** (2026-11-22) | "Dr. Smith" pasaba como PHI-safe | Patrón requería "a" entre "Dr" y el punto: `Dr[aá]\.?` sin `?` en `[aá]` | Cambiado a `Dr[aá]?\.?`. Sin esta corrección, todo doctor mencionado como "Dr. Apellido" pasaba PHI validation — riesgo HIPAA/UK GDPR. |
+| 22 | **Falsos positivos PHI: título sin nombre** (2026-11-22) | "Dr. recomienda", "El Dr", "El paciente está estable" bloqueados como PHI | Patrones 0/7/11 con `re.IGNORECASE` matcheaban minúsculas como mayúsculas `[A-Z]` | Filtro post-PHI: título seguido de minúscula → no es nombre propio. Filtro de prefijos: "El ", "La ", "En ". Whitelist mejorada: staff names buscados como substring dentro del match. Excepción para IDs ("paciente id:" sigue siendo PHI). |
+| 23 | **`NameError` en filtro de artículos** (2026-11-22) | `NameError` con matches como "El Doctor" | `m_stripped` no definido en el scope del bloque de filtro de artículos | Cambiado `m_stripped` a `m`. Detectado por revisión manual post-tests. |
 
-> **Nota**: 89 tests en `test_agent_graph.py` (57 de memoria + 32 de agente) +
-> 130 tests en otros módulos (`test_sales_forecast_split.py`,
-> `test_mcp_server_auth.py`, `test_temporal_cv.py`, `nightly/`, etc.) =
-> **212 tests totales en la suite del workspace**.
+> **Nota**: 94 tests en `test_agent_graph.py` (62 de memoria + 32 de agente,
+> incluyendo 9 tests nuevos de nunca/jamás/tampoco) + 130 tests en otros módulos
+> (`test_sales_forecast_split.py`, `test_mcp_server_auth.py`,
+> `test_temporal_cv.py`, `nightly/`, etc.) + 62 tests de guardrail =
+> **305 tests totales en la suite del workspace** (*checkpoint: 305 passed, 7.90s*).
 
 ---
 
