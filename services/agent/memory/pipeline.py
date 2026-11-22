@@ -795,20 +795,26 @@ def process_user_response(
 
             consolidate_memory(force=False)
 
-    else:  # discard por defecto
+    else:  # discard por defecto — mensaje no relacionado con la propuesta
+        # ❗ El mensaje del usuario no es una respuesta a la propuesta
+        # pendiente, sino una pregunta/información nueva.  Limpiamos la
+        # propuesta anterior (el usuario no se pronunció sobre ella) y
+        # devolvemos "unrelated" para que el mensaje fluya por el cauce
+        # normal (classify_query → answer → auto_evaluate_memory), donde
+        # será evaluado si merece una propuesta nueva.
         audit = _record_audit(
-            event_type="discarded",
+            event_type="unrelated",
             run_id=proposal["source_run_id"],
             proposal=proposal,
             user_message=user_message,
             classification=classification.intent,
             detail=(
-                "Propuesta descartada por defecto: el usuario no confirmó, "
-                "rechazó o editó explícitamente la propuesta."
+                "Mensaje no relacionado con la propuesta pendiente — "
+                "propuesta anterior limpiada, mensaje redirigido a flujo normal."
             ),
         )
         clear_pending_proposal()
-        result["resolution"] = "discarded"
+        result["resolution"] = "unrelated"
         result["final_content"] = None
         result["audit_entry"] = audit
 

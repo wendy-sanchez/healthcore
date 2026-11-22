@@ -19,6 +19,7 @@
 7. [Ciclo 2 — Rechazado](#7-ciclo-2--rechazado)
 8. [Ciclo 3 — Edición por el usuario](#8-ciclo-3--edición-por-el-usuario)
 9. [Ciclo 4 — PHI bloqueado](#9-ciclo-4--phi-bloqueado)
+9-B. [Ciclo 5 — Unrelated (mensaje no relacionado con la propuesta pendiente)](#9-b-ciclo-5--unrelated-mensaje-no-relacionado-con-la-propuesta-pendiente)
 10. [Consolidación y olvido](#10-consolidación-y-olvido)
 11. [Integración con el grafo LangGraph](#11-integración-con-el-grafo-langgraph)
 12. [Referencias](#12-referencias)
@@ -1025,6 +1026,114 @@ propuesta_memoria: {
 
 ---
 
+## 9-B. Ciclo 5 — Unrelated (mensaje no relacionado con la propuesta pendiente)
+
+### Contexto
+
+Cuando hay una propuesta pendiente pero el usuario escribe un mensaje que **no
+está relacionado** con ella (por ejemplo, nueva información operativa, una
+pregunta diferente, o una corrección sobre un tema distinto), el sistema
+reconoce que el mensaje no es una respuesta a la propuesta y la descarta
+como **unrelated**, dejando que el mensaje fluya por el cauce normal de
+evaluación de memoria.
+
+### Paso 1: Estado inicial — hay propuesta pendiente
+
+**Propuesta pendiente**:
+> Diane Foster quiere un reporte semanal de vacantes por clínica.
+
+**Categoría**: `staff_preference`
+
+### Paso 2: Usuario escribe un mensaje no relacionado
+
+**Usuario**:
+> El reporte semanal para Diane Foster debe incluir vacantes por rol, no solo
+> por clínica — eso lo pidió hace dos semanas.
+
+Este mensaje **no es una respuesta** a la propuesta pendiente. El usuario no
+dice ni "sí", ni "no", ni edita la propuesta — está aportando información
+operativa nueva que contradice la propuesta original.
+
+### Paso 3: `process_user_response` clasifica y descarta como unrelated
+
+- `classify_user_intent()`:
+  - Ejes de approve: mensaje no contiene "sí", "ok", "guárdalo" → puntuación baja
+  - Ejes de reject: "no solo" se detecta como rechazo parcial (0.5, por debajo del umbral 0.75)
+  - Ejes de edit: sin señales de edición
+  - Resultado: `discard` (nada coincide con approve/reject/edit)
+- `process_user_response()`:
+  - Intención `discard` → rama `else:` (por defecto)
+  - **Nuevo**: en lugar de devolver `resolution="discard"`, ahora devuelve
+    `resolution="unrelated"`
+  - `clear_pending_proposal()`: propuesta anterior se limpia
+  - `_record_audit("unrelated", ...)`: se registra como evento de auditoría
+  - El mensaje queda libre para ser procesado por `auto_evaluate_memory`
+
+### Paso 4: Mensaje redirigido al flujo normal
+
+Al no haber propuesta pendiente, el grafo continúa:
+
+```
+process_proposal (unrelated) → classify_query → retrieve_context
+→ generate_answer → auto_evaluate_memory
+```
+
+En `auto_evaluate_memory`, el mensaje de Diane Foster se evalúa como nueva
+información operativa:
+- Contiene información memorable: preferencia de Diane sobre el formato del
+  reporte semanal
+- Categoría: `staff_preference` (preferencia de un miembro del staff)
+- Propuesta generada:
+  > Diane Foster prefiere su reporte semanal de vacantes agrupado por rol,
+  > no solo por clínica.
+
+### Paso 5: Respuesta al usuario con nueva propuesta
+
+> Entendido. He actualizado la información: no guardaré el dato anterior sobre
+> el reporte por clínica.
+>
+> 📝 **¿Quieres que recuerde esto para la próxima vez?**
+> > Diane Foster prefiere su reporte semanal de vacantes agrupado por rol,
+> > no solo por clínica.
+> > *(categoría: staff_preference)*
+>
+> Responde con **«sí»**, **«no»**, o edita el texto.
+
+### Registro de auditoría (Ciclo 5)
+
+```json
+[
+  {"event_type": "unrelated", "run_id": "run_008", "timestamp": "2025-07-16T14:00:00",
+   "proposal": "Diane Foster quiere un reporte semanal de vacantes por clínica.",
+   "user_message": "El reporte semanal para Diane Foster debe incluir vacantes por rol...",
+   "classification": "discard",
+   "detail": "Mensaje no relacionado con la propuesta pendiente — propuesta anterior limpiada, mensaje redirigido a flujo normal."},
+  {"event_type": "proposed", "run_id": "run_009", "timestamp": "2025-07-16T14:00:01",
+   "proposal": "Diane Foster prefiere su reporte semanal de vacantes agrupado por rol...",
+   "classification": null, "detail": null},
+]
+```
+
+### Verificación desde el test server
+
+```
+$ curl -s -X POST http://localhost:8000/classify \
+  -H "Content-Type: application/json" \
+  -d '{"message":"El reporte semanal para Diane Foster debe incluir vacantes
+       por rol, no solo por clínica — eso lo pidió hace dos semanas."}'
+
+{
+    "intent": "discard",
+    "confidence": 0.0,
+    "explanation": "No se detectaron señales claras... \n📋 Resolución completa: unrelated. ¿Queda propuesta? No",
+    "pending_proposal": false
+}
+```
+
+---
+
+---
+
 ## 10. Consolidación y olvido
 
 ### 10.1 Política de consolidación
@@ -1172,7 +1281,7 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | **Total (agente+memoria)** | **89**| ✅     |
 | **Total suite completa**   | **219**| ✅     |
 
-### 11.6 Historial de bugs corregidos (16 totales)
+### 11.6 Historial de bugs corregidos (17 totales)
 
 | #  | Bug | Síntoma | Causa raíz | Corrección |
 |----|-----|---------|------------|------------|
@@ -1192,10 +1301,7 @@ Desglose por categoría (tests en `test_agent_graph.py`):
 | 14 | **"cambia el horario" → discard** | "cambia" daba approve en vez de edit | "cambia" listado como trigger de memorize | Rediseño completo a 6 ejes estructurales |
 | 15 | **Clasificador basado en listas planas** | Múltiples falsos positivos por patrón | Arquitectura de pattern lists | Rediseño total: clasificador estructural con 6 ejes analíticos y pipeline de 8 pasos |
 | 16 | **Negación con pronombres no se detecta** | "no lo guardes" → approve, "sí, pero no" → approve | `_RE_REJECT_PHRASE` no aceptaba pronombres `lo/la/los/las` entre "no" y el verbo; comandos de memoria negados sumaban puntaje de approve; contradicciones sí+no se resolvían como approve | `_RE_REJECT_PHRASE` ampliado con raíces de verbos; `_hay_aprobacion` ignora comandos negados vía `_comando_memoria_negado()`; nuevo paso 5b de contradicción → discard. 7 nuevos tests añadidos. |
-
-**Bugs 12-14**: Reportados por el usuario después del Hito 8 inicial.
-**Bug 15**: Corrección estructural que resuelve los bugs 12-14 de raíz, eliminando la dependencia de listas planas de patrones. Implementado en `classifier.py` (~567 líneas) con 6 funciones analíticas y pipeline de 10 pasos en `classify_user_intent()`.
-**Bug 16**: Corrección de alcance de negación: (a) `_RE_REJECT_PHRASE` ahora acepta pronombres átonos entre "no" y el verbo, (b) `_hay_aprobacion` ignora comandos de memoria que estén negados por un "no" precedente, (c) nuevo paso de detección de contradicciones (sí + no = discard). 7 nuevos tests de clasificador. 219/219 tests totales.
+| 17 | **Mensajes "unrelated" clasificados como discard sin limpiar propuesta** (2026-11-22) | Mensaje de Diane Foster "debe incluir vacantes por rol, no solo por clínica" devuelve discard pero la propuesta quedaba pendiente — el mensaje nunca llegaba a `auto_evaluate_memory` | El pipeline llamaba `process_user_response()` que clasificaba como discard pero no distinguía entre "mensaje irrelevante para la propuesta" y "rechazo explícito" | `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"` + `clear_pending_proposal()` + redirige el mensaje al flujo normal de auto-evaluación. Nuevo evento de auditoría `"unrelated"`. |
 
 > **Nota**: 89 tests en `test_agent_graph.py` (57 de memoria + 32 de agente) +
 > 130 tests en otros módulos (`test_sales_forecast_split.py`,

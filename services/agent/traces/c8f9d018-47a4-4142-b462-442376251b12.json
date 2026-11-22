@@ -1,0 +1,83 @@
+{
+  "run_id": "c8f9d018-47a4-4142-b462-442376251b12",
+  "question": "¿Qué seguros aceptan?",
+  "answer": "Respuesta simulada.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "check_pending_proposal → process_proposal (propuesta pendiente detectada)",
+    "process_proposal → unrelated ()",
+    "classify_query → rag",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada)",
+    "auto_evaluate_memory → nada que recordar"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.312929+00:00",
+      "metadata": {
+        "question_length": 21
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.315054+00:00",
+      "metadata": {
+        "num_memory_facts": 8,
+        "has_pending_proposal": true
+      }
+    },
+    {
+      "node": "process_proposal",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.320023+00:00",
+      "metadata": {
+        "resolution": "unrelated",
+        "proposal": "El usuario prefiere no guardar información operativa por defecto."
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.322691+00:00",
+      "metadata": {
+        "decision": "rag",
+        "has_incident": false,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.323626+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.324484+00:00",
+      "metadata": {
+        "answer_length": 19,
+        "llm_proposal": false
+      }
+    },
+    {
+      "node": "auto_evaluate_memory",
+      "status": "ok",
+      "timestamp": "2026-11-22T15:20:28.325777+00:00",
+      "metadata": {
+        "had_proposal": false,
+        "category": null
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 19,
+  "timestamp": "2026-11-22T15:20:28.326475+00:00"
+}

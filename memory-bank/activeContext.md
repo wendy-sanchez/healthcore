@@ -10,6 +10,17 @@
     - Nuevo paso 5b en el pipeline: detección de contradicciones — si el mensaje contiene tanto "sí" como "no", se descarta como ambiguo (discard)
     - 7 nuevos tests en `TestMemoryClassifier` para los casos: "no lo guardes", "sí, pero no lo guardes", "sí, pero no", "sí, no", "no la grabes", "no los apuntes", "no me recuerdes"
   - **Mejora 17 — Auto-evaluación LLM en lugar de heurística post-hoc** (2026-12):
+    - ... (contenido existente)
+  - **Bug 17 corregido — Mensajes "unrelated" ahora limpian la propuesta pendiente** (2026-11-22):
+    - **Problema**: Cuando un usuario enviaba un mensaje no relacionado con la propuesta pendiente (ej: "El reporte semanal para Diane Foster debe incluir vacantes por rol, no solo por clínica"), el clasificador devolvía `discard` pero no limpiaba la propuesta, dejando atrapado el mensaje sin llegar a `auto_evaluate_memory`.
+    - **Causa raíz**: `process_user_response()` en la rama `else` (discard) no distinguía entre "mensaje irrelevante" y "rechazo explícito", y no redirigía el mensaje al flujo normal de evaluación de memoria.
+    - **Solución**: `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"` + llama `clear_pending_proposal()` + redirige el mensaje al flujo normal. Nuevo evento de auditoría `"unrelated"`.
+    - **Cambios**:
+      - `pipeline.py`: `process_user_response()` — rama `else` devuelve `resolution="unrelated"` en lugar de `resolution="discard"`, limpia propuesta pendiente, registra auditoría.
+      - `classifier.py`: Sin cambios — la clasificación `discard` es correcta; el cambio está en cómo `process_user_response()` interpreta el discard.
+      - `agent-memory-harness-guard.md`: Nueva sección §9-B Ciclo 5 — Unrelated con 5 pasos documentados y registro de auditoría.
+      - Nuevo evento `"unrelated"` en el audit_log (junto a proposed, approved, rejected, discarded, edited, phi_rejected, consolidated).
+    - **Tests**: 89/89 tests de agente+memoria siguen pasando sin cambios.
     - **Problema**: El pipeline post-hoc (`_should_evaluate`) usaba heurísticas (triggers, regex) que fallaban en casos como `"porque"` matcheado como `"por qué"`, o conversaciones sin triggers explícitos que sí contenían información operativa valiosa.
     - **Solución**: El LLM devuelve la propuesta de memoria como **campo estructurado en la misma llamada** que genera la respuesta (`generate_answer_with_memory()` en `rag.py`). Elimina la necesidad de trigguers heurísticos y asegura precisión semántica.
     - **Cambios**:
@@ -22,7 +33,7 @@
 - **Entregable**: Sistema de memoria persistente para el agente LangGraph de HealthCore, que permite al agente recordar hechos operativos entre conversaciones con control explícito del usuario, auditoría completa y protección PHI.
 - **Stack**: `Python 3.14`, `TinyDB >=4.9.0`, `LangGraph >=1.2.22`, `re` (clasificador estructural, sin LLM).
 - **Arquitectura**: 6 módulos en `services/agent/memory/` + `rag.py`:
-  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas: `memory_facts`, `pending_proposal`, `audit_log` (6 eventos: `proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`). Validación PHI dual (antes de mostrar propuesta y antes de escribir). **Lista blanca PHI** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`). Consolidación automática (50 facts, TTL 90 días).
+  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas: `memory_facts`, `pending_proposal`, `audit_log` (8 eventos: `proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`, `unrelated`). Validación PHI dual (antes de mostrar propuesta y antes de escribir). **Lista blanca PHI** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`). Consolidación automática (50 facts, TTL 90 días).
   - `classifier.py` (~567 líneas) — **Clasificador estructural** con 6 ejes analíticos y pipeline de 10 pasos. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: `approve ≥0.70`, `reject ≥0.75`, `edit ≥0.85`, `discard` por defecto. `Nunca se asume aprobación por silencio`. Guardas adicionales: negación con pronombres, contradicciones sí+no, comandos negados no suman approve.
   - `pipeline.py` (~802 líneas) — Orquestador con **28 trigger keywords** incluyendo 10 comandos explícitos. 3 extractores específicos + 2 de respaldo. Clasifica en 3 categorías (`operational`, `incident_pattern`, `staff_preference`). Rechazo PHI explícito con mensaje HIPAA/UK GDPR. **Nuevo**: `_process_llm_proposal()` que prioriza juicio del LLM sobre heurísticas.
   - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers condicionales. `node_auto_evaluate_memory` maneja `phi_rejected` sin persistir. **Nuevo**: pasa `llm_memory_proposal` del estado a `_auto_evaluate()`.
@@ -31,7 +42,7 @@
 - **Integración en grafo**: `AgentState` con 8 campos (nuevo `llm_memory_proposal: Optional[dict]`). Flujo: `receive_question → load_memory_context → process_proposal` (si pendiente) / `classify_query` → ... → `generate_answer` (LLM produce answer + memory proposal) → `auto_evaluate_memory` (procesa propuesta LLM, valida PHI, presenta al usuario) → END.
 - **PHI Compliance**: 8 patrones PHI. Validación TWICE + re-validación consolidación. **Lista blanca** para staff HealthCore. Marco HIPAA (US) + UK GDPR.
 - **Tests**: **219 tests en toda la suite** (89 en `test_agent_graph.py` + 130 en otros módulos). 5 clases de memoria: `TestMemoryPHI` (8 tests), `TestMemoryStore` (5 tests), `TestMemoryClassifier` (**24** tests, cubriendo 6 ejes estructurales + pipeline 10 pasos + negación con pronombres + contradicciones), `TestMemoryPipeline` (**11** tests, incluyendo **3 E2E**), `TestMemoryGraphIntegration` (**9** tests, incluyendo **5 E2E** de ciclo completo: approve, reject, discard, **PHI-rejected (2 rutas)**, **consolidación**). **Todos pasan**.
-- **Bugs corregidos durante desarrollo (16 totales)**:
+- **Bugs corregidos durante desarrollo (17 totales)**:
   1. `route_after_receive` → KeyError en aristas del grafo.
   2. PHI: falsos negativos acentos → expandido a `áéíóúñ`.
   3. `add_fact()` sin validación PHI → validación dual.
@@ -48,7 +59,8 @@
   14. **"cambia el horario" → discard**: "cambia" en lista de memorize daba approve en vez de edit.
   15. **Clasificador basado en listas planas**: Rediseño total a 6 ejes estructurales (resuelve bugs 12-14 de raíz).
   16. **Negación con pronombres no se detecta**: "no lo guardes", "sí, pero no" → approve. `_RE_REJECT_PHRASE` no aceptaba pronombres; comandos de memoria negados sumaban approve; contradicciones sí+no se resolvían como approve. Corregido con ampliación de regex, `_comando_memoria_negado()`, y paso 5b de contradicción. 7 nuevos tests.
-- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1100+ líneas, 12 secciones, tabla de 16 bugs corregidos, clasificador estructural documentado en §5.2, 3 nuevos tests E2E documentados, 24 tests de clasificador).
+  17. **Mensajes "unrelated" no limpiaban propuesta pendiente**: Mensaje de Diane Foster devolvía discard pero la propuesta quedaba atrapada. `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"`, limpia propuesta y redirige a flujo normal.
+- **Auditoría**: Criterios cumplidos. Ver `agent-memory-harness-guard.md` (~1350+ líneas, 13 secciones, tabla de 17 bugs corregidos, clasificador estructural documentado en §5.2, 5 ciclos completos documentados (incluyendo Ciclo 5 — Unrelated), 24 tests de clasificador).
 - **Verificación CONTEXT.md**: 6/6 ejemplos verificados al nivel de flujo completo (pipeline completo, no solo `_should_evaluate`):
   - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
   - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente
@@ -56,7 +68,7 @@
   - ✅ Caso 4 (Diane Foster reporte) — propuesta creada (antes bloqueado por falso positivo PHI)
   - ✅ Caso 5 (consulta puntual) — correctamente sin propuesta
   - ✅ Caso 6 (agradecimiento) — correctamente sin propuesta
-- **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, 4 ciclos completos con trazas, política de consolidación, tabla de 11 bugs corregidos, whitelist PHI documentada, rechazo explícito PHI documentado.
+- **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, **5 ciclos completos con trazas (incluyendo Ciclo 5 — Unrelated)**, política de consolidación, tabla de **17 bugs corregidos**, whitelist PHI documentada, rechazo explícito PHI documentado, evento de auditoría `"unrelated"`.
 - **Branch**: `feature/agent-memory` (o rama activa del desarrollo).
 
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)

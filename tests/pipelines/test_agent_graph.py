@@ -1560,7 +1560,7 @@ class TestMemoryPipeline:
         )
 
         result = process_user_response("¿qué clima hace?")
-        assert result["resolution"] == "discarded"
+        assert result["resolution"] == "unrelated"
 
         facts = get_all_facts()
         assert len(facts) == initial_count
@@ -1852,26 +1852,26 @@ class TestMemoryGraphIntegration:
 
         # Paso 3: Usuario ignora la propuesta y pregunta otra cosa
         result = process_user_response("¿qué pasa con los incidentes de facturación?")
-        assert result["resolution"] == "discarded", (
-            f"Paso 3: El cambio de tema debe descartar la propuesta. "
+        assert result["resolution"] == "unrelated", (
+            f"Paso 3: El cambio de tema debe resultar en 'unrelated'. "
             f"Resultó: {result['resolution']}"
         )
         assert result["final_content"] is None, (
-            "Paso 3: No debe haber contenido tras discard"
+            "Paso 3: No debe haber contenido tras unrelated"
         )
 
-        # Paso 4: NO se escribió nada
+        # Paso 4: NO se escribió nada (la propuesta se limpió, no se guardó)
         facts_after = get_all_facts()
         assert len(facts_after) == initial_count, (
-            f"Paso 4: No deben crearse facts tras discard. "
+            f"Paso 4: No deben crearse facts tras unrelated. "
             f"Antes: {initial_count}, Después: {len(facts_after)}"
         )
 
-        # Paso 5: audit_log tiene user_discarded
+        # Paso 5: audit_log tiene 'unrelated' (no 'discarded')
         audit_log = db.table("audit_log").all()
         events = [e["event_type"] for e in audit_log]
-        assert "discarded" in events, (
-            "Paso 5: audit debe tener 'discarded'"
+        assert "unrelated" in events, (
+            "Paso 5: audit debe tener 'unrelated'"
         )
 
     def test_e2e_memory_phi_rejected_auto_evaluate(self):

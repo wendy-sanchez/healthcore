@@ -54,6 +54,7 @@ p { color: #8b949e; margin-bottom: 1.5rem; }
 .tag.edit { background: #58a6ff33; color: #58a6ff; border: 1px solid #58a6ff; }
 .tag.no_proposal { background: #8b949e33; color: #8b949e; border: 1px solid #8b949e; }
 .tag.phi_rejected { background: #f9758333; color: #f97583; border: 1px solid #f97583; }
+.tag.unrelated { background: #7ee78733; color: #7ee787; border: 1px solid #7ee787; }
 </style>
 </head>
 <body>
@@ -90,7 +91,7 @@ p { color: #8b949e; margin-bottom: 1.5rem; }
 
 <script>
 const BASE = '';  // mismo origen
-const COLORS = { approve: '#7ee787', reject: '#ff7b72', discard: '#d29922', edit: '#58a6ff', no_proposal: '#8b949e', phi_rejected: '#f97583' };
+const COLORS = { approve: '#7ee787', reject: '#ff7b72', discard: '#d29922', edit: '#58a6ff', no_proposal: '#8b949e', phi_rejected: '#f97583', unrelated: '#7ee787' };
 
 async function probar(msg) {
   if (!msg.trim()) return;
@@ -123,8 +124,25 @@ async function probar(msg) {
       `📝 "${data.message}"\n\n` +
       `🤖 ${data.explanation}\n\n` +
       `📊 Ejes analíticos:\n${ejes}`;
+    
+    // Regenerar propuesta en segundo plano SIN tocar el resultado
+    regenerarPropuesta();
   } catch (err) {
     el.textContent = `❌ Error: ${err.message}`;
+  }
+}
+
+// Regenera la propuesta pendiente sin modificar el resultado mostrado
+async function regenerarPropuesta() {
+  try {
+    const r = await fetch(`${BASE}/reset`, { method: 'POST' });
+    const data = await r.json();
+    if (r.ok) {
+      const status = document.getElementById('propuestaStatus');
+      status.innerHTML = '✅ Propuesta activa: <i>"' + (data.proposal || 'El usuario prefiere no guardar información') + '"</i>';
+    }
+  } catch (_) {
+    // No interrumpir al usuario si falla la regeneración
   }
 }
 

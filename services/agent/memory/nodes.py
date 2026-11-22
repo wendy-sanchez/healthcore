@@ -134,8 +134,15 @@ def node_process_proposal(state: dict[str, Any]) -> dict[str, Any]:
     # puede reformularla sin PHI.  El resto de resoluciones limpian.
     keep_proposal = result["resolution"] == "phi_rejected"
 
+    # "unrelated" significa que el mensaje del usuario no era una respuesta
+    # a la propuesta pendiente, sino una pregunta/información nueva sobre
+    # otro tema.  La propuesta anterior se limpió en process_user_response
+    # y el mensaje debe fluir al cauce normal (classify_query → answer →
+    # auto_evaluate_memory) para que se evalúe si merece una propuesta nueva.
+    is_unrelated = result["resolution"] == "unrelated"
+
     return {
-        "memory_proposal_handled": not keep_proposal,
+        "memory_proposal_handled": not keep_proposal and not is_unrelated,
         "memory_proposal_handled_text": memory_proposal_handled,
         "memory_proposal_result": result,
         "memory_proposal": proposal if keep_proposal else None,
