@@ -1,0 +1,72 @@
+{
+  "run_id": "fc6a473b-f61b-404c-9d6f-e8acc424846e",
+  "question": "¿Qué seguros aceptan?",
+  "answer": "Respuesta simulada.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "check_pending_proposal → process_proposal (propuesta pendiente detectada)",
+    "process_proposal → discarded ()",
+    "classify_query → rag",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada)"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.908839+00:00",
+      "metadata": {
+        "question_length": 21
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.911222+00:00",
+      "metadata": {
+        "num_memory_facts": 5,
+        "has_pending_proposal": true
+      }
+    },
+    {
+      "node": "process_proposal",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.917128+00:00",
+      "metadata": {
+        "resolution": "discarded",
+        "proposal": "El horario de la clínica de Austin cambió"
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.919772+00:00",
+      "metadata": {
+        "decision": "rag",
+        "has_incident": false,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.920804+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-22T12:49:19.921995+00:00",
+      "metadata": {
+        "answer_length": 19
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 19,
+  "timestamp": "2026-11-22T12:49:19.924265+00:00"
+}

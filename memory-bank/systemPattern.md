@@ -59,7 +59,27 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Supplier para la respuesta, con los campos que genera el sistema (id, updated_at, archived_at).
 - Los campos generados por el sistema se ignoran si el cliente los envía.
 
-### 10) LangGraph Agent Pattern (Parte 2 — Tools externas) — Grafo de decisión con consultas a servicios reales
+### 10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
+
+**Ubicación**: `services/agent/guardrails/`, `services/agent/graph.py`, `data/pipelines/rag.py`
+
+**Propósito**: Blindar el agente contra inyección de prompt, jailbreaks, solicitudes fuera de dominio y fugas de PHI mediante 3 capas deterministas (sin LLM en hot path).
+
+**Capas**:
+1. **Harness (system prompt)**: `build_system_prompt()` genera ~40 líneas de instrucciones de seguridad (5 reglas) que se envían como mensaje `system` separado. `wrap_rag_context()` aísla contenido RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS` + advertencia de solo-referencia-factual.
+2. **Content guardrail (input)**: `classify_input_scope()` clasifica toda query en 7 categorías con prioridad estricta: JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6) > OUT_OF_DOMAIN (7). Si no es DOMAIN, corta el flujo sin pasar por el LLM.
+3. **Output guardrail (output)**: `validate_output()` aplica 3 checkers: formato (vacío/largo), leaked instructions (14 patrones), sensitive data (PHI + términos confidenciales). Si falla, reemplaza la respuesta con fallback.
+
+**Integración en grafo**:
+- Nodos: `input_guardrail` (tras receive_question), `output_guardrail` (tras auto_evaluate_memory).
+- Routing: bloqueado → `__end__` con respuesta predefinida.
+- El harness se conecta en `node_generate_answer()`: llama a `build_system_prompt()`, envuelve chunks con `wrap_rag_context()`, pasa `system_role_message` a `_generate()` que lo envía como mensaje `system` separado.
+- Traza incluye `harness_active: True`.
+- Helper functions: `_build_context_from_chunks()`, `_build_memory_context_text()`.
+
+**3 capas** se orquestan en orden: `content_guard (input) → LLM (harness system prompt) → output_guard (response)`.
+
+### 11) LangGraph Agent Pattern (Parte 2 — Tools externas) — Grafo de decisión con consultas a servicios reales
 
 **UbicaciÃ³n**: `services/agent/graph.py`, `services/agent/tools/`, `services/agent/routes.py`
 
@@ -471,3 +491,16 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - **Las tools HTTP directas originales** (`services/agent/tools/incidents.py`, `inventory.py`) se marcan como DEPRECATED pero no se eliminan. El `__init__.py` se actualiza para reflejar la nueva arquitectura MCP Client.
 - **Motivo**: no romper imports de otros módulos que pudieran referenciarlos, y permitir rollback rápido si el MCP Server falla en producción.
 - **Mecanismo**: `warnings.warn("DEPRECATED: ...", DeprecationWarning, stacklevel=2)` en cada función. El agente LangGraph ya no importa estos módulos.
+
+### 59) Patrón LangGraph Agent Memory — Sistema de memoria persistente (Hito 8)
+- **Arquitectura en 4 capas**: `store.py` (backend TinyDB) → `classifier.py` (clasificador de intención) → `pipeline.py` (orquestador) → `nodes.py` (integración LangGraph). Cada capa tiene responsabilidad única y se comunica por interfaces tipadas.
+- **Almacenamiento separado de RAG**: TinyDB (JSON document store, zero-config) en `data/process/agent_memory/agent_memory.json`. 3 tablas: `memory_facts` (hechos confirmados), `pending_proposal` (máximo 1 propuesta pendiente), `audit_log` (traza de decisiones). No usa Qdrant ni vectores — solo hechos estructurados planos.
+- **PHI compliance dual**: `validate_phi_safe(text)` → `(bool, list[str])` verifica 8+ patrones PHI expandidos (nombres con caracteres acentuados, SSN, NHS numbers, emails, MRNs, términos clínicos — 20+ condiciones, apellidos hispanos — 70+, fechas standalone, teléfonos con lookbehind, direcciones físicas). Se ejecuta TWICE: (1) antes de mostrar propuesta `📝` al usuario, (2) antes de escribir en TinyDB en `add_fact()`. También se re-valida durante `consolidate_memory()`.
+- **Clasificador de intención sin LLM**: `classify_user_intent(user_message)` usa reglas léxicas con umbrales de confianza: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0 por defecto — «nunca se asume aprobación por silencio o ambigüedad»). `_extract_edit_text()` extrae texto editado entre comillas. `user_changed_topic()` detecta cambio de tema.
+- **Auto-evaluación de propuestas**: `auto_evaluate_proposal()` se invoca tras generar cada respuesta. Usa 18 trigger keywords (recuerda, aprende, guarda, etc.) y detecta indicadores de «no memorizable» (principalmente saludos, "gracias"). También bloquea frases hipotéticas/condicionales y patrones de consulta (qué es, dime, etc.). Clasifica en 3 categorías: `operational`, `incident_pattern`, `staff_preference`. Si hay propuesta pendiente, omite evaluación para no reemplazarla.
+- **Detección de duplicados**: `_is_duplicate()` compara contenido normalizado (sin espacios extra, sin puntuación final) contra facts existentes de la misma categoría. Evita que el mismo hecho se proponga o guarde múltiples veces.
+- **Flujo en grafo**: `receive_question → load_memory_context → route_after_load_memory → (process_proposal si hay pendiente | classify_query si no) → ... → generate_answer/synthesize_tool_answer → auto_evaluate_memory → END`. `route_after_process_proposal` redirige a classify_query si hay nueva pregunta, o a END si la intención era responder a la propuesta. `route_after_synthesis()` rompe el loop RAG+tool — va directo a `auto_evaluate_memory` sin posibilidad de volver a `synthesize_tool_answer`. 3 nuevos nodos + 3 routers = 13 nodos total.
+- **Validación PHI antes de propuesta al usuario**: El pipeline `auto_evaluate_proposal()` ejecuta `validate_phi_safe()` sobre el candidato a memoria antes de construir el mensaje `📝 ¿Quieres que recuerde esto para la próxima vez?`. Si contiene PHI, la propuesta se registra como `phi_blocked` en el audit_log con el texto ofuscado y la respuesta se devuelve sin propuesta.
+- **Auditoría completa**: `_record_audit()` escribe eventos con timestamp ISO, event_type (8 tipos: fact_added, fact_deleted, proposal_made, proposal_approved, proposal_rejected, proposal_edited, proposal_discarded, memory_consolidated, phi_blocked), contenido ofuscado (solo primeros 100 chars si es texto sensible), y metadatos adicionales. `get_audit_log()` soporta paginación por limit y filtro por event_type.
+- **Consolidación automática**: `consolidate_memory(force=False)` se dispara cuando `count_facts() >= 50` (threshold configurable) O cada 90 días (TTL). `add_fact()` auto-asigna `expires_at` (90 días vía `_now_plus_days`) si no se proporciona. `_build_summary()` genera resumen determinista agrupando facts por categoría. `_purge_expired()` elimina facts con `expires_at < now`. El resumen se escribe como nuevo fact con categoría `consolidated_summary`. Los facts originales se mantienen pero se marcan como consolidados.
+- **6 principios de diseño** (documentados en `__init__.py`): (1) PHI nunca se almacena ni se propone, (2) Toda decisión de memoria se audita, (3) Memoria nunca se escribe sin confirmación explícita del usuario, (4) Nunca se asume aprobación por silencio o ambigüedad, (5) Máximo una propuesta pendiente a la vez, (6) PHI se valida dos veces: antes de proponer y antes de escribir.

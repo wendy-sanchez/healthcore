@@ -2,6 +2,148 @@
 
 ## Estado actual del desarrollo
 
+### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
+
+- **Completado**: Paquete `services/agent/memory/` con 5 módulos:
+  - `store.py` (~716 líneas) — Backend TinyDB con 3 tablas, validación PHI dual con **lista blanca** (`_PHI_WHITELIST` + `_PHI_WHITELIST_PREFIXED`), consolidación automática (50 facts, TTL 90 días), auditoría con 8 eventos (`proposed`, `approved`, `rejected`, `discarded`, `edited`, `phi_rejected`, `consolidated`, `unrelated`).
+  - `classifier.py` (~567 líneas) — **Clasificador estructural** rediseñado con **6 ejes analíticos** y **pipeline de 10 pasos** en `classify_user_intent()`. Sin listas planas de patrones. Funciones: `_es_pregunta_o_condicional()`, `_hay_rechazo()`, `_hay_aprobacion()`, `_hay_edicion()`, `_es_solo_cortesia()`, `_es_falso_positivo_aprobacion()`, `_comando_memoria_negado()`. Umbrales: approve (≥0.70), reject (≥0.75), edit (≥0.85), discard (0.0). Guardas adicionales: negación con pronombres entre "no" y verbo, contradicciones sí+no → discard, comandos de memoria negados no suman approve.
+  - `pipeline.py` (~802 líneas) — Orquestador con 28 trigger keywords, 3 extractores + 2 de respaldo, clasificación en 3 categorías, rechazo PHI explícito con mensaje HIPAA/UK GDPR.
+  - `nodes.py` (~267 líneas) — 3 nodos LangGraph + 3 routers.
+  - `__init__.py` — 6 principios de diseño.
+
+- **Completado**: Integración en grafo LangGraph:
+  - 8 nuevos campos en `AgentState` (nuevo: `llm_memory_proposal`).
+  - Entrypoint actualizado y grafo ampliado de 10 a 13 nodos.
+
+- **Completado**: Evaluación de memoria por LLM (Mejora 17):
+  - `rag.py`: Nueva función `generate_answer_with_memory()` que devuelve `(answer, proposal_or_None)`.
+  - El LLM decide si hay información memorable usando instrucción estructurada (`_MEMORY_SYSTEM_PROMPT_SUFFIX`).
+  - Elimina dependencia de triggers heurísticos para decidir qué es memorable.
+  - `graph.py`: `node_generate_answer()` usa `generate_answer_with_memory()` como primaria, `generate_answer()` como fallback.
+  - `pipeline.py`: `auto_evaluate_proposal()` acepta `llm_proposal`, con `_process_llm_proposal()` que prioriza juicio LLM.
+  - `nodes.py`: Pasa `llm_memory_proposal` desde el estado.
+  - Tests: 89/89 pasan (fix de sintaxis en `_MEMORY_SYSTEM_PROMPT_SUFFIX`).
+
+- **Completado**: PHI Compliance con validación TWICE + re-validación consolidación.
+
+- **Completado**: **71 tests de memoria** en 5 clases (antes 32):
+    - `TestMemoryPHI` (8 tests)
+    - `TestMemoryStore` (5 tests)
+    - `TestMemoryClassifier` (**38 tests** — antes 29, cubriendo 6 ejes estructurales: approve/reject/edit/discard, cortesía sola, pregunta/condicional, falso positivo approve, texto vacío, sin propuesta pendiente, **negación con pronombres, contradicciones sí+no, contradicción no+comando con separadores, contradicción con nunca/jamás/tampoco**)
+    - `TestMemoryPipeline` (**11 tests**, incluyendo **3 tests E2E**: approve_cycle/reject_cycle/discard_cycle)
+    - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
+    - **62/62 tests de memoria pasan + 32 tests originales = 94 tests en test_agent_graph.py.**
+
+  - **Completado**: **305 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc. + 62 guardrails + 19 nuevos classifier).
+
+- **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
+  - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
+  - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
+  - Bug 14: "cambia el horario" → ahora edit (eje edición)
+
+- **Completado**: Auditoría — criterios cumplidos. Reporte completo en AUDITORIA1.md.
+- **Completado**: **3 mejoras post-auditoría** (1 descartada, 2 implementadas):
+  - ✅ **PHI-rejected flow E2E** (2 tests: auto-evaluate + set_pending) — cierre de compliance crítico
+  - ✅ **Consolidación E2E** (1 test: force=True, verifica resumen, TTL, PHI re-validation)
+  - ❌ Trigger keywords en archivo externo — descartado (constantes en módulo es suficiente, sin valor real en externalizar)
+
+- **Completado**: Documentación técnica actualizada:
+  - `agent-memory-harness-guard.md` (~1350+ líneas) — 13 secciones (nueva §9-B Ciclo 5 — Unrelated), clasificador estructural documentado en §5.2 con 6 ejes y tabla de ejemplos, evento de auditoría `"unrelated"` añadido, tabla ampliada a **17 bugs corregidos**, suite summary actualizado.
+
+- **Completado**: Bugs corregidos (17 totales):
+  1. `route_after_receive` devolvía `"classify_query"` pero el entrypoint cambió a `"load_memory_context"` → KeyError en aristas del grafo. Corregido el valor de retorno y el mapeo de aristas.
+  2. PHI: falsos negativos — patrón regex `[A-Z][a-z]+ [A-Z][a-z]+` no emparejaba caracteres acentuados (ej: "Juan Pérez"). Corregido a `[A-Z][a-zA-ZáéíóúñÁÉÍÓÚ]+`. Además se expandieron patrones PHI: términos clínicos (20+ condiciones), teléfono internacional con lookbehind, MRN con colon, apellidos hispanos (70+), fechas standalone.
+  3. `add_fact()` no validaba PHI antes de escribir en TinyDB — se añadió validación dual con auditoría, retornando None si se detecta PHI.
+  4. Clasificador: ambigüedad como aprobado — `"¿cambia el horario?"` y `"si llueve cancelo"` generaban propuestas. `_should_evaluate` reescrito: bloquea hipotéticas, requiere trigger keywords en combined text.
+  5. Consolidación: facts nunca expiraban — `add_fact()` no asignaba `expires_at` para facts no consolidados. Auto-asignación de `_DEFAULT_TTL_DAYS` (90) cuando `consolidated=False` y `expires_at is None`.
+  6. Loop RAG+tool — `route_after_generate` re-enrutaba a `synthesize_tool_answer` por `tool_results` persistentes. Nueva `route_after_synthesis()` que va directo a `auto_evaluate_memory` o `__end__`.
+  7. CONTEXT examples bloqueados — `"reporte"`, `"dashboard"`, `"esta semana"` en non-memorizable; faltaban triggers `"pidió"`, `"debe"`, etc. Movidos a triggers keywords; expandidos con `"pidió"`, `"debe"`, `"alerta"`, `"cierre"`, `"no-show"`, `"fue porque"`, `"hubo"`.
+  8. **Word boundary en `_QUERY_PHRASES`** — `"lista"` matcheaba dentro de `"especialista"` por substring check. Corregido a `re.search(r"\b" + re.escape(phrase) + r"\b", q_lower)`. Esto bloqueaba el Caso 2 (Manchester cambio proceso).
+  9. **Faltaban comandos explícitos en triggers** — `"apúntalo"`, `"guárdalo"`, `"recuérdalo"`, `"escribe"`, `"almacena"` y variantes no estaban en `_MEMORIZE_TRIGGER_KEYWORDS`. Añadidos 10 comandos. Esto causaba que el Caso 1 (Johnson PHI con "apúntalo") fuera ignorado en silencio.
+  10. **`_extract_memory_candidate` sin fallback** — Incluso cuando `_should_evaluate()` retornaba True, si ningún extractor específico clasificaba la interacción, retornaba `None` y la propuesta se perdía antes de llegar a validación PHI. Añadidos `_extract_command_memory()` para comandos explícitos y `_extract_fallback_content()` como fallback genérico con inferencia de categoría.
+  11. **PHI rejection silenciosa** — `auto_evaluate_proposal()` retornaba `(answer, None)` cuando `validate_phi_safe()` detectaba PHI, sin informar al usuario. Corregido a rechazo explícito con mensaje HIPAA/UK GDPR y `{"phi_rejected": True}`. El nodo de grafo detecta esto y no persiste la propuesta.
+  - **Además**: **Lista blanca PHI** añadida en `store.py` (`_PHI_WHITELIST` y `_PHI_WHITELIST_PREFIXED`) para evitar falsos positivos con staff de HealthCore (Diane Foster, Claire Whitfield, Marcus Reid, Sandra Okonkwo, Priya Nair, James Osei) y ubicaciones operativas (Austin, Manchester, London, Miami, Dallas, etc.). Esto resolvió 2 falsos positivos: "En Austin" y "Diane Foster".
+  - Bugs 12-15: **Rediseño del clasificador** (de listas planas a clasificador estructural con 6 ejes analíticos). Resuelve de raíz 3 bugs reportados por el usuario:
+    - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
+    - Bug 13: "bien gracias" → ahora discard (eje cortesía sola)
+    - Bug 14: "cambia el horario" → ahora edit (eje edición)
+  - Bug 16: **Negación con pronombres no se detecta** — "no lo guardes", "sí, pero no" → approve. `_RE_REJECT_PHRASE` no aceptaba pronombres entre "no" y el verbo; comandos de memoria negados sumaban approve; contradicciones sí+no se resolvían como approve. Corregido con ampliación de regex, `_comando_memoria_negado()`, y paso 5b de contradicción. 7 nuevos tests de clasificador. Pipeline ampliado de 8 a 10 pasos.
+  - Bug 17: **Mensajes "unrelated" no limpiaban propuesta pendiente** — Mensaje de Diane Foster con corrección del reporte semanal devolvía discard pero la propuesta quedaba atrapada. `process_user_response()` rama `else` ahora devuelve `resolution="unrelated"`, ejecuta `clear_pending_proposal()`, registra auditoría con evento `"unrelated"`, y redirige el mensaje al flujo normal de auto-evaluación. Sin cambios en clasificador. 89/89 tests siguen pasando.
+
+- **Tests**: Suite completa de **219 tests** verificada: `uv run python -m pytest tests/ -v`.
+  - Memory tests: 57/57 pasan (incluyendo PHI patterns, store CRUD, classifier con 24 tests, pipeline, graph integration).
+  - Non-memory agent tests: 32/32 heredados siguen pasando.
+  - Tests adicionales: 130 tests en sales_forecast, MCP auth, nightly, temporal_cv, etc.
+  - **6/6 ejemplos de CONTEXT.md verificados** al nivel de flujo completo:
+    - ✅ Caso 1 (Johnson PHI) — rechazo explícito con mensaje HIPAA/UK GDPR
+    - ✅ Caso 2 (Manchester cambio proceso) — propuesta creada correctamente
+    - ✅ Caso 3 (Austin alerta no-show) — propuesta creada (antes bloqueado por falso positivo "En Austin")
+    - ✅ Caso 4 (Diane Foster reporte) — propuesta creada (antes bloqueado por falso positivo PHI)
+    - ✅ Caso 5 (consulta puntual) — correctamente sin propuesta
+    - ✅ Caso 6 (agradecimiento) — correctamente sin propuesta
+  - **Branch**: `feature/agent-memory`.
+
+### Hito 8 · Parte 2 — Harness y Guardrails (2026-12) — Refuerzo integración grafo (2026-11-23)
+
+- **Completado**: 3 módulos de guardrail deterministas (regex, sin LLM):
+  - `harness.py` — System prompt hardening: 5 reglas de restricción + `RAG_TOOL_ISOLATION` + `wrap_rag_context()` para aislar contenido RAG/tools
+  - `content_guard.py` — Clasificación de entrada en **7 categorías** con prioridad: `JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6) > OUT_OF_DOMAIN (7)`. ~100 patrones regex.
+  - `output_guard.py` — Validación de respuesta: `check_format` (vacío/largo), `check_leaked_instructions` (14 patrones EN+ES), `check_sensitive_data` (PHI + términos confidenciales)
+
+- **Completado**: Integración en grafo LangGraph:
+  - 3 nuevos campos en `AgentState`: `guardrail_result`, `guardrail_blocked`, `guardrail_response`
+  - Nuevos nodos: `node_input_guardrail`, `node_output_guardrail`
+  - Routing: `route_after_receive` → `input_guardrail`; `route_after_input_guardrail` → `load_memory_context` (si DOMAIN) o `__end__` (si bloqueado)
+  - Observabilidad: `guardrail_summary(limit=100)` lee trazas y consolida estadísticas por clasificación/tipo
+
+- **Completado — Conexión real del harness al nodo del grafo** (2026-11-23):
+  - **Bug**: `build_system_prompt()` y `wrap_rag_context()` importados pero nunca usados en `_generate()` — el mensaje system no existía.
+  - **Fixes**:
+    1. `_generate()` en `rag.py` acepta `system_role_message` y lo envía como mensaje `system` separado (rol explícito).
+    2. `node_generate_answer()` llama a `build_system_prompt()` para construir system instructions del harness.
+    3. `wrap_rag_context()` aísla chunks RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS`.
+    4. Nuevas helpers: `_build_context_from_chunks()`, `_build_memory_context_text()`.
+    5. Trace events incluyen `harness_active: True`.
+  - **OUT_OF_DOMAIN**: Nueva clasificación (blocked=True). Fallback por defecto cambiado de `DOMAIN` a `OUT_OF_DOMAIN`.
+
+- **Completado**: **Gap cerrado contra solución de referencia** — 3 tests de inyección RAG + **6 nuevos tests de integración en grafo**:
+  1. `test_rag_content_injection_wrapped_as_data` — Chunk RAG envuelto, verifica NO en system prompt
+  2. `test_rag_content_injection_system_prompt_warns` — System prompt contiene advertencia "factual reference only"
+  3. `test_rag_injection_with_jailbreak_keywords_not_confused` — Query legítima DOMAIN, capas separadas
+  4. `test_node_generate_answer_uses_build_system_prompt` — system_role_message con Identity/HIPAA/Jailbreak
+  5. `test_node_generate_answer_wraps_rag_context` — marcadores BEGIN/END REFERENCE DOCUMENTS
+  6. `test_malicious_rag_chunk_does_not_contaminate_system_prompt` — [SYSTEM]: ignore rules NUNCA en system prompt
+  7. `test_malicious_rag_chunk_wrapped_in_graph_node` — Flujo completo: chunk malicioso → wrap → system_role_message limpio
+  8. `test_harness_active_flag_in_trace` — metadata harness_active=True
+  9. `test_route_after_input_guardrail_out_of_domain` — OUT_OF_DOMAIN blocked → __end__
+
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **317 tests totales workspace**. **187 passed, 0 failures**.
+
+- **Bugs corregidos post-auditoría (2026-11-23)**:
+  1. `guardrail_summary()` en `graph.py` — Usaba `event.get("event", "")` pero los eventos usan clave `"node"`. Metadata de output_guardrail esperaba shape incorrecto (`.get("valid", True)` en vez de `event["status"]`; issues tratadas como dicts en vez de strings). Fix: `event.get("node", "")`, usar `status` para fallback, iterar strings directamente.
+  2. `r"\bphi\b"` duplicado en `_DOMAIN_KEYWORDS` de `content_guard.py:83` — sin impacto funcional pero descuidado. Eliminada duplicación.
+  3. Cobertura de tests a nivel nodo del grafo: 6 nuevos tests para `node_input_guardrail`, `node_output_guardrail` y `route_after_auto_evaluate_v2`.
+
+- **Documentación**: `agent-memory-harness-guard.md` §13-19 actualizado con OUT_OF_DOMAIN, §14 con TestGraphHarnessIntegration, §11.6 con bugs 24-27, §18 auditoría 35/35 puntos.
+
+- **Aceptación**: ✅ 9/9 criterios de auditoría cumplidos. ✅ 100% contra solución de referencia (35/35 puntos).
+
+### Hito 8·2 — Corrección de contradicción comando+no en cualquier orden
+
+- **Bug detectado**: Frases como `"guárdalo, no"`, `"apúntalo, pero no"`, `"recuérdalo, pero no"`, `"guárdalo, no gracias"` retornaban `approve` y creaban facts. La contradicción solo se detectaba cuando `"no"` precedía al comando (`no antes que guarda`), no cuando el comando iba primero.
+- **Corregido — Paso 5c reescrito**: Se cambió de verificación posicional (`no.start() < command.start()`) a co-ocurrencia semántica (cualquier orden). Si el texto contiene TANTO un comando de memoria (`guárdalo`/`apúntalo`/`recuérdalo`) COMO `"no"` como palabra independiente, es semánticamente contradictorio → `discard`. Únicas excepciones: tag questions (`"¿no?"` con `?` explícito) y doble negación afirmativa (`"no olvides"` = `"recuerda"`).
+- **Ajustes adicionales en el clasificador**:
+  1. `_hay_rechazo()`: Retorna `0.0` si el texto coincide con `_RE_NO_OLVIDES` (`"no olvides"`, `"no te olvides"`) — son dobles negaciones con significado POSITIVO, no rechazo.
+  2. `_hay_aprobacion()`: Añade +0.7 si el texto coincide con `_RE_NO_OLVIDES` — mapea `"no olvides"` → `approve` semánticamente.
+  3. `_es_pregunta_o_condicional()`: Si el texto termina con `"¿no?"` (tag question) y coincide con `_RE_TAG_QUESTION`, NO se trata como pregunta real. `"guárdalo, ¿no?"` es una coletilla de confirmación, no una interrogación.
+- **Tests**: 10 tests nuevos + 1 renombrado = **19 tests de contradicción comando+no en 3 clases**:
+  - **Discard** (contradicción): `inverted_order`, `guardalo_pero_no`, `apuntalo_pero_no`, `recuerdalo_pero_no`, `guardalo_no_gracias`, `store_with_conjunction`, `apuntalo_no_me_digas`
+  - **Reject** (rechazo explícito): `guardalo_no_olvida` (contiene `"olvida"` = verbo de rechazo)
+  - **Approve** (excepciones): `guardalo_tag_question`, `no_olvides`, `no_te_olvides`
+- **Suite completa**: **296 tests** (`uv run python -m pytest tests/ -v`) — 0 fallos.
+- **Cobertura**: 19/19 tests de contradicción comando+no pasan. Casos cubiertos: orden invertido, comas, puntos suspensivos, conjunciones (`pero`), cortesía (`gracias`), tag questions (`¿no?`), doble negación (`no olvides`), verbos de refuerzo negativo (`olvida`).
+- **Branch**: `feature/agent-memory`.
+
 ### MCP Server — OAuth 2.1 y Autenticación (2026-11-18)
 - **Versión estable**: v1.0.0 — Server MCP con OAuth 2.1 (MCP Auth) como Resource Server.
 - **Problemas resueltos**:

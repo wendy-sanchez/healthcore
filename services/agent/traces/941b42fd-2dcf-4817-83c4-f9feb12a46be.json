@@ -1,0 +1,34 @@
+{
+  "run_id": "941b42fd-2dcf-4817-83c4-f9feb12a46be",
+  "question": "¿Qué seguros aceptan?",
+  "answer": "I specialise in HealthCore compliance and policies — HIPAA, UK GDPR, internal procedures, and clinical protocols. That question doesn't seem to relate to those topics. Please ask a question about compliance, policies, or HealthCore operations.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "input_guardrail → BLOCKED (out_of_domain)"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:38:52.520786+00:00",
+      "metadata": {
+        "question_length": 21
+      }
+    },
+    {
+      "node": "input_guardrail",
+      "status": "blocked",
+      "timestamp": "2026-11-23T07:38:52.523201+00:00",
+      "metadata": {
+        "classification": "out_of_domain",
+        "blocked": true,
+        "confidence": 0.7,
+        "reason": "Input does not match any HealthCore domain pattern, jailbreak, personal task, or small talk classification."
+      }
+    }
+  ],
+  "num_chunks_retrieved": 0,
+  "final_answer_length": 243,
+  "timestamp": "2026-11-23T07:38:52.524179+00:00"
+}

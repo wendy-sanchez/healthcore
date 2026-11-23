@@ -1,0 +1,106 @@
+{
+  "run_id": "7de1c7dd-22be-4b6f-aab4-56f02e29cd50",
+  "question": "Según la política de cancelación, ¿el ticket 2 debería tener cargo?",
+  "answer": "I generated a response that appears to contain protected information. Please rephrase your question or contact Claire Whitfield's team directly.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "input_guardrail → OK",
+    "check_pending_proposal → continue (sin propuesta pendiente)",
+    "classify_query → rag+incident",
+    "query_incident → 1 resultado(s)",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada con harness)",
+    "synthesize_tool_answer → respuesta (1 resultado(s))",
+    "output_guardrail → fallback (1 issue(s))"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.516462+00:00",
+      "metadata": {
+        "question_length": 67
+      }
+    },
+    {
+      "node": "input_guardrail",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.517880+00:00",
+      "metadata": {
+        "classification": "domain",
+        "blocked": false,
+        "confidence": 0.9,
+        "reason": "Input is within the HealthCore compliance domain."
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.518958+00:00",
+      "metadata": {
+        "num_memory_facts": 5,
+        "has_pending_proposal": false
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.519908+00:00",
+      "metadata": {
+        "decision": "rag+incident",
+        "has_incident": true,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "query_incident",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.520803+00:00",
+      "metadata": {
+        "num_results": 1
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.521596+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.522564+00:00",
+      "metadata": {
+        "answer_length": 439,
+        "llm_proposal": false,
+        "harness_active": true
+      }
+    },
+    {
+      "node": "synthesize_tool_answer",
+      "status": "ok",
+      "timestamp": "2026-11-23T07:28:45.523466+00:00",
+      "metadata": {
+        "decision": "rag+incident",
+        "num_results": 1
+      }
+    },
+    {
+      "node": "output_guardrail",
+      "status": "fallback",
+      "timestamp": "2026-11-23T07:28:45.525649+00:00",
+      "metadata": {
+        "issues": [
+          "phi_in_output"
+        ]
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 144,
+  "timestamp": "2026-11-23T07:28:45.526142+00:00"
+}

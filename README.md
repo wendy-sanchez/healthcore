@@ -30,6 +30,7 @@
 | 12 | **LangGraph Support Agent** — Decision graph wrapping RAG pipeline with explicit state, checkpointing, tracing, and HTTP endpoint | LangGraph 1.2.22, MemorySaver, httpx | ✅ Complete |
 | 13 | **LangGraph Agent — External Tools** — Added real-time incident and inventory query tools. Auto-routing between RAG, tools, or both via regex classification (no LLM). 5s timeout, honest fallback. 32 tests. | LangGraph, httpx, regex | ✅ Complete |
 | 14 | **MCP Server — OAuth-Protected Tools** — Model Context Protocol server exposing Incidents (5 tools) and Inventory (5 tools) as MCP tools, protected with OAuth 2.1 Resource Server via mcpauth. Inventory write operations explicitly rejected (RETO 2). LangGraph agent integrated via langchain-mcp-adapters. 9/9 acceptance criteria. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Complete |
+| 15 | **LangGraph Agent — Persistent Memory + Guardrails** — Agent learns from interaction without accumulating junk forever. TinyDB-backed memory (separate from RAG), dual PHI validation (8 HIPAA+UK GDPR patterns), explicit user approval required (never assumed), lexical intent classifier (no LLM), single pending proposal, full audit trail (8 event types), automatic consolidation (threshold 50 facts, TTL 90 days). **Plus**: 3-layer deterministic guardrails (regex, no LLM): system prompt hardening (5 rules), input classification (6 categories, ~100 patterns), output validation (PHI/instruction leak/format). RAG content isolation markers. Graph integration with 2 guardrail nodes + observability. 62 guardrail tests + 94 agent/graph tests = 286 total. 11/11 acceptance criteria. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Complete |
 
 ---
 
@@ -46,7 +47,7 @@ services/                   # Backend services
 ├── incidents-api/          #   Incidents FastAPI (port 8010) — standalone
 ├── reporting/              #   Reporting FastAPI (port 8001) — monthly KPIs
 ├── telemetry/              #   Telemetry analysis + standalone auth server
-├── agent/                  #   LangGraph agent — graph, tools, routes
+├── agent/                  #   LangGraph agent — graph, tools, memory, guardrails
 ├── celery_app.py           #   Celery app — async task definitions
 ├── nightly/                #   Nightly export job — background process
 └── job_runner.py           #   State machine for job orchestration
@@ -147,15 +148,20 @@ docker compose up --build    # Builds and starts all services
 
 ## 🧠 LangGraph Agent — Key Details
 
-The support agent is implemented as a LangGraph `StateGraph` with **10 nodes** and **7 conditional routers**. It reuses existing RAG functions (`retrieve`, `generate_answer`) without rewriting them.
+The support agent is implemented as a LangGraph `StateGraph` with **13 nodes** and **8 conditional routers**. It reuses existing RAG functions (`retrieve`, `generate_answer`) without rewriting them.
 
-**Nodes:** `receive_question` → `classify_query` → (tool and/or RAG) → `synthesize_tool_answer` / `generate_answer` → END
+**Main Flow:** `receive_question` → `load_memory_context` → (process_proposal / `classify_query`) → (tool and/or RAG) → `synthesize_tool_answer` / `generate_answer` → `auto_evaluate_memory` → END
 
 - **Classification:** Regex-based (no LLM needed). Decides between RAG, incident tool, inventory tool, or a combination.
 - **Tools:** Read-only (GET). Query real incident and inventory services. 5s timeout. All errors produce honest fallback responses.
+- **Persistent Memory (Part 1):** The agent can remember operational facts across conversations (staff preferences, incident patterns, operational settings) with explicit user control. Uses TinyDB (separate from RAG), dual PHI validation, lexical intent classifier (no LLM), and auto-consolidates/expires old facts. 113 agent+memory tests in test_agent_graph.py.
+- **Harness & Guardrails (Part 2):** Three-layer deterministic (regex, no LLM) safety system documented in [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md):
+  - **Harness** — Secure system prompt generation (`build_system_prompt`) with identity, domain, 5 hard behavior rules, and RAG content isolation (`wrap_rag_context` via `--- BEGIN/END REFERENCE DOCUMENTS ---` markers).
+  - **Content Guardrail** — Input scope classification (`classify_input_scope`) into 6 categories (domain, small_talk, personal_task, jailbreak, phi_in_query, gradual_extraction) using ~100 regex patterns. No LLM involved.
+  - **Output Guardrail** — Response validation (`validate_output`) checking for PHI leaks, instruction leaks, forbidden terms, and format compliance. 62 deterministic tests (with parametrisation).
 - **Tracing:** Each run produces a JSON trace persisted to `services/agent/traces/{run_id}.json`.
 - **Endpoint:** `POST /agent/query` (thin FastAPI layer — no business logic).
-- **Docs:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md) (Spanish).
+- **Docs:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md) (Spanish), [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md).
 
 ---
 
@@ -209,16 +215,21 @@ Retrieval-Augmented Generation over 4 HealthCore policy documents. Embedded with
 | [`message-queues-asyns-task.md`](./message-queues-asyns-task.md) | Asynchronous Task Queue — Redis + Celery |
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Overall architecture proposal |
 | [`mcp-server.md`](./mcp-server.md) | MCP Server — OAuth-protected tools, architecture, setup |
-| [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns |
+| [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | LangGraph Agent Persistent Memory + Harness & Guardrails — architecture, system prompt hardening, 3-layer deterministic safety, flow diagrams |
+| [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns, tech decisions |
 
 ---
 
 ## 🧪 Testing Philosophy
 
 - **Pipeline tests** (`tests/pipelines/`) cover agent, RAG, and sales forecast — all runnable with `uv run python -m pytest`
-- Agent tests include: graph compilation, conditional routing, traceability, grounded RAG behavior, tool routing (5 tests), tool fallback behavior (5 tests), and mixed synthesis (2 tests)
-- All test suites pass as gate before feature branches merge
-- Audit-driven development: each deliverable has verifiable acceptance criteria
+- Agent tests include: graph compilation, conditional routing, traceability, grounded RAG behavior, tool routing (5 tests), tool fallback behavior (5 tests), mixed synthesis (2 tests), 113 agent+memory tests (PHI validation, store CRUD, intent classification, pipeline orchestration, graph integration), and 12 harness integration tests
+- **Guardrail tests** (`tests/pipelines/test_guardrails.py`): 62 deterministic tests (with parametrisation) covering the **Harness** (system prompt structure, RAG isolation, jailbreak defenses), **Content Guardrail** (all 6 scope categories), and **Output Guardrail** (PHI, instruction leaks, format). All are pure Python — no LLM, no network, no database.
+- **Total agent suite**: 125 graph tests + 62 guardrail tests = **187 tests** covering both memory and safety layers.
+  - All agent + guardrail tests pass as gate before feature branches merge.
+  - Memory system: 11/11 acceptance criteria verified via audit.
+  - Harness & guardrails: 3 deterministic modules (system prompt, content guard, output guard), 62 tests (with parametrisation), 6 input scope categories, ~100 regex patterns — all LLM-free
+  - Audit-driven development: each deliverable has verifiable acceptance criteria
 
 
 ---

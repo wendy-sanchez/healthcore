@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Classifier — Test en Vivo</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0d1117; color: #c9d1d9;
+  padding: 2rem; max-width: 800px; margin: auto;
+}
+h1 { color: #58a6ff; margin-bottom: 0.5rem; }
+p { color: #8b949e; margin-bottom: 1.5rem; }
+.endpoint {
+  background: #161b22; border-radius: 8px;
+  padding: 0.5rem 1rem; margin-bottom: 1.5rem;
+  font-family: monospace; font-size: 0.9rem;
+  color: #7ee787;
+}
+.fila { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+.fila input {
+  flex: 1; padding: 0.6rem 1rem; border-radius: 6px;
+  border: 1px solid #30363d; background: #0d1117;
+  color: #c9d1d9; font-size: 1rem;
+}
+.fila button {
+  padding: 0.6rem 1.5rem; border-radius: 6px;
+  border: none; background: #238636; color: #fff;
+  font-weight: 600; cursor: pointer; font-size: 1rem;
+}
+.fila button:hover { background: #2ea043; }
+#resultado {
+  background: #161b22; border-radius: 8px;
+  padding: 1rem; white-space: pre-wrap;
+  font-family: monospace; font-size: 0.9rem;
+  min-height: 120px; border: 1px solid #30363d;
+}
+.rapidos {
+  display: flex; flex-wrap: wrap; gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+.rapidos button {
+  padding: 0.3rem 0.8rem; border-radius: 4px;
+  border: 1px solid #30363d; background: #21262d;
+  color: #c9d1d9; cursor: pointer; font-size: 0.85rem;
+}
+.rapidos button:hover { background: #30363d; border-color: #58a6ff; }
+.tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; margin-right: 0.3rem; }
+.tag.approve { background: #23863633; color: #7ee787; border: 1px solid #238636; }
+.tag.reject { background: #da363333; color: #ff7b72; border: 1px solid #da3633; }
+.tag.discard { background: #d2992233; color: #d29922; border: 1px solid #d29922; }
+.tag.edit { background: #58a6ff33; color: #58a6ff; border: 1px solid #58a6ff; }
+.tag.no_proposal { background: #8b949e33; color: #8b949e; border: 1px solid #8b949e; }
+.tag.phi_rejected { background: #f9758333; color: #f97583; border: 1px solid #f97583; }
+.tag.unrelated { background: #7ee78733; color: #7ee787; border: 1px solid #7ee787; }
+</style>
+</head>
+<body>
+<h1>🧠 Memory Classifier — Test en Vivo</h1>
+<p>Escribe o haz clic en un caso de prueba para ver cómo clasifica el agente.</p>
+<div class="endpoint">🧪 Servidor del clasificador de memoria — haz clic o escribe un mensaje</div>
+
+<div class="rapidos">
+  <button onclick="probar('no lo guardes')">no lo guardes</button>
+  <button onclick="probar('sí, pero no lo guardes')">sí, pero no lo guardes</button>
+  <button onclick="probar('sí, pero no')">sí, pero no</button>
+  <button onclick="probar('sí, no')">sí, no</button>
+  <button onclick="probar('no la grabes')">no la grabes</button>
+  <button onclick="probar('no los apuntes')">no los apuntes</button>
+  <button onclick="probar('no me recuerdes')">no me recuerdes</button>
+  <button onclick="probar('sí, guárdalo')">sí, guárdalo ✅</button>
+  <button onclick="probar('guárdalo por favor')">guárdalo por favor ✅</button>
+  <button onclick="probar('no gracias')">no gracias</button>
+  <button onclick="probar('está bien')">está bien ✅</button>
+</div>
+
+<div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:1rem; font-size:0.85rem;">
+  <button onclick="resetPropuesta()" style="padding:0.3rem 0.8rem; border-radius:4px; border:1px solid #58a6ff; background:#1f6feb33; color:#58a6ff; cursor:pointer;">🔄 Generar propuesta de prueba</button>
+  <span id="propuestaStatus" style="color:#8b949e;">Esperando...</span>
+</div>
+
+<div class="fila">
+  <input type="text" id="mensaje" placeholder="Ej: no lo guardes"
+    onkeydown="if(event.key==='Enter') probar(this.value)">
+  <button onclick="probar(document.getElementById('mensaje').value)">🔍 Probar</button>
+</div>
+
+<pre id="resultado">Esperando tu primer mensaje...</pre>
+
+<script>
+const BASE = '';  // mismo origen
+const COLORS = { approve: '#7ee787', reject: '#ff7b72', discard: '#d29922', edit: '#58a6ff', no_proposal: '#8b949e', phi_rejected: '#f97583', unrelated: '#7ee787' };
+
+async function probar(msg) {
+  if (!msg.trim()) return;
+  const el = document.getElementById('resultado');
+  el.textContent = '⏳ Clasificando...';
+  document.getElementById('mensaje').value = msg;
+  try {
+    const r = await fetch(`${BASE}/classify`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: msg})
+    });
+    if (!r.ok) {
+      el.textContent = `❌ Error HTTP ${r.status}: ${r.statusText}\n\nAbre la consola (F12) para más detalles.`;
+      return;
+    }
+    const data = await r.json();
+    const color = COLORS[data.intent] || '#8b949e';
+
+    let ejes = '';
+    for (const [k,v] of Object.entries(data.axes || {})) {
+      let val;
+      if (typeof v === 'boolean') val = v ? '✅' : '⬜';
+      else if (typeof v === 'number') val = v.toFixed(1);
+      else val = v;
+      ejes += `    ${k.padEnd(20)} → ${val}\n`;
+    }
+
+    el.innerHTML =
+      `<span class="tag ${data.intent}">${data.intent.toUpperCase()}</span> confianza: ${data.confidence.toFixed(2)}\n\n` +
+      `📝 "${data.message}"\n\n` +
+      `🤖 ${data.explanation}\n\n` +
+      `📊 Ejes analíticos:\n${ejes}`;
+    
+    // Regenerar propuesta en segundo plano SIN tocar el resultado
+    regenerarPropuesta();
+  } catch (err) {
+    el.textContent = `❌ Error: ${err.message}`;
+  }
+}
+
+// Regenera la propuesta pendiente sin modificar el resultado mostrado
+async function regenerarPropuesta() {
+  try {
+    const r = await fetch(`${BASE}/reset`, { method: 'POST' });
+    const data = await r.json();
+    if (r.ok) {
+      const status = document.getElementById('propuestaStatus');
+      status.innerHTML = '✅ Propuesta activa: <i>"' + (data.proposal || 'El usuario prefiere no guardar información') + '"</i>';
+    }
+  } catch (_) {
+    // No interrumpir al usuario si falla la regeneración
+  }
+}
+
+async function resetPropuesta() {
+  const status = document.getElementById('propuestaStatus');
+  const resultado = document.getElementById('resultado');
+  status.textContent = '⏳ Creando propuesta de prueba...';
+  resultado.textContent = '⏳ Creando propuesta de prueba...';
+  try {
+    const r = await fetch(`${BASE}/reset`, { method: 'POST' });
+    const data = await r.json();
+    if (r.ok) {
+      status.innerHTML = '✅ Propuesta activa: <i>"' + (data.proposal || 'El usuario prefiere no guardar información') + '"</i>';
+      resultado.innerHTML = '✅ Propuesta de prueba creada.<br><br>Ahora escribe o haz clic en un caso para clasificarlo.';
+    } else {
+      status.textContent = '❌ Error al crear propuesta: ' + (data.detail || 'desconocido');
+      resultado.textContent = '❌ ' + status.textContent;
+    }
+  } catch (err) {
+    status.textContent = '❌ Error de conexión: ' + err.message;
+    resultado.textContent = '❌ Error de conexión: ' + err.message;
+  }
+}
+
+// Al cargar la página, intentar reset
+window.addEventListener('DOMContentLoaded', resetPropuesta);
+</script>
+</body>
+</html>

@@ -13,6 +13,14 @@ Parte 2 (tools externas):
   - Todas las tools tienen timeout (5s) y ruta de fallback explícita.
   - El trace muestra si se usó RAG, tool, o ambos, y en qué orden.
 
+Parte 3 (memoria — Hito 8·1):
+  - Memoria persistente con TinyDB, clasificador estructural, auto-evaluación LLM.
+
+Parte 4 (harness y guardrails — Hito 8·2):
+  - Input guardrail: clasifica alcance (domain / jailbreak / personal / PHI).
+  - System prompt separado (system role, no user message).
+  - Output guardrail: valida formato, sin PHI, sin instrucciones filtradas.
+
 Principios:
   - Estado mínimo y explícito.
   - Nodos con responsabilidad única.
@@ -34,7 +42,7 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 # Reutilizamos las funciones RAG existentes — sin duplicar lógica.
-from data.pipelines.rag import generate_answer, retrieve
+from data.pipelines.rag import generate_answer, generate_answer_with_memory, retrieve
 
 # Tools externas (Parte 2) — MCP Client
 from services.agent.tools.mcp_client import (
@@ -43,6 +51,29 @@ from services.agent.tools.mcp_client import (
     query_product_by_id,
     query_products_list,
 )
+
+# Módulo de memoria (Hito 8)
+from services.agent.memory.nodes import (
+    node_auto_evaluate_memory,
+    node_load_memory_context,
+    node_process_proposal,
+    route_after_auto_evaluate,
+    route_after_load_memory,
+    route_after_process_proposal,
+)
+from services.agent.memory.store import get_all_facts
+
+# Guardrails (Hito 8 · Parte 2)
+from services.agent.guardrails import (
+    classify_input_scope,
+    GuardResult,
+    ScopeClassification,
+    validate_output,
+    OutputValidationResult,
+    build_system_prompt,
+    wrap_rag_context,
+)
+from services.agent.guardrails.content_guard import _RESPONSES as GUARDRAIL_RESPONSES
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +110,16 @@ class AgentState(TypedDict):
                           "rag+incident" | "rag+inventory" | ""
         tool_results:     Resultados normalizados de las tools.
         tool_errors:      Errores de las tools (fallback).
+
+    Atributos (Parte 3 — memoria Hito 8):
+        memory_facts:             Hechos de memoria cargados.
+        memory_context:           Contexto de memoria formateado para prompt.
+        memory_proposal:          Propuesta pendiente (dict) o None.
+        memory_proposal_handled:  Si la propuesta pendiente ya se procesó.
+        memory_proposal_handled_text: Texto de confirmación de manejo.
+        memory_proposal_result:   Resultado del procesamiento de propuesta.
+        llm_memory_proposal:     Propuesta generada por el LLM en la misma llamada (salida estructurada).
+        run_id:                   Identificador único de la corrida (para auditoría).
     """
 
     question: str
@@ -92,9 +133,22 @@ class AgentState(TypedDict):
     routing_decision: str
     tool_results: Annotated[list[dict[str, Any]], _accumulate_list]
     tool_errors: Annotated[list[str], _accumulate_list]
+    # Parte 3 — Memoria (Hito 8)
+    memory_facts: list[dict[str, Any]]
+    memory_context: str
+    memory_proposal: Optional[dict[str, Any]]
+    memory_proposal_handled: bool
+    memory_proposal_handled_text: str
+    memory_proposal_result: Optional[dict[str, Any]]
+    llm_memory_proposal: Optional[dict[str, Any]]
+    run_id: str
+    # Parte 4 — Guardrails (Hito 8 · Parte 2)
+    guardrail_result: Optional[dict[str, Any]]
+    guardrail_blocked: bool
+    guardrail_response: str
 
 
-def build_initial_state(question: str) -> AgentState:
+def build_initial_state(question: str, run_id: str = "") -> AgentState:
     """Construye el estado inicial para una nueva corrida del grafo."""
     return AgentState(
         question=question.strip(),
@@ -107,6 +161,19 @@ def build_initial_state(question: str) -> AgentState:
         routing_decision="",
         tool_results=[],
         tool_errors=[],
+        # Memoria (Hito 8)
+        memory_facts=[],
+        memory_context="",
+        memory_proposal=None,
+        memory_proposal_handled=True,
+        memory_proposal_handled_text="",
+        memory_proposal_result=None,
+        llm_memory_proposal=None,
+        run_id=run_id,
+        # Guardrails (Hito 8 · Parte 2)
+        guardrail_result=None,
+        guardrail_blocked=False,
+        guardrail_response="",
     )
 
 
@@ -193,6 +260,53 @@ def node_receive_question(state: AgentState) -> dict[str, Any]:
     }
 
 
+def node_input_guardrail(state: AgentState) -> dict[str, Any]:
+    """Guarda de entrada: clasifica la pregunta y bloquea si es necesario.
+
+    Evalúa la pregunta del usuario contra los guardrails de contenido:
+      - Jailbreak: bloquea con mensaje firme.
+      - PHI en input: bloquea y pide reformulación.
+      - Personal task: bloquea y redirige.
+      - Gradual extraction: bloquea y redirige.
+      - Small talk: no bloquea, pero se clasifica.
+      - Domain query: permite continuar.
+
+    Si se bloquea, establece ``guardrail_blocked=True`` y una respuesta
+    predefinida en ``guardrail_response`` para que el grafo pueda enrutar
+    directamente a un nodo terminal sin llamar al LLM.
+    """
+    question = state.get("question", "")
+    result: GuardResult = classify_input_scope(question)
+
+    log_entry = {
+        "classification": result.classification.value,
+        "blocked": result.blocked,
+        "confidence": result.confidence,
+        "reason": result.reason,
+    }
+    logger.info("INPUT GUARDRAIL: %s", log_entry)
+
+    updates: dict[str, Any] = {
+        "guardrail_result": log_entry,
+        "guardrail_blocked": result.blocked,
+        "guardrail_response": result.response or "",
+        "trace_events": [_make_trace_event(
+            "input_guardrail",
+            "blocked" if result.blocked else "ok",
+            log_entry,
+        )],
+        "routing_log": [
+            f"input_guardrail → {'BLOCKED (' + result.classification.value + ')' if result.blocked else 'OK'}"
+        ],
+    }
+
+    # If blocked, set answer directly so terminal nodes can use it
+    if result.blocked and result.response:
+        updates["answer"] = result.response
+
+    return updates
+
+
 def node_retrieve_context(state: AgentState) -> dict[str, Any]:
     """Ejecuta retrieve() sobre la base de conocimiento Qdrant.
 
@@ -230,14 +344,25 @@ def node_retrieve_context(state: AgentState) -> dict[str, Any]:
 
 
 def node_generate_answer(state: AgentState) -> dict[str, Any]:
-    """Genera la respuesta final a partir del contexto ya recuperado.
+    """Genera la respuesta final y evalúa memoria en una sola llamada LLM.
 
-    Reutiliza ``data.pipelines.rag.generate_answer(question, context)``
-    con los chunks que el nodo retrieve_context ya produjo.
-    NO ejecuta retrieve() internamente.
+    Usa ``generate_answer_with_memory()`` en lugar de ``generate_answer()``
+    para que el LLM decida si hay algo memorable (salida estructurada)
+    en la misma llamada que genera la respuesta.
+
+    El resultado de la auto-evaluación del LLM se almacena en
+    ``llm_memory_proposal`` para que el nodo ``auto_evaluate_memory``
+    lo procese directamente, sin duplicar heurísticas post-hoc.
+
+    **Harness integration** (Hito 8·2):
+      - El system prompt se construye con ``build_system_prompt()`` y se envía
+        como mensaje ``system`` (rol separado, no mezclado con user).
+      - El contexto RAG se envuelve con ``wrap_rag_context()`` para aislarlo
+        del system prompt.
     """
     question = state["question"]
     chunks = state.get("retrieved_chunks", [])
+    memory_facts = state.get("memory_facts", [])
 
     if not chunks:
         return {
@@ -250,21 +375,65 @@ def node_generate_answer(state: AgentState) -> dict[str, Any]:
             "trace_events": [_make_trace_event("generate_answer", "fallback", {"reason": "empty_context"})],
         }
 
-    try:
-        answer = generate_answer(question=question, context=chunks)
-    except RuntimeError as exc:
-        return {
-            "error": f"Error al generar la respuesta: {exc}",
-            "answer": "",
-            "routing_log": ["generate_answer → error"],
-            "trace_events": [_make_trace_event("generate_answer", "error", {"error": str(exc)})],
-        }
+    # ── Build harness system prompt ──────────────────────────────────
+    system_instructions = build_system_prompt()
 
-    return {
+    # ── Wrap RAG context with isolation markers ──────────────────────
+    # Convert chunks to a single context string, then wrap it.
+    raw_context = _build_context_from_chunks(chunks)
+    isolated_context = wrap_rag_context(raw_context)
+
+    memory_prompt_state = (
+        state.get("memory_context", "")
+        or _build_memory_context_text(memory_facts)
+    )
+
+    # Reconstruct chunks as a list with the *wrapped* text so the
+    # callers (generate_answer / generate_answer_with_memory) get
+    # the isolated version.
+    wrapped_chunks: list[dict[str, Any]] = [
+        {"text": isolated_context, "source_document": "rag_harness", "section": "isolated"}
+    ]
+
+    try:
+        answer, llm_proposal = generate_answer_with_memory(
+            question=question,
+            context=wrapped_chunks,
+            memory_facts=memory_facts,
+            system_role_message=system_instructions,
+        )
+    except RuntimeError as exc:
+        # Fallback: usar generate_answer tradicional (sin harness)
+        logger.warning("generate_answer_with_memory falló, usando fallback: %s", exc)
+        try:
+            answer = generate_answer(
+                question=question,
+                context=wrapped_chunks,
+                system_role_message=system_instructions,
+            )
+            llm_proposal = None
+        except RuntimeError as exc2:
+            return {
+                "error": f"Error al generar la respuesta: {exc2}",
+                "answer": "",
+                "routing_log": ["generate_answer → error"],
+                "trace_events": [_make_trace_event("generate_answer", "error", {"error": str(exc2)})],
+            }
+
+    result: dict[str, Any] = {
         "answer": answer,
-        "routing_log": ["generate_answer → END (respuesta generada)"],
-        "trace_events": [_make_trace_event("generate_answer", "ok", {"answer_length": len(answer)})],
+        "llm_memory_proposal": llm_proposal,
+        "routing_log": [
+            "generate_answer → END (respuesta generada con harness)",
+        ],
+        "trace_events": [_make_trace_event("generate_answer", "ok", {
+            "answer_length": len(answer),
+            "llm_proposal": llm_proposal is not None,
+            "harness_active": True,
+        })],
     }
+
+    return result
 
 
 def node_respond_no_info(state: AgentState) -> dict[str, Any]:
@@ -282,6 +451,48 @@ def node_respond_no_info(state: AgentState) -> dict[str, Any]:
         ),
         "routing_log": ["respond_no_info → END (sin información disponible)"],
         "trace_events": [_make_trace_event("respond_no_info", "ok")],
+    }
+
+
+def node_output_guardrail(state: AgentState) -> dict[str, Any]:
+    """Guarda de salida: valida la respuesta antes de devolverla al usuario.
+
+    Verifica:
+      1. Formato (no vacía, no demasiado larga).
+      2. Sin instrucciones internas filtradas.
+      3. Sin PHI ni datos confidenciales.
+
+    Si la validación falla, reemplaza la respuesta con un fallback seguro.
+    """
+    answer = state.get("answer", "")
+
+    validation: OutputValidationResult = validate_output(answer)
+
+    if not validation.valid:
+        logger.warning(
+            "OUTPUT GUARDRAIL: %d issue(s) found, using safe fallback.",
+            len(validation.issues),
+        )
+        return {
+            "answer": validation.safe_response,
+            "routing_log": [
+                f"output_guardrail → fallback ({len(validation.issues)} issue(s))"
+            ],
+            "trace_events": [_make_trace_event(
+                "output_guardrail",
+                "fallback",
+                {"issues": [i["type"] for i in validation.issues]},
+            )],
+        }
+
+    logger.info("OUTPUT GUARDRAIL: OK (%d chars)", len(answer))
+    return {
+        "routing_log": ["output_guardrail → OK"],
+        "trace_events": [_make_trace_event(
+            "output_guardrail",
+            "ok",
+            {"answer_length": len(answer)},
+        )],
     }
 
 
@@ -718,20 +929,62 @@ def _format_inventory_response(products: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# ── Helpers para el harness (Hito 8·2) ──────────────────────────────
+
+
+def _build_context_from_chunks(chunks: list[dict[str, Any]]) -> str:
+    """Convierte una lista de chunks RAG en un único string de contexto.
+
+    Reimplementación local de ``data.pipelines.rag._build_context`` para
+    evitar importar una función privada.
+    """
+    parts: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        parts.append(
+            f"[Fuente {i}: {chunk.get('source_document', 'desconocida')} "
+            f"— {chunk.get('section', 'general')}]\n"
+            f"{chunk.get('text', '')}"
+        )
+    return "\n\n".join(parts)
+
+
+def _build_memory_context_text(memory_facts: list[dict[str, Any]]) -> str:
+    """Construye un string de contexto de memoria a partir de los facts."""
+    if not memory_facts:
+        return ""
+    lines = ["Hechos recordados:"]
+    for f in memory_facts:
+        lines.append(f"- {f.get('content', '')}")
+    return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 4.  Aristas condicionales — decisiones de enrutamiento explícitas
 # ──────────────────────────────────────────────────────────────────────
 
 
-def route_after_receive(state: AgentState) -> Literal["classify_query", "__end__"]:
+def route_after_receive(state: AgentState) -> Literal["input_guardrail", "__end__"]:
     """Decide el siguiente paso después de validar la pregunta.
 
-    Ahora enruta a ``classify_query`` en lugar de directamente a
-    ``retrieve_context``. La clasificación decide si toca RAG, tool, o ambos.
+    Ahora enruta a ``input_guardrail`` (Hito 8·2) para clasificar el
+    alcance de la pregunta antes de continuar.
+    Si la pregunta es inválida, termina.
     """
     if state.get("error") or not state.get("question_valid", True):
         return "__end__"
-    return "classify_query"
+    return "input_guardrail"
+
+
+def route_after_input_guardrail(state: AgentState) -> Literal["load_memory_context", "__end__"]:
+    """Después del guardrail de entrada: ¿bloqueado o continuar?
+
+    Si el guardrail bloqueó la consulta (jailbreak, PHI, personal task),
+    termina el grafo con la respuesta predefinida.
+    Si no, continúa con la carga de memoria contextual.
+    """
+    if state.get("guardrail_blocked", False):
+        return "__end__"
+    return "load_memory_context"
 
 
 def route_after_classify(state: AgentState) -> str:
@@ -799,11 +1052,12 @@ def route_after_retrieve_v2(state: AgentState) -> str:
     return "respond_no_info"
 
 
-def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesize_tool_answer", "__end__"]:
+def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesize_tool_answer", "auto_evaluate_memory", "__end__"]:
     """Después de generar la respuesta RAG, verifica si hay tools pendientes.
 
     Si la decisión original incluía tools y hay tool_results o tool_errors,
-    enruta a synthesize_tool_answer para combinar.  Si no, va a END.
+    enruta a synthesize_tool_answer para combinar.  Si no, enruta a
+    auto_evaluate_memory para evaluar si hay algo memorable que proponer.
     """
     if state.get("error"):
         return "handle_error"
@@ -815,7 +1069,29 @@ def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesi
     if (has_tool_results or has_tool_errors) and decision in ("rag+incident", "rag+inventory"):
         return "synthesize_tool_answer"
 
-    return "__end__"
+    # Siempre pasar por auto-evaluación de memoria
+    return "auto_evaluate_memory"
+
+
+def route_after_synthesis(state: AgentState) -> Literal["auto_evaluate_memory", "__end__"]:
+    """Después de sintetizar la respuesta de tools, siempre va a auto-evaluación.
+
+    NUNCA vuelve a synthesize_tool_answer para evitar bucles infinitos.
+    """
+    if state.get("error"):
+        return "__end__"
+    return "auto_evaluate_memory"
+
+
+def route_after_auto_evaluate_v2(state: AgentState) -> Literal["output_guardrail", "__end__"]:
+    """Después de auto-evaluación de memoria, pasa por el guardrail de salida.
+
+    El output_guardrail valida formato, PHI e instrucciones filtradas
+    antes de devolver la respuesta al usuario.
+    """
+    if state.get("error"):
+        return "__end__"
+    return "output_guardrail"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -823,7 +1099,7 @@ def route_after_generate(state: AgentState) -> Literal["handle_error", "synthesi
 # ──────────────────────────────────────────────────────────────────────
 
 def _build_graph() -> StateGraph:
-    """Construye el grafo con todos los nodos y aristas (Parte 1 + Parte 2).
+    """Construye el grafo con todos los nodos y aristas (Parte 1–4).
 
     Esta función es invocada una sola vez en tiempo de importación.
     Cualquier error estructural (nodo sin conectar, estado mal tipado)
@@ -844,13 +1120,54 @@ def _build_graph() -> StateGraph:
     workflow.add_node("query_inventory", node_query_inventory)
     workflow.add_node("synthesize_tool_answer", node_synthesize_tool_answer)
 
+    # ── Nodos de memoria (Parte 3 — Hito 8) ──────────────────────────
+    workflow.add_node("load_memory_context", node_load_memory_context)
+    workflow.add_node("process_proposal", node_process_proposal)
+    workflow.add_node("auto_evaluate_memory", node_auto_evaluate_memory)
+
+    # ── Nodos de guardrails (Parte 4 — Hito 8·2) ─────────────────────
+    workflow.add_node("input_guardrail", node_input_guardrail)
+    workflow.add_node("output_guardrail", node_output_guardrail)
+
     # Arista de entrada: el grafo arranca validando la pregunta
     workflow.set_entry_point("receive_question")
 
-    # ── Aristas condicionales (Parte 1 adaptadas) ────────────────────
+    # ── Aristas condicionales (Parte 1 + guardrail de entrada) ───────
+    # receive → input_guardrail
     workflow.add_conditional_edges(
         "receive_question",
         route_after_receive,
+        {
+            "input_guardrail": "input_guardrail",
+            "__end__": END,
+        },
+    )
+
+    # input_guardrail → load_memory_context (si no bloqueado) o END
+    workflow.add_conditional_edges(
+        "input_guardrail",
+        route_after_input_guardrail,
+        {
+            "load_memory_context": "load_memory_context",
+            "__end__": END,
+        },
+    )
+
+    # ── Aristas de memoria (Parte 3) ──────────────────────────────────
+    # Después de cargar memoria: ¿propuesta pendiente o continuar?
+    workflow.add_conditional_edges(
+        "load_memory_context",
+        route_after_load_memory,
+        {
+            "process_proposal": "process_proposal",
+            "classify_query": "classify_query",
+        },
+    )
+
+    # Después de procesar propuesta: ¿continuar o terminar?
+    workflow.add_conditional_edges(
+        "process_proposal",
+        route_after_process_proposal,
         {
             "classify_query": "classify_query",
             "__end__": END,
@@ -901,20 +1218,44 @@ def _build_graph() -> StateGraph:
     )
 
     # Después de generate_answer: ¿tools pendientes o END?
+    # También enruta a auto_evaluate_memory si no hay tools
     workflow.add_conditional_edges(
         "generate_answer",
         route_after_generate,
         {
             "handle_error": "handle_error",
             "synthesize_tool_answer": "synthesize_tool_answer",
+            "auto_evaluate_memory": "auto_evaluate_memory",
             "__end__": END,
         },
     )
 
-    # Nodos terminales
-    workflow.add_edge("respond_no_info", END)
-    workflow.add_edge("handle_error", END)
-    workflow.add_edge("synthesize_tool_answer", END)
+    # Nodos de respuesta con/sin info → output_guardrail
+    workflow.add_edge("respond_no_info", "output_guardrail")
+    workflow.add_edge("handle_error", "output_guardrail")
+
+    # Síntesis de tool_answer → auto-evaluación (NUNCA volver a síntesis)
+    workflow.add_conditional_edges(
+        "synthesize_tool_answer",
+        route_after_synthesis,
+        {
+            "auto_evaluate_memory": "auto_evaluate_memory",
+            "__end__": END,
+        },
+    )
+
+    # Auto-evaluación → output_guardrail (Hito 8·2)
+    workflow.add_conditional_edges(
+        "auto_evaluate_memory",
+        route_after_auto_evaluate_v2,
+        {
+            "output_guardrail": "output_guardrail",
+            "__end__": END,
+        },
+    )
+
+    # Output guardrail → END (nodo terminal final)
+    workflow.add_edge("output_guardrail", END)
 
     return workflow
 
@@ -965,6 +1306,12 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
     Llama al grafo compilado vía ainvoke, lo que permite que los nodos
     asíncronos (query_incident, query_inventory) funcionen correctamente.
 
+    El grafo ahora incluye:
+      - Carga de memoria contextual (hechos recordados)
+      - Procesamiento de propuestas pendientes de conversaciones anteriores
+      - Auto-evaluación al final para detectar nuevos hechos memorables
+      - Trazabilidad completa de todas las operaciones
+
     Args:
         question: Pregunta del usuario.
         run_id:   Identificador único para esta corrida (opcional).
@@ -972,7 +1319,7 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
 
     Returns:
         El estado final del grafo, incluyendo answer, trace_events y
-        routing_log.
+        routing_log, y metadata de memoria.
 
     Raises:
         ValueError: Si la pregunta está vacía o es demasiado corta.
@@ -991,7 +1338,7 @@ async def run_agent(question: str, run_id: str | None = None) -> AgentState:
         import uuid
         run_id = str(uuid.uuid4())
 
-    initial_state = build_initial_state(question)
+    initial_state = build_initial_state(question, run_id=run_id)
 
     # Configuración de la corrida con thread_id para checkpointing
     config = {
@@ -1051,3 +1398,71 @@ def list_traces(limit: int = 20) -> list[dict[str, Any]]:
             "timestamp": data.get("timestamp"),
         })
     return result
+
+
+def guardrail_summary(limit: int = 100) -> dict[str, Any]:
+    """Resumen de activaciones de guardrails en las últimas N trazas.
+
+    Examina las trazas persistentes y cuenta cuántas veces se activó
+    cada tipo de guardrail (input/output), con qué clasificación y
+    cuántas consultas fueron bloqueadas.
+
+    Args:
+        limit: Número máximo de trazas a examinar.
+
+    Returns:
+        Dict con estadísticas de guardrail.
+    """
+    traces = sorted(
+        _TRACE_DIR.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+
+    stats: dict[str, Any] = {
+        "total_traces_examined": len(traces),
+        "input_guardrail": {
+            "total": 0,
+            "blocked": 0,
+            "by_classification": {},
+        },
+        "output_guardrail": {
+            "total": 0,
+            "fallback": 0,
+            "by_issue_type": {},
+        },
+    }
+
+    for trace_path in traces:
+        try:
+            data = json.loads(trace_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        events = data.get("events", [])
+        for event in events:
+            # Trace events use "node" key (from _make_trace_event)
+            event_type = event.get("node", "")
+            if event_type == "input_guardrail":
+                stats["input_guardrail"]["total"] += 1
+                meta = event.get("metadata", {})
+                classification = meta.get("classification", "unknown")
+                stats["input_guardrail"]["by_classification"][classification] = (
+                    stats["input_guardrail"]["by_classification"].get(classification, 0) + 1
+                )
+                if meta.get("blocked"):
+                    stats["input_guardrail"]["blocked"] += 1
+            elif event_type == "output_guardrail":
+                stats["output_guardrail"]["total"] += 1
+                meta = event.get("metadata", {})
+                # The "status" field tells us if this was a fallback or ok
+                if event.get("status") == "fallback":
+                    stats["output_guardrail"]["fallback"] += 1
+                    # Issues are stored as a list of strings (issue types),
+                    # not list of dicts — iterate directly
+                    for issue_str in meta.get("issues", []):
+                        stats["output_guardrail"]["by_issue_type"][issue_str] = (
+                            stats["output_guardrail"]["by_issue_type"].get(issue_str, 0) + 1
+                        )
+
+    return stats
