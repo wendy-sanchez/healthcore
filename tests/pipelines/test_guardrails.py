@@ -384,13 +384,13 @@ class TestGuardrailEdgeCases:
         assert r.classification == ScopeClassification.SMALL_TALK
         assert r.blocked is False
 
-    def test_long_random_text_classifies_as_domain(self):
-        """Texto aleatorio largo sin patrones conocidos debe ser DOMAIN."""
+    def test_long_random_text_classifies_as_out_of_domain(self):
+        """Texto aleatorio largo sin patrones conocidos debe ser OUT_OF_DOMAIN."""
         r = classify_input_scope(
             "Lorem ipsum dolor sit amet consectetur adipiscing elit."
         )
-        assert r.classification == ScopeClassification.DOMAIN
-        assert r.blocked is False
+        assert r.classification == ScopeClassification.OUT_OF_DOMAIN
+        assert r.blocked is True
 
     def test_mixed_language_jailbreak(self):
         """Jailbreak con idioma mezclado debe detectarse."""

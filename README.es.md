@@ -30,7 +30,7 @@
 | 12 | **Agente de Soporte LangGraph** — Grafo de decisión que envuelve el pipeline RAG con estado explícito, checkpointing, trazabilidad y endpoint HTTP | LangGraph 1.2.22, MemorySaver, httpx | ✅ Completado |
 | 13 | **Agente LangGraph — Tools Externas** — Añadidas herramientas de consulta en tiempo real a incidencias e inventario. Enrutamiento automático entre RAG, tools o ambos mediante clasificación regex (sin LLM). Timeout 5s, fallback honesto. 32 tests. | LangGraph, httpx, regex | ✅ Completado |
 | 14 | **Servidor MCP — Tools Protegidas con OAuth** — Servidor Model Context Protocol que expone Incidencias (5 tools) e Inventario (5 tools) como herramientas MCP, protegidas con OAuth 2.1 Resource Server vía mcpauth. Operaciones de escritura en inventario explícitamente rechazadas (RETO 2). Agente LangGraph integrado vía langchain-mcp-adapters. 9/9 criterios de aceptación. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Completado |
-| 15 | **Agente LangGraph — Memoria Persistente + Guardrails** — El agente aprende de la interacción sin acumular basura. Memoria TinyDB (separada de RAG), validación PHI dual (8 patrones HIPAA+UK GDPR), aprobación explícita del usuario requerida (nunca asumida), clasificador léxico (sin LLM), máximo una propuesta pendiente, trazabilidad completa (8 eventos), consolidación automática (threshold 50 facts, TTL 90 días). **Además**: 3 capas de guardrails deterministas (regex, sin LLM): hardening de system prompt (5 reglas), clasificación de entrada (6 categorías, ~100 patrones), validación de salida (PHI/filtración instrucciones/formato). Aislamiento de contenido RAG con marcadores. Integración en grafo con 2 nodos + observabilidad. 62 tests de guardrail + 94 tests agente/grafo = 286 total. 11/11 criterios de aceptación + 100% solución de referencia. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Completado |
+| 15 | **Agente LangGraph — Memoria Persistente + Guardrails** — El agente aprende de la interacción sin acumular basura. Memoria TinyDB (separada de RAG), validación PHI dual (8 patrones HIPAA+UK GDPR), aprobación explícita del usuario requerida (nunca asumida), clasificador léxico (sin LLM), máximo una propuesta pendiente, trazabilidad completa (8 eventos), consolidación automática (threshold 50 facts, TTL 90 días). **Además**: 3 capas de guardrails deterministas (regex, sin LLM): hardening de system prompt (5 reglas), clasificación de entrada (6 categorías, ~100 patrones), validación de salida (PHI/filtración instrucciones/formato). Aislamiento de contenido RAG con marcadores. Integración en grafo con 2 nodos + observabilidad. 62 tests de guardrail + 94 tests agente/grafo = 286 total. 11/11 criterios de aceptación. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Completado |
 
 ---
 
@@ -47,7 +47,7 @@ services/                   # Servicios backend
 ├── incidents-api/          #   FastAPI incidencias (puerto 8010) — standalone
 ├── reporting/              #   FastAPI reporting (puerto 8001) — KPIs mensuales
 ├── telemetry/              #   Análisis de telemetría + servidor auth standalone
-├── agent/                  #   Agente LangGraph — grafo, tools, rutas
+├── agent/                  #   Agente LangGraph — grafo, tools, memoria, guardrails
 ├── celery_app.py           #   App Celery — definiciones de tareas asíncronas
 ├── nightly/                #   Job nocturno de exportación — proceso en segundo plano
 └── job_runner.py           #   Máquina de estados para orquestación de trabajos
@@ -154,7 +154,11 @@ El agente de soporte está implementado como un `StateGraph` de LangGraph con **
 
 - **Clasificación:** Basada en regex (sin LLM). Decide entre RAG, tool de incidencias, tool de inventario, o una combinación.
 - **Tools:** Solo lectura (GET). Consultan los servicios reales de incidencias e inventario. Timeout 5s. Todos los errores producen respuestas de fallback honestas.
-- **Memoria Persistente:** El agente puede recordar hechos operativos entre conversaciones (preferencias de personal, patrones de incidencias, configuraciones operativas) con control explícito del usuario. Usa TinyDB (separado de RAG), validación PHI dual, clasificador de intención léxico (sin LLM), y consolida/expira hechos viejos automáticamente. 32 tests de memoria. Ver [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md).
+- **Memoria Persistente (Parte 1):** El agente puede recordar hechos operativos entre conversaciones (preferencias de personal, patrones de incidencias, configuraciones operativas) con control explícito del usuario. Usa TinyDB (separado de RAG), validación PHI dual, clasificador de intención léxico (sin LLM), y consolida/expira hechos viejos automáticamente. 113 tests de agente+memoria en test_agent_graph.py.
+- **Harness y Guardrails (Parte 2):** Sistema de seguridad determinista de 3 capas (regex, sin LLM) documentado en [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md):
+  - **Harness** — Generación segura del system prompt (`build_system_prompt`) con identidad, dominio, 5 reglas de comportamiento estrictas, y aislamiento del contexto RAG (`wrap_rag_context` mediante marcadores `--- BEGIN/END REFERENCE DOCUMENTS ---`).
+  - **Content Guardrail** — Clasificación del alcance de entrada (`classify_input_scope`) en 6 categorías (domain, small_talk, personal_task, jailbreak, phi_in_query, gradual_extraction) usando ~100 patrones regex. Sin LLM.
+  - **Output Guardrail** — Validación de respuesta (`validate_output`) verificando filtraciones PHI, filtración de instrucciones, términos prohibidos y formato. 62 tests deterministas (con parametrización).
 - **Trazabilidad:** Cada ejecución produce un trace JSON persistido en `services/agent/traces/{run_id}.json`.
 - **Endpoint:** `POST /agent/query` (capa FastAPI delgada — sin lógica de negocio).
 - **Documentación:** [`agente-soporte-langgraph.md`](./agente-soporte-langgraph.md), [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md).
@@ -211,7 +215,7 @@ Generación Aumentada por Recuperación sobre 4 documentos de políticas de Heal
 | [`message-queues-asyns-task.md`](./message-queues-asyns-task.md) | Cola de Tareas Asíncronas — Redis + Celery |
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Propuesta de arquitectura general |
 | [`mcp-server.md`](./mcp-server.md) | Servidor MCP — tools protegidas con OAuth, arquitectura, configuración |
-| [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | Memoria Persistente del Agente LangGraph — arquitectura, decisiones de diseño, diagramas de flujo |
+| [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | Memoria Persistente del Agente LangGraph + Harness y Guardrails — arquitectura, hardening del system prompt, seguridad determinista de 3 capas, diagramas de flujo |
 | [`memory-bank/`](./memory-bank/) | Progreso del desarrollo, contexto activo, patrones del sistema, decisiones técnicas |
 
 ---
@@ -219,10 +223,13 @@ Generación Aumentada por Recuperación sobre 4 documentos de políticas de Heal
 ## 🧪 Filosofía de Testing
 
 - **Tests de pipelines** (`tests/pipelines/`) cubren agente, RAG y pronóstico de ventas — todos ejecutables con `uv run python -m pytest`
-- Los tests del agente incluyen: compilación del grafo, enrutamiento condicional, trazabilidad, comportamiento RAG fundamentado, enrutamiento de tools (5 tests), comportamiento de fallback de tools (5 tests), síntesis mixta (2 tests) y 32 tests específicos de memoria (validación PHI, CRUD de store, clasificación de intención, orquestación del pipeline, integración en el grafo)
-- Los 64 tests del agente pasan como puerta de entrada antes de fusionar ramas
-- Sistema de memoria: 11/11 criterios de aceptación verificados mediante auditoría (ver `AUDITORIA_HITO8_MEMORIA.md`)
-- Desarrollo impulsado por auditoría: cada entregable tiene criterios de aceptación verificables
+- Los tests del agente incluyen: compilación del grafo, enrutamiento condicional, trazabilidad, comportamiento RAG fundamentado, enrutamiento de tools (5 tests), comportamiento de fallback de tools (5 tests), síntesis mixta (2 tests), 113 tests de agente+memoria (validación PHI, CRUD de store, clasificación de intención, orquestación del pipeline, integración en el grafo), y 12 tests de integración de harness
+- **Tests de guardrails** (`tests/pipelines/test_guardrails.py`): 62 tests deterministas (con parametrización) que cubren el **Harness** (estructura del system prompt, aislamiento RAG, defensas anti-jailbreak), el **Content Guardrail** (las 6 categorías de alcance) y el **Output Guardrail** (PHI, filtración de instrucciones, formato). Todos son Python puro — sin LLM, sin red, sin base de datos.
+- **Suite total del agente**: 125 tests de grafo + 62 tests de guardrails = **187 tests** cubriendo tanto la capa de memoria como la de seguridad.
+  - Todos los tests del agente + guardrails pasan como puerta de entrada antes de fusionar ramas.
+  - Sistema de memoria: 11/11 criterios de aceptación verificados mediante auditoría.
+  - Harness y guardrails: 3 módulos deterministas (system prompt, content guard, output guard), 62 tests (con parametrización), 6 categorías de alcance de entrada, ~100 patrones regex — todo sin LLM.
+  - Desarrollo impulsado por auditoría: cada entregable tiene criterios de aceptación verificables.
 
 
 ---

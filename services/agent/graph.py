@@ -353,6 +353,12 @@ def node_generate_answer(state: AgentState) -> dict[str, Any]:
     El resultado de la auto-evaluación del LLM se almacena en
     ``llm_memory_proposal`` para que el nodo ``auto_evaluate_memory``
     lo procese directamente, sin duplicar heurísticas post-hoc.
+
+    **Harness integration** (Hito 8·2):
+      - El system prompt se construye con ``build_system_prompt()`` y se envía
+        como mensaje ``system`` (rol separado, no mezclado con user).
+      - El contexto RAG se envuelve con ``wrap_rag_context()`` para aislarlo
+        del system prompt.
     """
     question = state["question"]
     chunks = state.get("retrieved_chunks", [])
@@ -369,17 +375,42 @@ def node_generate_answer(state: AgentState) -> dict[str, Any]:
             "trace_events": [_make_trace_event("generate_answer", "fallback", {"reason": "empty_context"})],
         }
 
+    # ── Build harness system prompt ──────────────────────────────────
+    system_instructions = build_system_prompt()
+
+    # ── Wrap RAG context with isolation markers ──────────────────────
+    # Convert chunks to a single context string, then wrap it.
+    raw_context = _build_context_from_chunks(chunks)
+    isolated_context = wrap_rag_context(raw_context)
+
+    memory_prompt_state = (
+        state.get("memory_context", "")
+        or _build_memory_context_text(memory_facts)
+    )
+
+    # Reconstruct chunks as a list with the *wrapped* text so the
+    # callers (generate_answer / generate_answer_with_memory) get
+    # the isolated version.
+    wrapped_chunks: list[dict[str, Any]] = [
+        {"text": isolated_context, "source_document": "rag_harness", "section": "isolated"}
+    ]
+
     try:
         answer, llm_proposal = generate_answer_with_memory(
             question=question,
-            context=chunks,
+            context=wrapped_chunks,
             memory_facts=memory_facts,
+            system_role_message=system_instructions,
         )
     except RuntimeError as exc:
-        # Fallback: usar generate_answer tradicional
+        # Fallback: usar generate_answer tradicional (sin harness)
         logger.warning("generate_answer_with_memory falló, usando fallback: %s", exc)
         try:
-            answer = generate_answer(question=question, context=chunks)
+            answer = generate_answer(
+                question=question,
+                context=wrapped_chunks,
+                system_role_message=system_instructions,
+            )
             llm_proposal = None
         except RuntimeError as exc2:
             return {
@@ -392,10 +423,13 @@ def node_generate_answer(state: AgentState) -> dict[str, Any]:
     result: dict[str, Any] = {
         "answer": answer,
         "llm_memory_proposal": llm_proposal,
-        "routing_log": ["generate_answer → END (respuesta generada)"],
+        "routing_log": [
+            "generate_answer → END (respuesta generada con harness)",
+        ],
         "trace_events": [_make_trace_event("generate_answer", "ok", {
             "answer_length": len(answer),
             "llm_proposal": llm_proposal is not None,
+            "harness_active": True,
         })],
     }
 
@@ -895,6 +929,35 @@ def _format_inventory_response(products: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# ── Helpers para el harness (Hito 8·2) ──────────────────────────────
+
+
+def _build_context_from_chunks(chunks: list[dict[str, Any]]) -> str:
+    """Convierte una lista de chunks RAG en un único string de contexto.
+
+    Reimplementación local de ``data.pipelines.rag._build_context`` para
+    evitar importar una función privada.
+    """
+    parts: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        parts.append(
+            f"[Fuente {i}: {chunk.get('source_document', 'desconocida')} "
+            f"— {chunk.get('section', 'general')}]\n"
+            f"{chunk.get('text', '')}"
+        )
+    return "\n\n".join(parts)
+
+
+def _build_memory_context_text(memory_facts: list[dict[str, Any]]) -> str:
+    """Construye un string de contexto de memoria a partir de los facts."""
+    if not memory_facts:
+        return ""
+    lines = ["Hechos recordados:"]
+    for f in memory_facts:
+        lines.append(f"- {f.get('content', '')}")
+    return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 4.  Aristas condicionales — decisiones de enrutamiento explícitas
 # ──────────────────────────────────────────────────────────────────────
@@ -1378,7 +1441,8 @@ def guardrail_summary(limit: int = 100) -> dict[str, Any]:
 
         events = data.get("events", [])
         for event in events:
-            event_type = event.get("event", "")
+            # Trace events use "node" key (from _make_trace_event)
+            event_type = event.get("node", "")
             if event_type == "input_guardrail":
                 stats["input_guardrail"]["total"] += 1
                 meta = event.get("metadata", {})
@@ -1391,13 +1455,14 @@ def guardrail_summary(limit: int = 100) -> dict[str, Any]:
             elif event_type == "output_guardrail":
                 stats["output_guardrail"]["total"] += 1
                 meta = event.get("metadata", {})
-                valid = meta.get("valid", True)
-                if not valid:
+                # The "status" field tells us if this was a fallback or ok
+                if event.get("status") == "fallback":
                     stats["output_guardrail"]["fallback"] += 1
-                    for issue in meta.get("issues", []):
-                        issue_type = issue.get("type", "unknown")
-                        stats["output_guardrail"]["by_issue_type"][issue_type] = (
-                            stats["output_guardrail"]["by_issue_type"].get(issue_type, 0) + 1
+                    # Issues are stored as a list of strings (issue types),
+                    # not list of dicts — iterate directly
+                    for issue_str in meta.get("issues", []):
+                        stats["output_guardrail"]["by_issue_type"][issue_str] = (
+                            stats["output_guardrail"]["by_issue_type"].get(issue_str, 0) + 1
                         )
 
     return stats

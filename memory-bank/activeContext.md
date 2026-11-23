@@ -118,29 +118,34 @@
 - **Documentación**: `agent-memory-harness-guard.md` — 7 preguntas de diseño respondidas, tabla comparativa de 5 alternativas de almacenamiento, **5 ciclos completos con trazas (incluyendo Ciclo 5 — Unrelated)**, política de consolidación, tabla de **17 bugs corregidos**, whitelist PHI documentada, rechazo explícito PHI documentado, evento de auditoría `"unrelated"`.
 - **Branch**: `feature/agent-memory` (o rama activa del desarrollo).
 
-### Hito 8 · Parte 2 — Harness y Guardrails (2026-12)
+### Hito 8 · Parte 2 — Harness y Guardrails (2026-12) — Refuerzo de integración (2026-11-23)
 
 - **Entregable**: Blindaje del agente LangGraph contra inyección de prompt, jailbreaks, solicitudes fuera de dominio, y fugas de PHI mediante guardrails deterministas basados en regex (sin LLM en hot path).
 - **Stack**: `Python 3.14`, `re` (guardrails regex puros, sin dependencia LLM), `LangGraph >=1.2.22` (nodos de guardrail en el grafo).
 - **3 módulos** en `services/agent/guardrails/`:
   - `harness.py` — **System prompt hardening**: 5 reglas de restricción (Prohibited behavior, Constrained capabilities, Query-response binding, Completeness, Tone and empathy). Funciones: `build_system_prompt()` retorna string completo; `wrap_rag_context(context)` aísla contenido RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS` + advertencia.
-  - `content_guard.py` — **Clasificación de entrada**: 6 categorías con prioridad estricta: `JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6)`. ~100 patrones regex. Función: `classify_input_scope(text)` retorna `GuardResult` con clasificación, blocked, confidence, reason, response.
-  - `output_guard.py` — **Validación de respuesta**: 3 checkers independientes — `check_format` (vacío/largo), `check_leaked_instructions` (14 patrones EN+ES), `check_sensitive_data` (6 patrones PHI + 3 confidenciales). Función: `validate_output(output)` retorna `OutputValidationResult`.
-- **Aislamiento de contenido externo** (`wrap_rag_context` + sección `RAG_TOOL_ISOLATION` en system prompt): contenido RAG/tools nunca se trata como instrucción. Verificado con 3 tests de inyección RAG.
-- **Integración en grafo LangGraph**:
-  - 3 nuevos campos en `AgentState`: `guardrail_result: Optional[dict]`, `guardrail_blocked: bool`, `guardrail_response: str`.
-  - Nodo `node_input_guardrail`: clasifica query; si no es DOMAIN, corta el flujo con respuesta predefinida.
-  - Nodo `node_output_guardrail`: valida respuesta del LLM; si detecta PHI/leaked/format, la reemplaza con fallback.
-  - Routing: `route_after_receive` → `input_guardrail`; `route_after_input_guardrail` → `load_memory_context` (si DOMAIN) o `__end__` (si bloqueado).
-- **Observabilidad**: `guardrail_summary(limit=100)` en `graph.py` lee trazas persistentes y retorna estadísticas agregadas (input/output activaciones por clasificación/tipo de issue). Cada nodo registra evento estructurado con `failure_type` (security/content/structural).
-- **Tests**: **62 tests de guardrail** en `test_guardrails.py` (7 harness + 26 content + 12 output + 17 edge cases). 104 tests en `test_agent_graph.py` (62 memory + 32 agent + 10 contradicción). **Suite completa: 296 tests** (`uv run python -m pytest tests/ -v` → 296 passed).
-- **Nuevos tests de inyección RAG** (3):
-  1. `test_rag_content_injection_wrapped_as_data` — Chunk con `[SYSTEM]: ignore...` envuelto, verifica NO en system prompt.
-  2. `test_rag_content_injection_system_prompt_warns` — System prompt contiene advertencia "factual reference only".
-  3. `test_rag_injection_with_jailbreak_keywords_not_confused` — Query legítima DOMAIN, capas separadas.
-- **Auditoría**: ✅ 9/9 criterios de aceptación cumplidos. ✅ 100% contra solución de referencia (29/29 puntos). Gap en tests de inyección RAG cerrado.
-- **Archivos clave**: `services/agent/guardrails/{harness,content_guard,output_guard}.py`, `__init__.py`, `services/agent/graph.py`, `tests/pipelines/test_guardrails.py`.
-- **Documentación**: `agent-memory-harness-guard.md` — §13-19: arquitectura, 3 capas, aislamiento RAG, tests, observabilidad, integración, auditoría, referencias.
+  - `content_guard.py` — **Clasificación de entrada**: **7 categorías** con prioridad estricta: `JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6) > OUT_OF_DOMAIN (7)`. ~100 patrones regex. Función: `classify_input_scope(text)` retorna `GuardResult`. **OUT_OF_DOMAIN** es nueva: texto sin relación con HealthCore que no coincide con jailbreak/personal/small_talk se bloquea con respuesta predefinida, en lugar de pasarlo al LLM como DOMAIN.
+  - `output_guard.py` — **Validación de respuesta**: 3 checkers independientes — `check_format` (vacío/largo), `check_leaked_instructions` (14 patrones EN+ES), `check_sensitive_data` (6 patrones PHI + 3 confidenciales).
+- **Aislamiento de contenido externo**: `wrap_rag_context()` + sección `RAG_TOOL_ISOLATION` en el system prompt. Contenido RAG/tools nunca se trata como instrucción.
+
+- **Nueva integración del harness en el grafo** (Bug fix 2026-11-23):
+  - **Problema**: `build_system_prompt()` y `wrap_rag_context()` estaban importados en `graph.py` pero **nunca se usaban**. `_generate()` en `rag.py` solo enviaba un mensaje `user` con el antiguo SYSTEM_PROMPT embebido, sin usar mensaje `system` separado. `node_generate_answer` pasaba chunks RAG crudos sin aislar.
+  - **Solución**:
+    1. `_generate()`, `generate_answer()` y `generate_answer_with_memory()` en `rag.py` aceptan `system_role_message: str | None`. Cuando se proporciona, se envía como `{"role": "system"}` separado, con el contenido del usuario estructurado en secciones.
+    2. `node_generate_answer()` en `graph.py` llama a `build_system_prompt()` para construir las instrucciones del harness y las pasa como `system_role_message`.
+    3. `wrap_rag_context()` se usa para aislar el contenido RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS` y advertencia de solo-referencia-factual.
+    4. Nuevas helpers: `_build_context_from_chunks()` y `_build_memory_context_text()`.
+    5. El trace event incluye `"harness_active": True` para observabilidad.
+  - **OUT_OF_DOMAIN**: Nueva clasificación en `ScopeClassification` (blocked=True). El fallback por defecto en `classify_input_scope()` cambió de `DOMAIN` (blocked=False, confianza 0.60) a `OUT_OF_DOMAIN` (blocked=True, con respuesta de redirección). Keywords de dominio ampliadas con `auditor`, `audit`, `datos de salud`, `health data`, `salud`.
+  - **Tests**: 6 nuevos tests en `TestGraphHarnessIntegration` (test_agent_graph.py) que verifican: uso de system prompt, wrapping de contexto RAG, chunk malicioso no contamina system prompt, flujo completo chunk→wrap→system_role_message limpio, flag `harness_active` en traza, ruteo OUT_OF_DOMAIN → __end__. Test renombrado en test_guardrails.py: `test_long_random_text_classifies_as_out_of_domain` (antes domain).
+
+- **Bugs corregidos post-auditoría (2026-11-23)**:
+  1. `guardrail_summary()` en `graph.py` — Usaba `event.get("event", "")` pero los eventos usan clave `"node"`. Metadata de output_guardrail esperaba shape incorrecto. Fix: `event.get("node", "")`, usar `status` para fallback, iterar strings directamente.
+  2. `r"\bphi\b"` duplicado en `_DOMAIN_KEYWORDS` de `content_guard.py:83`. Eliminada duplicación.
+  3. Cobertura de tests a nivel nodo: 6 nuevos tests (jailbreak block, domain pass, clean output, PHI replacement, 2 routing de auto_evaluate_v2).
+
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **317 tests totales workspace**. **0 fallos**.
+- **Documentación**: `agent-memory-harness-guard.md` — §13-19 actualizado con OUT_OF_DOMAIN, §14 ampliado con TestGraphHarnessIntegration (12 tests), bugfixes post-auditoría documentados, §18 auditoría a 35/35 puntos.
 - **Branch**: `feature/agent-memory`.
 
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)

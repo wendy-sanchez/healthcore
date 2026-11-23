@@ -26,6 +26,10 @@ class ScopeClassification(Enum):
     DOMAIN = "domain"
     """Consulta legítima sobre compliance, políticas o procedimientos."""
 
+    OUT_OF_DOMAIN = "out_of_domain"
+    """Texto sin relación con HealthCore — no es jailbreak ni personal task, pero
+    está fuera del dominio de compliance. Se redirige sin pasar por el LLM."""
+
     SMALL_TALK = "small_talk"
     """Saludo o comentario casual, sin intención de consulta."""
 
@@ -76,7 +80,7 @@ _DOMAIN_KEYWORDS: list[str] = [
     r"\bbrecha", r"\bbreach", r"\bnotificaci[oó]n", r"\bnotification",
     r"\bico\b", r"\binfring", r"\bviolaci[oó]n",
     # Patient/data rights
-    r"\bphi\b", r"\bphi\b", r"\bprivacidad", r"\bprivacy",
+    r"\bphi\b", r"\bprivacidad", r"\bprivacy",
     r"\bconsentimient", r"\bconsent", r"\bderechos?\s+del?\s+paciente",
     r"\bpatient\s+rights?", r"\bao\b", r"\baccess\s+request",
     r"\bsolicitud\s+de\s+acceso", r"\bsars?\b",
@@ -94,6 +98,9 @@ _DOMAIN_KEYWORDS: list[str] = [
     # Operations
     r"\bincidente", r"\bincident", r"\bticket\b", r"\binventario", r"\binventory",
     r"\bstock\b", r"\bproducto", r"\bproduct",
+    # Audit / data / health
+    r"\bauditor", r"\baudit", r"\bdatos?\s+de\s+salud", r"\bhealth\s+data",
+    r"\bsalud\b",
     # Staff
     r"\bstaff\b", r"\bpersonal\b", r"\bemplead", r"\bemployee",
     r"\bcontrataci[oó]n", r"\bhiring", r"\brrhh\b", r"\bhr\b",
@@ -409,12 +416,23 @@ def classify_input_scope(text: str) -> GuardResult:
             reason="Input is within the HealthCore compliance domain.",
         )
 
-    # ── 7. Default: ambiguous, let LLM handle it ────────────────────
+    # ── 7. Default: OUT_OF_DOMAIN — no coincide con ningún patrón ────
+    # Ya no se envía al LLM. Se redirige con un mensaje claro.
     return GuardResult(
-        classification=ScopeClassification.DOMAIN,
-        blocked=False,
-        confidence=0.60,
-        reason="Input does not match any guardrail pattern; passing to LLM.",
+        classification=ScopeClassification.OUT_OF_DOMAIN,
+        blocked=True,
+        confidence=0.70,
+        reason=(
+            "Input does not match any HealthCore domain pattern, jailbreak, "
+            "personal task, or small talk classification."
+        ),
+        response=(
+            "I specialise in HealthCore compliance and policies — HIPAA, "
+            "UK GDPR, internal procedures, and clinical protocols. "
+            "That question doesn't seem to relate to those topics. "
+            "Please ask a question about compliance, policies, "
+            "or HealthCore operations."
+        ),
     )
 
 

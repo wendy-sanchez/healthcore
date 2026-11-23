@@ -59,7 +59,27 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Supplier para la respuesta, con los campos que genera el sistema (id, updated_at, archived_at).
 - Los campos generados por el sistema se ignoran si el cliente los envía.
 
-### 10) LangGraph Agent Pattern (Parte 2 — Tools externas) — Grafo de decisión con consultas a servicios reales
+### 10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
+
+**Ubicación**: `services/agent/guardrails/`, `services/agent/graph.py`, `data/pipelines/rag.py`
+
+**Propósito**: Blindar el agente contra inyección de prompt, jailbreaks, solicitudes fuera de dominio y fugas de PHI mediante 3 capas deterministas (sin LLM en hot path).
+
+**Capas**:
+1. **Harness (system prompt)**: `build_system_prompt()` genera ~40 líneas de instrucciones de seguridad (5 reglas) que se envían como mensaje `system` separado. `wrap_rag_context()` aísla contenido RAG con marcadores `BEGIN/END REFERENCE DOCUMENTS` + advertencia de solo-referencia-factual.
+2. **Content guardrail (input)**: `classify_input_scope()` clasifica toda query en 7 categorías con prioridad estricta: JAILBREAK (1) > PHI (2) > PERSONAL_TASK (3) > GRADUAL_EXTRACTION (4) > SMALL_TALK (5) > DOMAIN (6) > OUT_OF_DOMAIN (7). Si no es DOMAIN, corta el flujo sin pasar por el LLM.
+3. **Output guardrail (output)**: `validate_output()` aplica 3 checkers: formato (vacío/largo), leaked instructions (14 patrones), sensitive data (PHI + términos confidenciales). Si falla, reemplaza la respuesta con fallback.
+
+**Integración en grafo**:
+- Nodos: `input_guardrail` (tras receive_question), `output_guardrail` (tras auto_evaluate_memory).
+- Routing: bloqueado → `__end__` con respuesta predefinida.
+- El harness se conecta en `node_generate_answer()`: llama a `build_system_prompt()`, envuelve chunks con `wrap_rag_context()`, pasa `system_role_message` a `_generate()` que lo envía como mensaje `system` separado.
+- Traza incluye `harness_active: True`.
+- Helper functions: `_build_context_from_chunks()`, `_build_memory_context_text()`.
+
+**3 capas** se orquestan en orden: `content_guard (input) → LLM (harness system prompt) → output_guard (response)`.
+
+### 11) LangGraph Agent Pattern (Parte 2 — Tools externas) — Grafo de decisión con consultas a servicios reales
 
 **UbicaciÃ³n**: `services/agent/graph.py`, `services/agent/tools/`, `services/agent/routes.py`
 

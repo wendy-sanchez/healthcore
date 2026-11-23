@@ -185,21 +185,44 @@ def _generate(
     question: str,
     context: str,
     system_prompt: str | None = None,
+    *,
+    system_role_message: str | None = None,
 ) -> str:
     """Call the generation LLM with a prompt built from context + question.
+
+    If *system_role_message* is provided, it is sent as a system role
+    message (highest authority).  Otherwise the legacy behaviour is used:
+    the system instructions are embedded inside a single user message.
 
     Uses the **generation** model only — never the embedding model.
     """
     client = _get_gen_client()
-    prompt = (system_prompt or SYSTEM_PROMPT).format(
-        context=context,
-        question=question,
-    )
+
+    if system_role_message:
+        # Modern path: separate system + user messages (harness-compliant).
+        user_content = (
+            "=== Contexto recuperado ===\n"
+            f"{context}\n\n"
+            "=== Pregunta ===\n"
+            f"{question}\n\n"
+            "=== Respuesta ==="
+        )
+        messages = [
+            {"role": "system", "content": system_role_message},
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        # Legacy path: all-in-one user message.
+        prompt = (system_prompt or SYSTEM_PROMPT).format(
+            context=context,
+            question=question,
+        )
+        messages = [{"role": "user", "content": prompt}]
 
     try:
         resp = client.chat.completions.create(
             model=GENERATION_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.3,
             max_tokens=2000,
         )
@@ -235,7 +258,12 @@ def _generate(
 # ── generate_answer() — public, separate generation step ─────────────
 
 
-def generate_answer(question: str, context: list[dict[str, Any]]) -> str:
+def generate_answer(
+    question: str,
+    context: list[dict[str, Any]],
+    *,
+    system_role_message: str | None = None,
+) -> str:
     """Generate a final answer from *question* and retrieved *context* chunks.
 
     This is a **public** function so future agents (e.g. LangGraph) can call
@@ -245,6 +273,9 @@ def generate_answer(question: str, context: list[dict[str, Any]]) -> str:
     Args:
         question: The original user question.
         context: List of chunk dicts returned by retrieve().
+        system_role_message: Optional system role message (harness prompt).
+            When provided, it is sent as a system role message instead of
+            embedding instructions in the user message.
 
     Returns:
         The generated answer as a plain string.
@@ -257,6 +288,7 @@ def generate_answer(question: str, context: list[dict[str, Any]]) -> str:
     return _generate(
         question=question,
         context=context_str,
+        system_role_message=system_role_message,
     )
 
 
@@ -341,6 +373,8 @@ def generate_answer_with_memory(
     question: str,
     context: list[dict[str, Any]],
     memory_facts: list[dict[str, Any]] | None = None,
+    *,
+    system_role_message: str | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Generate answer AND auto-evaluate memory in a single LLM call.
 
@@ -365,23 +399,43 @@ def generate_answer_with_memory(
         return generate_answer(question, context), None
 
     context_str = _build_context(context)
-    base_prompt = SYSTEM_PROMPT.format(context=context_str, question=question)
-
-    # Add memory facts context if available
-    memory_context = ""
-    if memory_facts:
-        lines = ["Hechos ya recordados en memoria:"]
-        for f in memory_facts:
-            lines.append(f"- {f.get('content', '')}")
-        memory_context = "\n".join(lines) + "\n\n"
-
-    prompt = memory_context + base_prompt + _MEMORY_SYSTEM_PROMPT_SUFFIX
 
     client = _get_gen_client()
+
+    if system_role_message:
+        # Modern path: system role + user content (harness-compliant).
+        user_parts = [f"=== Contexto recuperado ===\n{context_str}"]
+
+        if memory_facts:
+            lines = ["Hechos ya recordados en memoria:"]
+            for f in memory_facts:
+                lines.append(f"- {f.get('content', '')}")
+            user_parts.append("\n".join(lines))
+
+        user_parts.append(f"=== Pregunta ===\n{question}")
+        user_parts.append("=== Respuesta ===")
+        user_parts.append(_MEMORY_SYSTEM_PROMPT_SUFFIX)
+
+        messages = [
+            {"role": "system", "content": system_role_message},
+            {"role": "user", "content": "\n\n".join(user_parts)},
+        ]
+    else:
+        # Legacy path: all-in-one user message.
+        base_prompt = SYSTEM_PROMPT.format(context=context_str, question=question)
+        memory_context = ""
+        if memory_facts:
+            lines = ["Hechos ya recordados en memoria:"]
+            for f in memory_facts:
+                lines.append(f"- {f.get('content', '')}")
+        memory_context = "\n".join(lines) + "\n\n"
+        prompt = memory_context + base_prompt + _MEMORY_SYSTEM_PROMPT_SUFFIX
+        messages = [{"role": "user", "content": prompt}]
+
     try:
         resp = client.chat.completions.create(
             model=GENERATION_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.3,
             max_tokens=2500,
         )
