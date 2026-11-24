@@ -36,6 +36,8 @@ from data.pipelines.rfp_intake.orchestrator import orchestrate
 from data.pipelines.rfp_intake.readability import compute_readability
 from data.pipelines.rfp_intake.synthesizer import synthesize
 from data.pipelines.rfp_intake.workers import run_worker, run_worker_rule_based
+from data.pipelines.rfp_intake.cycle import run_part2_pipeline
+from services.api.models_rfp import DepartmentSectionDB
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +216,7 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                 meta_row.departments_needed = metadata.departments_mentioned or None
                 meta_row.extra_departments_mentioned = metadata.extra_departments_mentioned or None
                 meta_row.has_phi = metadata.has_phi
+                meta_row.estimated_complexity = metadata.estimated_complexity
                 session.add(meta_row)
                 session.commit()
 
@@ -305,7 +308,61 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
         state["synthesis"] = synthesis_text
         state["handoff"] = handoff.model_dump(mode="json")
 
-        logger.info("Pipeline RFP completado para ticket %s → analisis_completo", ticket_id)
+        # ── Nodo 8 (Parte 2): Generación y Evaluación de Borradores ─
+        logger.info("[Nodo 7/7] Ejecutando Parte 2 — ciclo generador-evaluador...")
+        state["status"] = TicketStatus.GENERANDO_BORRADOR.value
+        with Session(engine) as session:
+            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+            ticket = session.exec(stmt).first()
+            if ticket:
+                ticket.status = TicketStatus.GENERANDO_BORRADOR.value
+                session.add(ticket)
+            session.commit()
+
+        # Marcar como en_evaluación mientras corren los evaluadores
+        state["status"] = TicketStatus.EN_EVALUACION.value
+        with Session(engine) as session:
+            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+            ticket = session.exec(stmt).first()
+            if ticket:
+                ticket.status = TicketStatus.EN_EVALUACION.value
+                session.add(ticket)
+            session.commit()
+
+        part2_handoff = await run_part2_pipeline(handoff, max_iterations=3)
+
+        # Persistir resultados de Parte 2 en DepartmentSectionDB
+        with Session(engine) as session:
+            for dept_out in part2_handoff.departments:
+                stmt = select(DepartmentSectionDB).where(
+                    DepartmentSectionDB.ticket_id == ticket_id,
+                    DepartmentSectionDB.department_id == dept_out.department_id,
+                )
+                dept_db = session.exec(stmt).first()
+                if dept_db:
+                    dept_db.evaluation_results = (
+                        dept_out.evaluation.model_dump(mode="json", by_alias=True)
+                        if dept_out.evaluation else None
+                    )
+                    dept_db.approval_status = dept_out.approval_status
+                    session.add(dept_db)
+            session.commit()
+
+        # Actualizar ticket con resultados de Parte 2
+        final_status = part2_handoff.overall_status  # "needs_human_review" or "analisis_completo"
+        with Session(engine) as session:
+            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+            ticket = session.exec(stmt).first()
+            if ticket:
+                ticket.status = final_status
+                ticket.handoff_payload = part2_handoff.model_dump(mode="json")
+                session.add(ticket)
+            session.commit()
+
+        state["status"] = final_status
+        state["part2_handoff"] = part2_handoff.model_dump(mode="json")
+
+        logger.info("Pipeline RFP completado para ticket %s → %s", ticket_id, final_status)
         return state
 
     except Exception as e:

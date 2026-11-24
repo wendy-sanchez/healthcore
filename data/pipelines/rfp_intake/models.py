@@ -20,6 +20,9 @@ class TicketStatus(str, Enum):
     ANALIZANDO = "analizando"
     DESCARTADO = "descartado"
     ANALISIS_COMPLETO = "analisis_completo"
+    GENERANDO_BORRADOR = "generando_borrador"
+    EN_EVALUACION = "en_evaluación"
+    NEEDS_HUMAN_REVIEW = "needs_human_review"
     ERROR = "error"
 
 

@@ -57,6 +57,9 @@ class DepartmentSectionResponse(BaseModel):
     key_aspects: list[dict]
     open_questions: list[str]
     contains_phi: bool
+    draft_content: str | None = None
+    evaluation_results: dict | None = None
+    approval_status: str | None = None
 
 
 class TicketDetailResponse(BaseModel):
@@ -201,6 +204,9 @@ async def get_ticket(ticket_id: str, db: Session = Depends(get_db)) -> TicketDet
             key_aspects=ds.key_aspects or [],
             open_questions=ds.open_questions or [],
             contains_phi=ds.contains_phi,
+            draft_content=ds.draft_content,
+            evaluation_results=ds.evaluation_results,
+            approval_status=ds.approval_status,
         )
         for ds in dept_sections
     ]
@@ -271,12 +277,21 @@ async def reprocess_ticket(ticket_id: str, db: Session = Depends(get_db)) -> Rep
     ticket.handoff_payload = None
     db.add(ticket)
     db.commit()
+
     # Eliminar metadatos previos para que se regeneren limpios
     old_meta = db.exec(
         select(RfpMetadataDB).where(RfpMetadataDB.ticket_id == ticket_id)
     ).all()
     for m in old_meta:
         db.delete(m)
+
+    # Eliminar department sections previas (incluye draft, evaluation, approval)
+    old_sections = db.exec(
+        select(DepartmentSectionDB).where(DepartmentSectionDB.ticket_id == ticket_id)
+    ).all()
+    for s in old_sections:
+        db.delete(s)
+
     db.commit()
 
     logger.info("Ticket %s reabierto para reprocesamiento", ticket_id)

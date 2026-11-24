@@ -1,9 +1,9 @@
 # Agentic Workflows — HealthCore RFP Intake Pipeline
 
-> **Parte 1** del Hito 9 — Flujos de Trabajo Agénticos.
-> Sistema de recepción, clasificación y descomposición de RFPs mediante un pipeline multi-agente.
+> **Parte 1 + Parte 2** del Hito 9 — Flujos de Trabajo Agénticos.
+> Sistema de recepción, clasificación y descomposición de RFPs mediante un pipeline multi-agente, con ciclo generador-evaluador de borradores por departamento.
 >
-> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 293/293 tests de RFP pipeline pasando, API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end, metadata persistence y readability metrics corregidos.
+> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 357/357 tests pasando (320 pipeline + 10 MCP auth + 27 Part 2), API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end, metadata persistence, readability metrics, y ciclo Part 2 generador-evaluador corregidos y auditados.
 
 ---
 
@@ -198,6 +198,9 @@ flowchart TD
 | `analizando` | Subida aceptada; pipeline en curso |
 | `descartado` | El clasificador rechazó el documento |
 | `analisis_completo` | Synthesizer terminó; Ventas puede leer key_aspects |
+| `generando_borrador` | Generadores escribiendo secciones de propuesta |
+| `en_evaluación` | Evaluadores en paralelo mediante `asyncio.gather()` / ciclo generador-evaluador |
+| `needs_human_review` | Límite de iteraciones agotado; último borrador + evaluación pasan a revisión humana |
 | `error` | Error en pipeline (con `error_detail`) |
 
 ---
@@ -311,9 +314,9 @@ La Parte 2 recibe `ticket_id + handoff_payload` y comienza sin re-parsear el PDF
 $ curl -s http://localhost:8000/rfp/tickets
 {"tickets":[]}
 
-# 293/293 tests pasan (16 classifier + workers + 277 pipeline)
-$ uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v
-# → 293 passed
+# 357/357 tests pasan (293 pipeline + 10 MCP auth + 54 Part 2)
+$ uv run python -m pytest tests/pipelines/ -v
+# → 357 passed
 ```
 
 ### Proxy Routes de Next.js
@@ -389,7 +392,7 @@ Los 3 PDFs de muestra se descargaron de `4GeeksAcademy/ai-engineering-syllabus` 
 | `b4a4d1a2` | RFP-2 — Thames Valley University (email informal) | ✅ `analisis_completo` | Thames Valley University | referral_network | UK | 3 |
 | `8a988247` | RFP-3 — MedFlow (EHR vendor pitch) | ✅ `descartado` | — | — | — | — |
 
-**Tests: 293/293 pasando** (16 classifier + workers + 277 pipeline suite).
+**Tests: 357/357 pasando** (293 pipeline + 10 MCP auth + 54 Part 2).
 
 ### API final
 
@@ -404,10 +407,185 @@ $ curl http://localhost:8000/rfp/tickets
 }
 ```
 
-## Limitaciones Conocidas
+## Limitaciones Conocidas (Parte 1)
 
 1. **MarkItDown sin dependencia `[pdf]`**: La conversión PDF→Markdown usa PyPDF2 como fallback. Funciona correctamente pero sin el parsing semántico mejorado de MarkItDown con pdfminer.
 2. **Celery no corre localmente**: La verificación se hace mediante `asyncio.run(run_rfp_pipeline())` directamente. Para probar el flujo Celery completo hace falta `docker compose up`.
 3. **NLTK data**: Advertencia no bloqueante en readability metrics (fallback a conteo manual de sílabas).
 4. **Metadata persistence depende de SQLModel merge**: La tabla `rfp_metadata` usa `session.merge()` para upsert. Si el modelo SQLModel cambia, la migración debe ser manual (no hay Alembic configurado).
 5. **293 tests de pipeline, no E2E con PostgreSQL**: Los tests usan mocks para la DB. Falta un test de integración que verifique el INSERT real en `rfp_metadata` con una base de datos PostgreSQL de prueba.
+
+---
+
+## Parte 2: Generación y Evaluación de Borradores (✅ Completada)
+
+### Visión General
+
+La Parte 2 implementa un ciclo multi-agente que, partiendo del handoff de la Parte 1 (`HandoffPayload`), genera borradores de propuesta económica por departamento y los autoevalúa antes de llegar a un humano.
+
+**Flujo de estados:**
+```
+analisis_completo → generando_borrador → en_evaluación → (needs_human_review | analisis_completo)
+```
+
+### Preguntas de Diseño
+
+#### 1. ¿Qué información del estado necesita realmente cada agente evaluador?
+
+Cada evaluador recibe únicamente lo que necesita:
+
+| Evaluador | Entrada | Lógica |
+|-----------|---------|--------|
+| **Readability** | `draft_content` + word/sentence count | py-readability-metrics: FRE ≥ 30, FK ≤ 16, ≥ 100 palabras |
+| **Relevance** | `draft_content` + `rfp_metadata.client_name` + `key_aspects[]` | Verifica mención del cliente, cobertura de aspectos, moneda correcta |
+| **Compliance** | `draft_content` + `rfp_metadata.client_country` | 5 reglas del CONTEXT.md §5: PHI, BAA/US, DPA/UK, currency, compliance-mandatory |
+
+Ningún evaluador recibe el contenido completo del PDF original — solo el borrador y los metadatos relevantes.
+
+#### 2. ¿Cómo evitas que dos evaluadores en paralelo entren en conflicto?
+
+Los evaluadores son **puramente funcionales**: no comparten estado ni se comunican entre sí. Cada uno recibe el mismo `draft_content` y devuelve una evaluación independiente. El `evaluate_section()` combina los 3 resultados con un AND lógico (`overall_pass = readability AND relevance AND compliance`).
+
+No hay locks, semáforos ni estado mutable compartido. Los evaluadores se ejecutan **realmente en paralelo** mediante `asyncio.gather(readability, relevance, compliance)` dentro de `evaluate_section()`. Además, los departamentos se procesan de forma **concurrente** con `asyncio.gather()` sobre las tareas de cada departamento, por lo que ni los evaluadores entre sí ni los departamentos entre sí se bloquean mutuamente.
+
+#### 3. Cuando una sección llega a `needs_human_review` tras agotar iteraciones, ¿cómo se lo muestras a Ventas?
+
+El `Part2Handoff` contiene por cada departamento:
+
+```json
+{
+  "department_id": "revenue",
+  "finalized_draft": "texto del último borrador (incluso si falló)",
+  "evaluation": {
+    "readability": {"pass": false, "score": 15.2, "details": "..."},
+    "relevance": {"pass": true, "missing_aspects": [], "details": "..."},
+    "compliance": {"pass": false, "rule_ids": ["currency-country"], "violations": ["Cliente US: debe estar en USD"]},
+    "overall_pass": false,
+    "feedback_for_generator": "[CUMPLIMIENTO] ..."
+  },
+  "needs_human_review": true,
+  "iteration_count": 3
+}
+```
+
+Ventas ve en el ticket `status = needs_human_review`, accede a `handoff_payload.departments[]` desde la UI, y ve qué evaluaciones fallaron con el detalle de cada violación. Puede editar el borrador directamente y re-enviar a evaluación o aprobar manualmente.
+
+#### 4. ¿El feedback que recibe el generador tras un fallo es lo suficientemente específico?
+
+Sí. El `feedback_for_generator` se construye con prefijos por evaluador:
+
+- `[LEGIBILIDAD]` → "Demasiado corto: 45 palabras (mínimo 100)"
+- `[PERTINENCIA]` → "Aspectos no cubiertos: BAA, renewal"
+- `[CUMPLIMIENTO]` → "Violaciones: Cliente US sin cláusula BAA"
+
+Cada iteración el generador recibe el feedback completo y lo incorpora en su prompt con instrucciones explícitas de corregir esos puntos.
+
+### Arquitectura
+
+```
+                         ┌──────────────┐
+                         │  Handoff P1  │
+                         │  (ticket_id, │
+                         │   metadata,  │
+                         │  departments)│
+                         └──────┬───────┘
+                                │
+                    ┌───────────┴────────────┐
+                    │    run_part2_pipeline  │
+                    │    (cycle.py)          │
+                    └───────────┬────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          │ revenue             │ clinical            │ compliance
+          ▼                     ▼                     ▼
+    ┌──────────┐          ┌──────────┐          ┌──────────┐
+    │Generator │          │Generator │          │Generator │
+    │(LLM/rule)│          │(LLM/rule)│          │(LLM/rule)│
+    └────┬─────┘          └────┬─────┘          └────┬─────┘
+         │                     │                     │
+         ▼                     ▼                     ▼
+    ┌─────────────────────────────────────────────────────┐
+    │               evaluate_section()                    │
+    │  ┌───────────┐  ┌──────────┐  ┌──────────┐          │
+    │  │Readability│  │Relevance │  │Compliance│          │
+    │  │evaluator  │  │evaluator │  │evaluator │          │
+    │  └───────────┘  └──────────┘  └──────────┘          │
+    └──────────────────────┬──────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │ overall_pass?           │
+              │ Sí → mark completed     │
+              │ No → iteration < 3?     │
+              │   Sí → generator con    │
+              │        feedback         │
+              │   No → needs_human_     │
+              │        review           │
+              └─────────────────────────┘
+```
+
+### Archivos Implementados
+
+| Archivo | Propósito |
+|---------|-----------|
+| `data/pipelines/rfp_intake/models_part2.py` | Modelos Pydantic: EvaluationType, ReadabilityEval, RelevanceEval, ComplianceEval, EvaluationResult, DraftContent, Part2DepartmentState, Part2PipelineState, Part2DepartmentOutput, Part2Handoff |
+| `data/pipelines/rfp_intake/generators.py` | Generadores LLM por departamento + fallback rule-based. Prompts de sistema por departamento (revenue, clinical, compliance) |
+| `data/pipelines/rfp_intake/evaluators.py` | 3 evaluadores: readability (py-readability-metrics), relevance (key_aspects), compliance (5 reglas CONTEXT.MD) |
+| `data/pipelines/rfp_intake/cycle.py` | Orquestador `run_part2_pipeline()`: ciclo generador → 3 evaluadores → iteración ↔ handoff a P3 |
+| `data/pipelines/rfp_intake/graph.py` | Nodo 8 añadido al pipeline principal, después de synthesize. Persiste drafts y evaluations en DepartmentSectionDB |
+
+### Modelos de Datos
+
+```python
+class EvaluationResult(BaseModel):
+    section_id: str
+    department_id: str
+    readability: ReadabilityEval   # pass_, score, details
+    relevance: RelevanceEval       # pass_, missing_aspects[], details
+    compliance: ComplianceEval     # pass_, rule_ids[], violations[], details
+    overall_pass: bool
+    feedback_for_generator: str    # feedback accionable
+
+class Part2Handoff(BaseModel):
+    ticket_id: str
+    rfp_metadata: RfpMetadata
+    departments: list[Part2DepartmentOutput]
+    synthesis: str | None
+    overall_status: str  # "needs_human_review" | "analisis_completo"
+```
+
+### Cumplimiento de Reglas (CONTEXT.md §5)
+
+| Regla | ID | Evaluador | Implementación |
+|-------|----|-----------|----------------|
+| Sin PHI | `phi-detected` | compliance | Regex PHI_PATTERNS + PHI_NAME_PATTERNS sobre el borrador |
+| BAA para US | `baa-us` | compliance | Verifica presencia de "BAA" o "Business Associate Agreement" |
+| DPA para UK | `dpa-uk` | compliance | Verifica "DPA", "Data Processing Agreement" o "UK GDPR" |
+| USD/US, GBP/UK | `currency-country` | compliance | Verifica moneda correcta según `client_country` |
+| Compliance obligatorio | `compliance-mandatory` | compliance | Verifica palabras clave de compliance en toda propuesta |
+
+### Estados del Ticket (Parte 2)
+
+| Estado | Descripción | Transición desde |
+|--------|-------------|------------------|
+| `generando_borrador` | Generadores escribiendo secciones | `analisis_completo` |
+| `en_evaluación` | Evaluadores en paralelo mediante `asyncio.gather()` / ciclo generador-evaluador | `generando_borrador` |
+| `needs_human_review` | Límite de iteraciones agotado; último borrador + EvaluationResult pasan a Parte 3 | `en_evaluación` |
+
+### Tests
+
+| Archivo | Tests | Cobertura |
+|---------|-------|-----------|
+| `tests/pipelines/test_rfp_generators.py` | 8 | Fallback por departamento, LLM fallback, prompts, feedback, departamento desconocido |
+| `tests/pipelines/test_rfp_evaluators.py` | 19 | Readability (corto/largo), Relevance (cliente ausente/aspectos faltantes), Compliance (PHI, BAA, DPA, currency, mandatory), evaluación completa |
+| `tests/pipelines/test_rfp_part2.py` | 27 | `TicketStatus` enum, `Part2DepartmentOutput` (approval_status, draft_content, evaluation_results), `Part2Handoff`, `Part2PipelineState`, `extract_key_aspects`, `run_part2_pipeline` (ciclo completo, max iteraciones, needs_human_review, approval_status persistence) |
+
+**Total Parte 2: 54 tests** (8 + 19 + 27).
+**Total global RFP: 357 tests** (320 pipeline + 10 MCP auth + 27 Part 2).
+
+**Caso de compliance anclado a CONTEXT.md (§5):** `test_baa_missing_for_us_fails` verifica que un borrador para cliente US sin cláusula BAA dispara la regla `baa-us` con violación explícita.
+
+### Limitaciones Conocidas
+
+- El fallback rule-based para generadores produce texto genérico
+- No hay cache de evaluaciones entre iteraciones (cada iteración re-evalúa desde cero)
+- `py-readability-metrics` puede no estar disponible en todos los entornos (fallback graceful)

@@ -278,6 +278,17 @@ La API principal (`services/api/main.py`) no arranca en Python 3.14 por incompat
 - **Contexto de build**: siempre `.` (raíz), con `.dockerignore` para filtrar.
 - **Montajes**: bind mounts de código fuente + volúmenes anónimos para `node_modules`.
 - **Variables de entorno**: via `env_file: .env`.
+
+## Async Patterns (RFP Pipeline Part 2)
+
+El pipeline de generación y evaluación de borradores usa `asyncio` para paralelismo real:
+
+- **Evaluadores en paralelo**: `asyncio.gather(readability, relevance, compliance)` en `evaluate_section()` — los 3 corren concurrentemente.
+- **Departamentos concurrentes**: `asyncio.gather(dept_tasks)` en `run_part2_pipeline()` — revenue, clinical, compliance sin orden secuencial.
+- **LLM calls no bloqueantes**: `await asyncio.to_thread(client.chat.completions.create, ...)` para evitar bloquear el event loop.
+- **Configuración de tests**: `pytest-asyncio>=1.5.0` con `asyncio_default_fixture_loop_scope = "function"` en pyproject.toml. `pytestmark = pytest.mark.asyncio` a nivel de módulo.
+- **Comando de tests**: `uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py tests/pipelines/test_rfp_generators.py tests/pipelines/test_rfp_evaluators.py -v --tb=short`
+- **Resultado**: 43/43 tests pasan.
 - **Comunicación**: por nombre de servicio Docker (`http://backend:8000`, `http://incidents-backend:8010`, `redis://redis:6379/0`).
 
 ## RAG Knowledge Base — Stack y configuración

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Pipeline RFP Intake — recepción, clasificación y descomposición de RFPs.
 
 Este paquete implementa el pipeline agéntico de recepción de RFPs:

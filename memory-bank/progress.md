@@ -34,7 +34,7 @@
     - `TestMemoryGraphIntegration` (**9 tests**, incluyendo **5 tests E2E**: approve_cycle, reject_cycle, discard_cycle, **PHI-rejected auto-evaluate, PHI-rejected set_pending, consolidación**)
     - **62/62 tests de memoria pasan + 32 tests originales = 94 tests en test_agent_graph.py.**
 
-  - **Completado**: **305 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc. + 62 guardrails + 19 nuevos classifier).
+  - **Completado**: **357 tests totales** en la suite del workspace (94 memory+agent + 130 de sales_forecast, MCP auth, nightly, etc. + 62 guardrails + 27 Part 2 + 19 + 25 nuevos classifier).
 
 - **Completado**: **Rediseño del clasificador** (Bug 15): de listas planas de patrones a clasificador estructural con 6 ejes analíticos. Resuelve de raíz 3 bugs reportados por el usuario:
   - Bug 12: "si llueve" → ahora discard (eje pregunta/condicional)
@@ -208,6 +208,42 @@
   - Bug 1: `route_after_retrieve_v2` prioriza `generate_answer` cuando hay chunks RAG (antes iba directo a `synthesize_tool_answer`, descartando el contexto RAG).
   - Bug 2: `route_after_generate` ahora considera `tool_errors` además de `tool_results` para decidir si va a `synthesize_tool_answer`.
   - Bug 3: `node_synthesize_tool_answer` incluye la respuesta RAG en modo combinado aun si la tool falla (antes mostraba solo error y omitía el RAG).
+
+### Hito 9 · RFP Pipeline — Parte 2: Generación y Evaluación de Borradores (2026-11-24)
+
+- **Completado**: Parte 1 del pipeline RFP (convertir, clasificar, descomponer, sintetizar) — 293 tests.
+- **Completado**: Parte 2 — Ciclo generador-evaluador de borradores por departamento:
+  - `data/pipelines/rfp_intake/models_part2.py`: Modelos Pydantic (EvaluationResult, Part2DepartmentOutput con `approval_status`, Part2Handoff, etc.)
+  - `data/pipelines/rfp_intake/generators.py`: Generadores LLM + fallback rule-based por departamento
+  - `data/pipelines/rfp_intake/evaluators.py`: 3 evaluadores async en paralelo (readability, relevance, compliance)
+  - `data/pipelines/rfp_intake/cycle.py`: Orquestador con `asyncio.gather()` sobre departamentos y ciclo generador-evaluador
+  - `data/pipelines/rfp_intake/graph.py`: Nodo 8 `run_part2_pipeline`, persistencia de drafts/evaluations/approval_status en DepartmentSectionDB
+  - Flujo de estados: `analisis_completo → generando_borrador → en_evaluación → (needs_human_review | analisis_completo)`
+
+- **Completado**: 6 bugs corregidos:
+  1. Metadata INSERT nunca se ejecutaba (sin `else:` en `if existing_meta:`) — `graph.py`
+  2. Enriquecimiento post-clasificación no persistido — `graph.py`
+  3. Readability fields incompletos + formato API incorrecto — `models_rfp.py`, `graph.py`, `routes/rfp.py`
+  4. reprocess_ticket no limpia DepartmentSectionDB — `routes/rfp.py`
+  5. get_ticket no expone Part 2 fields (draft_content, evaluation_results, approval_status) — `routes/rfp.py`
+  6. approval_status no se persiste en DepartmentSectionDB — `graph.py`
+
+- **Completado**: `from __future__ import annotations` añadido a `data/pipelines/rfp_intake/__init__.py` y `mcps/__init__.py`.
+
+- **Completado**: 27 nuevos tests en `tests/pipelines/test_rfp_part2.py`:
+  - `TestTicketStatusEnum` (5): valores del enum
+  - `TestPart2DepartmentOutput` (8): approval_status, draft_content, evaluation_results
+  - `TestPart2Handoff` (3): estructura con departamentos, overall_status
+  - `TestPart2PipelineState` (2): estructura del estado
+  - `TestExtractKeyAspects` (3): extracción de aspectos clave
+  - `TestRunPart2Pipeline` (6 async): ciclo completo, max iteraciones, needs_human_review, approval_status persistence, sin departamentos
+
+- **Tests**: **357 tests totales** (`uv run python -m pytest tests/ -v`): 293 pipeline + 10 MCP auth + 54 Part 2. **0 fallos**.
+
+- **Pendiente**:
+  - Prueba con Celery + Docker compose
+  - Tests de integración E2E con PostgreSQL real
+  - UI de aprobación / revisión humana de borradores
 - **Completado**: 2 nuevos tests en `TestMixedSynthesis` — verifica que rag+incident combina ambas fuentes y que el fallo de tool en modo combinado incluye RAG + error honesto.
 - **Completado**: Trazas regeneradas con ticket real (ID 2, no el inexistente 482) y timestamps reales para evitar artefactos de mock. `scripts/regenerate_traces.py` reescrito sin mocks — usa servicios reales: RAG 5788ms, Incidente 41ms (branch_label "London West End"), Combinado 2892ms, Fallback 1649ms.
 - **Completado**: routing_log corregido: `receive_question → classify_query` en lugar del antiguo `receive_question → retrieve_context`.
@@ -401,6 +437,34 @@
 - 45 errores iniciales de TypeScript en `suppliersProxy.test.ts` resueltos.
 - Tests ejecutándose correctamente: 11/11 passed (0.723s).
 
+### Hito 9 · RFP Pipeline — Parte 2: Generación y Evaluación de Borradores (2026-11-24)
+
+- **Completado**: Ciclo multi-agente que genera borradores de propuesta por departamento y los autoevalúa con hasta 3 iteraciones.
+
+- **Arquitectura async/paralelo**:
+  - Evaluadores ejecutados **realmente en paralelo** mediante `asyncio.gather(readability, relevance, compliance)` en `evaluate_section()`.
+  - Departamentos procesados de forma **concurrente** con `asyncio.gather(dept_tasks)` en `run_part2_pipeline()`.
+  - Generador LLM envuelto con `asyncio.to_thread()` para no bloquear el event loop.
+
+- **Archivos creados/modificados**:
+  - `data/pipelines/rfp_intake/models_part2.py` — 10 modelos Pydantic (EvaluationType, ReadabilityEval, RelevanceEval, ComplianceEval, EvaluationResult, DraftContent, Part2DepartmentState, Part2PipelineState, Part2DepartmentOutput, Part2Handoff)
+  - `data/pipelines/rfp_intake/generators.py` — 3 prompts de sistema por departamento (revenue-Tom Callahan, clinical-Dr. Reid, compliance-Claire Whitfield) + fallback rule-based
+  - `data/pipelines/rfp_intake/evaluators.py` — 3 evaluadores async: readability (py-readability-metrics), relevance (key_aspects), compliance (5 reglas CONTEXT.md §5)
+  - `data/pipelines/rfp_intake/cycle.py` — Orquestador `run_part2_pipeline()` con `asyncio.gather` para procesamiento concurrente de departamentos
+  - `data/pipelines/rfp_intake/graph.py` — Nodo 8 añadido al pipeline principal, persistencia en DepartmentSectionDB
+
+- **5 reglas de compliance** (CONTEXT.md §5): `phi-detected`, `baa-us`, `dpa-uk`, `currency-country`, `compliance-mandatory`
+
+- **Estados del ticket**: `analisis_completo → generando_borrador → en_evaluación → (needs_human_review | analisis_completo)`
+
+- **Tests**: **43/43 tests PASS** (`uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py tests/pipelines/test_rfp_generators.py tests/pipelines/test_rfp_evaluators.py -v --tb=short`)
+  - `test_rfp_generators.py`: 8 tests (fallback por departamento, LLM fallback, prompts, feedback, unknown department)
+  - `test_rfp_evaluators.py`: 19 tests (readability corto/largo, relevance cliente ausente/aspectos, compliance PHI/BAA/DPA/currency/mandatory, evaluación completa)
+
+- **Documentación**: `agentic-workflows.md` — sección Parte 2 con 4 preguntas de diseño, diagrama de arquitectura, tabla de archivos, modelos de datos, compliance rules, estados del ticket, tests coverage y limitaciones.
+
+- **Branch**: `agentic-workflows`
+
 12. **Correcciones runtime (docker compose up)**:
 - **Backend (8000) — Supabase graceful skip**: `DATABASE_URL` vacío provocaba crash en `init_supabase_schema()`. Solucionado con verificación `if not DATABASE_URL: logger.info(...); return`.
 - **Backoffice (3001) — Module not found**: Turbopack no resuelve imports fuera del directorio del proyecto (`../../../src/...`). Solucionado montando `./src` dentro de `uis/backoffice/src` en docker-compose.yml y cambiando imports a `../src/...`.
@@ -524,7 +588,7 @@
   6. **`graph.py` — Metadata INSERT nunca se ejecutaba (Bug 1)**: `if existing_meta:` no tenía rama `else:` — en el primer pipeline run no se creaba ninguna fila en `rfp_metadata`. `GET /rfp/tickets/{id}` devolvía `metadata: null` siempre. Corregido con rama `else:` completa.
   7. **`graph.py` — Enriquecimiento post-clasificación no persistido (Bug 2)**: `client_name`, `client_country`, `program_type`, etc. se asignaban a `metadata.*` en memoria pero nunca se hacía commit a DB. Corregido con bloque `with Session(engine) as session:` que hace upsert.
   8. **`models_rfp.py` + `graph.py` + `routes/rfp.py` — Readability fields incompletos + formato API incorrecto (Bug 3)**: DB solo tenía 3 fields planos; API devolvía fields planos en lugar de estructura anidada `readability: { ... }`. Corregido: (a) 4 nuevos campos DB, (b) mapeo completo 7 campos en graph.py, (c) transformación a estructura anidada en routes/rfp.py.
-- **Tests**: **293/293 tests pasan** (16 classifier + workers + 277 del resto de la suite pipeline). Los 3 archivos modificados son sintácticamente válidos.
+- **Tests**: **357/357 tests pasan** (293 pipeline + 10 MCP auth + 54 Part 2). Los 4 archivos modificados son sintácticamente válidos.
 - **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy y procesados con LLM real:
   - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅ — client_name: "Meridian Manufacturing, Inc.", country: US, program: occupational_health
   - RFP-2 (Thames Valley University) → `analisis_completo` ✅ — client_name: "Thames Valley University", country: UK, program: referral_network

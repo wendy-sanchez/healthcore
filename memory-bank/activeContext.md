@@ -144,16 +144,18 @@
   2. `r"\bphi\b"` duplicado en `_DOMAIN_KEYWORDS` de `content_guard.py:83`. Eliminada duplicación.
   3. Cobertura de tests a nivel nodo: 6 nuevos tests (jailbreak block, domain pass, clean output, PHI replacement, 2 routing de auto_evaluate_v2).
 
-- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **317 tests totales workspace**. **0 fallos**.
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **357 tests totales workspace**. **0 fallos**.
 - **Documentación**: `agent-memory-harness-guard.md` — §13-19 actualizado con OUT_OF_DOMAIN, §14 ampliado con TestGraphHarnessIntegration (12 tests), bugfixes post-auditoría documentados, §18 auditoría a 35/35 puntos.
 - **Branch**: `feature/agent-memory`.
 
-## Hito 9 · RFP Pipeline — Bugs de metadata y readability corregidos (2026-11-24)
+## Hito 9 · RFP Pipeline — Parte 2 + Bugs de metadata y readability corregidos (2026-11-24)
 
 ### Entregable
-Pipeline RFP completamente funcional con metadatos persistentes en PostgreSQL y métricas de legibilidad expuestas correctamente en la API.
+Pipeline RFP completamente funcional con metadatos persistentes en PostgreSQL, métricas de legibilidad correctas en la API, y ciclo Part 2 generador-evaluador completo.
 
-### Bugs corregidos (3 críticos)
+### Bugs corregidos (6 totales)
+
+#### Bugs de metadata y readability (Parte 1)
 
 | # | Bug | Archivo | Causa | Fix |
 |---|-----|---------|-------|-----|
@@ -161,16 +163,29 @@ Pipeline RFP completamente funcional con metadatos persistentes en PostgreSQL y 
 | 2 | **Enriquecimiento post-clasificación no persistido** | `graph.py` | `client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency` se asignaban a `metadata.*` en memoria tras clasificación LLM pero **nunca se hacía commit**. | Añadido bloque `with Session(engine) as session:` con `session.merge()` para upsert. |
 | 3 | **Readability fields incompletos + formato API incorrecto** | `models_rfp.py`, `graph.py`, `routes/rfp.py` | DB solo almacenaba 3 de 6 fields de legibilidad; API devolvía fields planos en lugar de anidados bajo `readability` como espera la UI. | (a) 4 nuevos campos DB (`readability_fre_score`, `readability_cl_score`, `readability_ari_score`, `sentence_count`). (b) Mapeo completo 7 campos en graph.py. (c) Transformación a estructura anidada en routes/rfp.py. |
 
+#### Bugs de auditoría completa (Parte 2)
+
+| # | Bug | Archivo | Síntoma | Causa | Fix |
+|---|-----|---------|---------|-------|-----|
+| 4 | **reprocess_ticket no limpia DepartmentSectionDB** | `routes/rfp.py` | Al reprocesar, las secciones viejas de Part 2 se acumulaban | No se eliminaban los registros antiguos | Bucle `for old in existing_sections: session.delete(old)` + `session.commit()` |
+| 5 | **get_ticket no expone Part 2 fields** | `routes/rfp.py` | `draft_content`, `evaluation_results`, `approval_status` no llegaban a la UI | `DepartmentSectionResponse` no incluía estos campos | Añadidos 3 campos + mapeo en `get_ticket()` |
+| 6 | **approval_status no se persiste en DepartmentSectionDB** | `graph.py` | `approval_status` quedaba como `"pending"` aunque Part 2 lo hubiera cambiado | Parte 2 persist no copiaba `approval_status` de `Part2DepartmentOutput` a DB | Añadido `dept_db.approval_status = dept_out.approval_status` en persistencia |
+
 ### Archivos modificados
 
 - **`services/api/models_rfp.py`**: Añadidos 4 campos nuevos a `RfpMetadataDB`: `readability_fre_score` (Float), `readability_cl_score` (Float), `readability_ari_score` (Float), `sentence_count` (Integer, nullable=True).
-- **`data/pipelines/rfp_intake/graph.py`**: Dos bloques nuevos: (1) rama `else:` en metadata persist block para INSERT inicial. (2) Bloque post-clasificación que persiste metadatos enriquecidos. Mapeo completo de todos los campos de `ReadabilityMetrics` a los campos DB.
-- **`services/api/routes/rfp.py`**: Transformación de fields planos de DB a estructura anidada: `{metadata: {...}, readability: {...}}` con los 6 campos que espera la UI.
-- **`agentic-workflows.md`**: Tabla de infraestructura ampliada con 3 bugs, tabla de bugs corregidos actualizada, limitaciones conocidas actualizadas.
+- **`data/pipelines/rfp_intake/graph.py`**: (1) Rama `else:` en metadata persist block para INSERT inicial. (2) Bloque post-clasificación que persiste metadatos enriquecidos. (3) Mapeo completo `ReadabilityMetrics` → DB. (4) Persistencia de `approval_status` en `DepartmentSectionDB`.
+- **`data/pipelines/rfp_intake/__init__.py`**: Añadido `from __future__ import annotations`.
+- **`data/pipelines/rfp_intake/models_part2.py`**: Añadido `approval_status: str = "pending"` a `Part2DepartmentOutput`.
+- **`mcps/__init__.py`**: Añadido `from __future__ import annotations`.
+- **`services/api/routes/rfp.py`**: Transformación fields planos → `readability: {...}`. Limpieza `DepartmentSectionDB` en reprocess. Exposición de `draft_content`, `evaluation_results`, `approval_status` en `get_ticket`.
+- **`agentic-workflows.md`**: Tabla de estados ampliada con Part 2, tests actualizados (357), limitaciones conocidas renombradas.
+- **`tests/pipelines/test_rfp_part2.py`**: **Nuevo archivo** — 27 tests para Part 2.
 
 ### Tests
-- **293/293 tests pasan** (`uv run python -m pytest tests/pipelines/ -v`): 16 de classifier + workers + 277 del resto de la suite pipeline.
-- Los 3 archivos modificados son sintácticamente válidos (verificado con `python -c "import ast; ast.parse(...)"` y `uv run python -c "from ... import ..."`).
+- **357/357 tests pasan** (`uv run python -m pytest tests/pipelines/ -v`): 293 pipeline + 10 MCP auth + 54 Part 2.
+- Nuevos tests Part 2: `TicketStatus` enum, `Part2DepartmentOutput` (approval_status, draft_content, evaluation_results), `Part2Handoff`, `Part2PipelineState`, `extract_key_aspects`, `run_part2_pipeline` (ciclo completo, max iteraciones, needs_human_review, approval_status persistence).
+- Los archivos modificados son sintácticamente válidos.
 - **No hay test E2E con PostgreSQL real** — dependencia de mock/SQLite para tests unitarios.
 
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
@@ -931,3 +946,37 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 ### URL pública (Playground)
 - `https://congenial-pancake-gxq77rxwr56q3v7x4-9100.app.github.dev/mcp`
 - Verificada con `tools/list` → 10 tools, `tools/call` → write rejection, CORS preflight → 204
+
+## Hito 9 · RFP Pipeline — Parte 2: Generación y Evaluación de Borradores (2026-11-24)
+
+### Entregable
+Ciclo multi-agente que genera borradores de propuesta por departamento y los autoevalúa en paralelo, con iteraciones hasta 3 y handoff a humano si se agotan.
+
+### Arquitectura Async
+- **Evaluadores en paralelo real**: `asyncio.gather(readability, relevance, compliance)` dentro de `evaluate_section()` — ninguno bloquea a los otros.
+- **Departamentos concurrentes**: `asyncio.gather()` sobre las tareas de cada departamento (revenue, clinical, compliance) — no hay orden secuencial entre departamentos.
+- **Generador async**: `generate_draft` envuelve la llamada LLM bloqueante con `await asyncio.to_thread()`.
+- **5 reglas de compliance** (CONTEXT.md §5): PHI, BAA/US, DPA/UK, currency-country, compliance-mandatory.
+
+### Archivos
+- `data/pipelines/rfp_intake/models_part2.py` — 10 modelos Pydantic estructurados
+- `data/pipelines/rfp_intake/generators.py` — 3 prompts de departamento + fallback rule-based
+- `data/pipelines/rfp_intake/evaluators.py` — 3 evaluadores async + `asyncio.gather` en `evaluate_section`
+- `data/pipelines/rfp_intake/cycle.py` — Orquestador con departamentos concurrentes
+- `data/pipelines/rfp_intake/graph.py` — Nodo 8, persistencia en DepartmentSectionDB
+
+### Tests
+- **43/43 tests PASS** (16 originales + 27 nuevos de Parte 2)
+- `test_rfp_generators.py` — 8 tests (fallback, LLM, prompts, feedback, unknown)
+- `test_rfp_evaluators.py` — 19 tests (readability, relevance, compliance, full eval)
+
+### Estados del Ticket
+```
+analisis_completo → generando_borrador → en_evaluación → needs_human_review | analisis_completo
+```
+
+### Limitaciones Conocidas
+- Fallback rule-based produce texto genérico
+- Sin caché de evaluaciones entre iteraciones
+- `py-readability-metrics` puede no estar disponible (fallback graceful)
+- Sin test E2E con PostgreSQL real

@@ -1,0 +1,85 @@
+{
+  "run_id": "832e1a4b-cf82-42eb-bbd4-e9a9ae0b3153",
+  "question": "¿Qué es HealthCore?",
+  "answer": "Respuesta simulada.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "input_guardrail → OK",
+    "check_pending_proposal → continue (sin propuesta pendiente)",
+    "classify_query → rag",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada con harness)",
+    "output_guardrail → OK"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.478638+00:00",
+      "metadata": {
+        "question_length": 19
+      }
+    },
+    {
+      "node": "input_guardrail",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.479640+00:00",
+      "metadata": {
+        "classification": "domain",
+        "blocked": false,
+        "confidence": 0.9,
+        "reason": "Input is within the HealthCore compliance domain."
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.480689+00:00",
+      "metadata": {
+        "num_memory_facts": 0,
+        "has_pending_proposal": false
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.482082+00:00",
+      "metadata": {
+        "decision": "rag",
+        "has_incident": false,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.483004+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.483872+00:00",
+      "metadata": {
+        "answer_length": 19,
+        "llm_proposal": false,
+        "harness_active": true
+      }
+    },
+    {
+      "node": "output_guardrail",
+      "status": "ok",
+      "timestamp": "2026-11-24T22:19:00.485586+00:00",
+      "metadata": {
+        "answer_length": 19
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 19,
+  "timestamp": "2026-11-24T22:19:00.486031+00:00"
+}
