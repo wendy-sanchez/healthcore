@@ -152,10 +152,18 @@ def synthesize(
     synthesis_text = "\n".join(synthesis_parts)
 
     # ── Construir handoff payload ───────────────────────────────────
+    # Limpiar raw_extract de departments para evitar inflar la DB
+    import copy
+    clean_departments = []
+    for d in departments:
+        clean = copy.copy(d)
+        clean.raw_extract = None
+        clean_departments.append(clean)
+
     handoff_payload = HandoffPayload(
         ticket_id=ticket_id,
         rfp_metadata=metadata,
-        departments=departments,
+        departments=clean_departments,
         synthesis=synthesis_text,
     )
 
@@ -182,8 +190,6 @@ def _detect_conflicts(departments: list[DepartmentSection], metadata: RfpMetadat
     conflicts: list[str] = []
 
     # Buscar por departamento en la lista
-    revenue_dept = next((d for d in departments if d.department_id == "revenue"), None)
-    clinical_dept = next((d for d in departments if d.department_id == "clinical"), None)
     compliance_dept = next((d for d in departments if d.department_id == "compliance"), None)
 
     # Conflicto 1: Moneda vs. país

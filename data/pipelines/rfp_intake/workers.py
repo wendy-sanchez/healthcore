@@ -36,6 +36,7 @@ Tu tarea es leer los extractos de una RFP que son relevantes para tu departament
 1. **Aspectos clave (key_aspects)**: información relevante para tu departamento. Cada aspecto debe tener:
    - aspect: nombre corto del aspecto
    - detail: descripción detallada
+   - source_reference: sección o párrafo del documento donde se menciona (opcional pero útil)
    - confidence: "high" si está explícito en el documento, "medium" si es inferencia razonable, "low" si es especulativo
 
 2. **Preguntas abiertas (open_questions)**: información que tu departamento necesita pero que NO está en el documento. NUNCA inventes cifras.
@@ -50,7 +51,7 @@ Reglas:
 Responde SOLO con un JSON con esta estructura:
 {{
     "key_aspects": [
-        {{"aspect": "...", "detail": "...", "confidence": "high/medium/low"}}
+        {{"aspect": "...", "detail": "...", "source_reference": "...", "confidence": "high/medium/low"}}
     ],
     "open_questions": [...],
     "contains_phi": false

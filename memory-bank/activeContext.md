@@ -148,6 +148,31 @@
 - **Documentación**: `agent-memory-harness-guard.md` — §13-19 actualizado con OUT_OF_DOMAIN, §14 ampliado con TestGraphHarnessIntegration (12 tests), bugfixes post-auditoría documentados, §18 auditoría a 35/35 puntos.
 - **Branch**: `feature/agent-memory`.
 
+## Hito 9 · RFP Pipeline — Bugs de metadata y readability corregidos (2026-11-24)
+
+### Entregable
+Pipeline RFP completamente funcional con metadatos persistentes en PostgreSQL y métricas de legibilidad expuestas correctamente en la API.
+
+### Bugs corregidos (3 críticos)
+
+| # | Bug | Archivo | Causa | Fix |
+|---|-----|---------|-------|-----|
+| 1 | **Metadata INSERT nunca se ejecutaba** | `graph.py` | `if existing_meta:` actualizaba filas existentes pero **no había `else:`** — en el primer pipeline run no se creaba ninguna fila en `rfp_metadata`. `GET /rfp/tickets/{id}` devolvía `metadata: null` siempre. | Añadida rama `else:` con `RfpMetadataDB(ticket_id=..., ...)` que inserta la fila completa. |
+| 2 | **Enriquecimiento post-clasificación no persistido** | `graph.py` | `client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency` se asignaban a `metadata.*` en memoria tras clasificación LLM pero **nunca se hacía commit**. | Añadido bloque `with Session(engine) as session:` con `session.merge()` para upsert. |
+| 3 | **Readability fields incompletos + formato API incorrecto** | `models_rfp.py`, `graph.py`, `routes/rfp.py` | DB solo almacenaba 3 de 6 fields de legibilidad; API devolvía fields planos en lugar de anidados bajo `readability` como espera la UI. | (a) 4 nuevos campos DB (`readability_fre_score`, `readability_cl_score`, `readability_ari_score`, `sentence_count`). (b) Mapeo completo 7 campos en graph.py. (c) Transformación a estructura anidada en routes/rfp.py. |
+
+### Archivos modificados
+
+- **`services/api/models_rfp.py`**: Añadidos 4 campos nuevos a `RfpMetadataDB`: `readability_fre_score` (Float), `readability_cl_score` (Float), `readability_ari_score` (Float), `sentence_count` (Integer, nullable=True).
+- **`data/pipelines/rfp_intake/graph.py`**: Dos bloques nuevos: (1) rama `else:` en metadata persist block para INSERT inicial. (2) Bloque post-clasificación que persiste metadatos enriquecidos. Mapeo completo de todos los campos de `ReadabilityMetrics` a los campos DB.
+- **`services/api/routes/rfp.py`**: Transformación de fields planos de DB a estructura anidada: `{metadata: {...}, readability: {...}}` con los 6 campos que espera la UI.
+- **`agentic-workflows.md`**: Tabla de infraestructura ampliada con 3 bugs, tabla de bugs corregidos actualizada, limitaciones conocidas actualizadas.
+
+### Tests
+- **293/293 tests pasan** (`uv run python -m pytest tests/pipelines/ -v`): 16 de classifier + workers + 277 del resto de la suite pipeline.
+- Los 3 archivos modificados son sintácticamente válidos (verificado con `python -c "import ast; ast.parse(...)"` y `uv run python -c "from ... import ..."`).
+- **No hay test E2E con PostgreSQL real** — dependencia de mock/SQLite para tests unitarios.
+
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
 - **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
 - **Causa raíz**: `mcpauth.MCPAuth` crea su propio `ContextVar` interno (`mcp_auth_context`) donde guarda `AuthInfo`. Por otro lado, `_require_tool_scope()` y `_current_client()` en `server.py` leen desde `_auth_info_context` en `mcps/auth.py`. Como son **dos ContextVars distintos**, `get_auth_info()` siempre devolvía `None`, causando que cada `tools/call` lanzara `PermissionError`.

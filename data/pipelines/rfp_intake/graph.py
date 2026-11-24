@@ -15,6 +15,7 @@ El grafo NO se mezcla con el grafo CX del agente de soporte.
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 from datetime import datetime, timezone
@@ -97,7 +98,18 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
         logger.info("[Nodo 2/6] Extrayendo metadatos y legibilidad...")
         metadata, readability = _extract_initial_metadata(markdown_content)
 
-        # Persistir metadatos
+        # Estimar complejidad basada en conteo de palabras
+        if readability.word_count:
+            if readability.word_count < 1000:
+                metadata.estimated_complexity = "low"
+            elif readability.word_count < 5000:
+                metadata.estimated_complexity = "medium"
+            else:
+                metadata.estimated_complexity = "high"
+        else:
+            metadata.estimated_complexity = "medium"
+
+        # Persistir metadatos (upsert)
         with Session(engine) as session:
             from services.api.models_rfp import RfpMetadataDB
             stmt = select(RfpMetadataDB).where(RfpMetadataDB.ticket_id == ticket_id)
@@ -111,8 +123,35 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                 existing_meta.budget_range = metadata.budget_range
                 existing_meta.readability_fk_score = readability.flesch_kincaid_grade
                 existing_meta.readability_gf_score = readability.gunning_fog
+                existing_meta.readability_fre_score = readability.flesch_reading_ease
+                existing_meta.readability_cl_score = readability.coleman_liau_index
+                existing_meta.readability_ari_score = readability.automated_readability_index
                 existing_meta.word_count = readability.word_count
+                existing_meta.sentence_count = readability.sentence_count
                 session.add(existing_meta)
+            else:
+                # Crear fila de metadatos si no existe
+                new_meta = RfpMetadataDB(
+                    ticket_id=ticket_id,
+                    client_name=metadata.client_name,
+                    client_country=metadata.client_country,
+                    program_type=metadata.program_type,
+                    covered_population=metadata.covered_population,
+                    deadline=metadata.deadline,
+                    budget_range=metadata.budget_range,
+                    currency=metadata.currency,
+                    departments_needed=metadata.departments_mentioned or None,
+                    extra_departments_mentioned=metadata.extra_departments_mentioned or None,
+                    readability_fk_score=readability.flesch_kincaid_grade,
+                    readability_gf_score=readability.gunning_fog,
+                    readability_fre_score=readability.flesch_reading_ease,
+                    readability_cl_score=readability.coleman_liau_index,
+                    readability_ari_score=readability.automated_readability_index,
+                    word_count=readability.word_count,
+                    sentence_count=readability.sentence_count,
+                    estimated_complexity=metadata.estimated_complexity,
+                )
+                session.add(new_meta)
             session.commit()
 
         state["metadata"] = metadata.model_dump()
@@ -150,6 +189,36 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                 pass
         if classification.get("deadline"):
             metadata.deadline = classification["deadline"]
+        if classification.get("budget_range"):
+            metadata.budget_range = classification["budget_range"]
+        if classification.get("currency"):
+            metadata.currency = classification["currency"]
+        if classification.get("departments_needed"):
+            metadata.departments_mentioned = classification["departments_needed"]
+        if classification.get("extra_departments_mentioned"):
+            metadata.extra_departments_mentioned = classification["extra_departments_mentioned"]
+        metadata.has_phi = classification.get("has_phi", False)
+        # Persistir metadatos enriquecidos tras clasificación
+        with Session(engine) as session:
+            from services.api.models_rfp import RfpMetadataDB
+            stmt = select(RfpMetadataDB).where(RfpMetadataDB.ticket_id == ticket_id)
+            meta_row = session.exec(stmt).first()
+            if meta_row:
+                meta_row.client_name = metadata.client_name
+                meta_row.client_country = metadata.client_country
+                meta_row.program_type = metadata.program_type
+                meta_row.covered_population = metadata.covered_population
+                meta_row.deadline = metadata.deadline
+                meta_row.budget_range = metadata.budget_range
+                meta_row.currency = metadata.currency
+                meta_row.departments_needed = metadata.departments_mentioned or None
+                meta_row.extra_departments_mentioned = metadata.extra_departments_mentioned or None
+                meta_row.has_phi = metadata.has_phi
+                session.add(meta_row)
+                session.commit()
+
+        # Actualizar state con metadatos enriquecidos tras clasificación
+        state["metadata"] = metadata.model_dump()
 
         logger.info("Documento clasificado como RFP. Metadatos: cliente=%s, país=%s, programa=%s",
                      metadata.client_name, metadata.client_country, metadata.program_type)
@@ -279,7 +348,7 @@ def _extract_initial_metadata(markdown_content: str) -> tuple[RfpMetadata, Reada
     # Detectar país
     if "united kingdom" in content_lower or " uk " in content_lower or "london" in content_lower:
         metadata.client_country = "UK"
-    elif "united states" in content_lower or "us " in content_lower or "austin" in content_lower:
+    elif "united states" in content_lower or re.search(r'\bUS\b|\bUSA\b|\bU\.S\.', markdown_content) or "austin" in content_lower:
         metadata.client_country = "US"
 
     return metadata, readability

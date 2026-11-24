@@ -66,6 +66,7 @@ class RfpMetadata(BaseModel):
     departments_mentioned: list[str] = Field(default_factory=list)
     extra_departments_mentioned: list[str] = Field(default_factory=list)
     estimated_complexity: str | None = None  # "low", "medium", "high"
+    has_phi: bool = False  # True si el clasificador detectó PHI en el documento
 
 
 # ── Key aspects por departamento ─────────────────────────────────────

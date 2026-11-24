@@ -95,10 +95,20 @@ class RfpMetadataDB(SQLModel, table=True):
     """Flesch-Kincaid Grade Level."""
     readability_gf_score: float | None = Field(default=None)
     """Gunning Fog Index."""
+    readability_fre_score: float | None = Field(default=None)
+    """Flesch Reading Ease score."""
+    readability_cl_score: float | None = Field(default=None)
+    """Coleman-Liau Index."""
+    readability_ari_score: float | None = Field(default=None)
+    """Automated Readability Index."""
     word_count: int | None = Field(default=None)
     """Número de palabras del Markdown."""
+    sentence_count: int | None = Field(default=None)
+    """Número de oraciones del Markdown."""
     estimated_complexity: str | None = Field(default=None, max_length=16)
     """low / medium / high — estimación de complejidad."""
+    has_phi: bool = Field(default=False)
+    """True si el clasificador detectó PHI en el documento."""
 
     created_at: datetime = Field(default_factory=_utc_now, nullable=False)
 

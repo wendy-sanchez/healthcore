@@ -290,7 +290,42 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Aunque tienen importancia combinada del ~49,8 %, no son conocibles en `t−1` para un forecast real — si se usan, el modelo necesita sus valores pronosticados por separado.
 - El análisis de justificación se integra como paso 9 del pipeline y se exporta a `metrics.json` bajo `features_justification`.
 
-### 41) Patrón: comparativa antes/después como herramienta de auditoría
+### 42) Patrón RFP: metadata upsert con merge (evita INSERT/UPDATE manual)
+
+La tabla `rfp_metadata` se actualiza en dos momentos del pipeline:
+
+1. **Tras convert + readability** (graph.py líneas 100-143): se guardan métricas de legibilidad con `session.merge()` — si la fila no existe (primer run) la crea, si existe (reprocess) la actualiza. Esto evita tener que distinguir entre INSERT y UPDATE.
+
+2. **Tras clasificación LLM** (graph.py líneas 182-198): los metadatos enriquecidos (`client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency`) se persisten con otro `session.merge()`.
+
+La API (routes/rfp.py) transforma los campos planos de DB a la estructura anidada que espera la UI:
+
+```python
+readability_data = {
+    "flesch_reading_ease": meta.flesch_reading_ease,
+    "flesch_kincaid_grade": meta.flesch_kincaid_grade,
+    "gunning_fog": meta.gunning_fog,
+    "coleman_liau_index": meta.readability_cl_score,
+    "automated_readability_index": meta.readability_ari_score,
+    "word_count": meta.word_count,
+}
+return {"metadata": {..., "readability": readability_data}, ...}
+```
+
+### 43) Patrón RFP: estructura de campo plana en DB → anidada en API
+
+Por limitaciones de SQLModel (no soporta nested models directamente), los campos de legibilidad se almacenan planos en la tabla `rfp_metadata`:
+
+| Campo DB | Tipo | Mapeo API |
+|----------|------|-----------|
+| `flesch_reading_ease` | Float | `readability.flesch_reading_ease` |
+| `flesch_kincaid_grade` | Float | `readability.flesch_kincaid_grade` |
+| `gunning_fog` | Float | `readability.gunning_fog` |
+| `readability_cl_score` | Float | `readability.coleman_liau_index` |
+| `readability_ari_score` | Float | `readability.automated_readability_index` |
+| `word_count` | Integer | `readability.word_count` |
+
+La transformación se hace en `routes/rfp.py` al serializar la respuesta del endpoint `GET /rfp/tickets/{ticket_id}`.
 - `scripts/sales_forecast/compare_before_after.py` replica intencionalmente el bug (`_add_causal_features_with_fuga()`) y entrena un segundo modelo con la corrección, generando una gráfica de 2 paneles:
   - **Panel superior**: predicciones de ambos modelos solapadas sobre los datos reales.
   - **Panel inferior**: diferencia de error absoluto mes a mes, con media discontinua para cada modelo.

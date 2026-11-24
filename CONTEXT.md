@@ -2297,7 +2297,7 @@ Documenta al menos estos intentos, adaptados al contexto de HealthCore:
 
 > Este documento es válido para las tres partes del Hito 9. Léelo completo antes de empezar la Parte 1 — las Partes 2 y 3 reutilizan los mismos departamentos, formato de RFP y lineamientos definidos aquí.
 >
-> ⚠️ **Restricción no negociable:** HealthCore opera bajo HIPAA (EE. UU.) y UK GDPR (Reino Unido). Ningún identificador de paciente ni PHI (Protected Health Information) puede aparecer en ningún evento, tabla, endpoint, log, ticket o documento generado por tu flujo — ni siquiera como ejemplo ilustrativo. Esto aplica en las tres partes de este hito.
+> ⚠️ **Restricción no negociable:** HealthCore opera bajo HIPAA (EE. UU.) y UK GDPR (Reino Unido). Ningún identificador de paciente ni PHI (Protected Health Information) puede aparecer en ningún evento, tabla, endpoint, log, ticket o documento generado por el flujo — ni siquiera como ejemplo ilustrativo. Esto aplica en las tres partes de este hito.
 
 ### 1. Introducción
 

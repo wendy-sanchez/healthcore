@@ -521,6 +521,10 @@
   3. `classifier.py` (rules): EHR pitch no detectado → patrón regex añadido para "our platform was built for", "unified ehr", etc.
   4. `classifier.py` (rules): Referral partnership informal no detectado → patrón regex para "referral partnership", "student health", etc.
   5. **`graph.py` (CRÍTICO)**: `import asyncio` insertado en línea 1 por `sed` quedó ANTES de `from __future__ import annotations` → `SyntaxError`. Movido a después del bloque de imports estándar. El pipeline completo (`run_rfp_pipeline`) no podía importarse.
+  6. **`graph.py` — Metadata INSERT nunca se ejecutaba (Bug 1)**: `if existing_meta:` no tenía rama `else:` — en el primer pipeline run no se creaba ninguna fila en `rfp_metadata`. `GET /rfp/tickets/{id}` devolvía `metadata: null` siempre. Corregido con rama `else:` completa.
+  7. **`graph.py` — Enriquecimiento post-clasificación no persistido (Bug 2)**: `client_name`, `client_country`, `program_type`, etc. se asignaban a `metadata.*` en memoria pero nunca se hacía commit a DB. Corregido con bloque `with Session(engine) as session:` que hace upsert.
+  8. **`models_rfp.py` + `graph.py` + `routes/rfp.py` — Readability fields incompletos + formato API incorrecto (Bug 3)**: DB solo tenía 3 fields planos; API devolvía fields planos en lugar de estructura anidada `readability: { ... }`. Corregido: (a) 4 nuevos campos DB, (b) mapeo completo 7 campos en graph.py, (c) transformación a estructura anidada en routes/rfp.py.
+- **Tests**: **293/293 tests pasan** (16 classifier + workers + 277 del resto de la suite pipeline). Los 3 archivos modificados son sintácticamente válidos.
 - **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy y procesados con LLM real:
   - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅ — client_name: "Meridian Manufacturing, Inc.", country: US, program: occupational_health
   - RFP-2 (Thames Valley University) → `analisis_completo` ✅ — client_name: "Thames Valley University", country: UK, program: referral_network

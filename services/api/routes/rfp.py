@@ -148,16 +148,20 @@ async def list_tickets(db: Session = Depends(get_db)) -> TicketsListResponse:
     """Lista todos los tickets RFP."""
     tickets = db.exec(select(TicketDB).order_by(TicketDB.created_at.desc())).all()
 
+    # Eager-load metadatos para evitar N+1
+    ticket_ids = [t.ticket_id for t in tickets]
+    metadata_rows = db.exec(
+        select(RfpMetadataDB).where(RfpMetadataDB.ticket_id.in_(ticket_ids))
+    ).all()
+    metadata_map: dict[str, RfpMetadataDB] = {m.ticket_id: m for m in metadata_rows}
+
     items = []
     for t in tickets:
         client_name = None
         if t.handoff_payload:
             client_name = t.handoff_payload.get("rfp_metadata", {}).get("client_name")
         if not client_name:
-            # Intentar desde metadata
-            meta = db.exec(
-                select(RfpMetadataDB).where(RfpMetadataDB.ticket_id == t.ticket_id)
-            ).first()
+            meta = metadata_map.get(t.ticket_id)
             if meta:
                 client_name = meta.client_name
 
@@ -201,6 +205,35 @@ async def get_ticket(ticket_id: str, db: Session = Depends(get_db)) -> TicketDet
         for ds in dept_sections
     ]
 
+    # Transformar metadata plana a formato anidado que espera la UI
+    metadata_response = None
+    if meta:
+        metadata_response = {
+            "client_name": meta.client_name,
+            "client_country": meta.client_country,
+            "program_type": meta.program_type,
+            "covered_population": meta.covered_population,
+            "deadline": meta.deadline,
+            "budget_range": meta.budget_range,
+            "currency": meta.currency,
+            "departments_needed": meta.departments_needed or [],
+            "extra_departments_mentioned": meta.extra_departments_mentioned or [],
+            "readability": {
+                "flesch_reading_ease": meta.readability_fre_score,
+                "flesch_kincaid_grade": meta.readability_fk_score,
+                "gunning_fog": meta.readability_gf_score,
+                "coleman_liau_index": meta.readability_cl_score,
+                "automated_readability_index": meta.readability_ari_score,
+                "word_count": meta.word_count or 0,
+            } if any([meta.readability_fk_score is not None,
+                       meta.readability_gf_score is not None,
+                       meta.readability_fre_score is not None,
+                       meta.word_count is not None]) else None,
+            "word_count": meta.word_count,
+            "estimated_complexity": meta.estimated_complexity,
+            "has_phi": meta.has_phi,
+        }
+
     return TicketDetailResponse(
         ticket_id=ticket.ticket_id,
         status=ticket.status,
@@ -210,7 +243,7 @@ async def get_ticket(ticket_id: str, db: Session = Depends(get_db)) -> TicketDet
         error_detail=ticket.error_detail,
         created_at=ticket.created_at.isoformat() if ticket.created_at else "",
         updated_at=ticket.updated_at.isoformat() if ticket.updated_at else "",
-        metadata=meta.model_dump() if meta else None,
+        metadata=metadata_response,
         departments=departments,
     )
 
@@ -231,11 +264,19 @@ async def reprocess_ticket(ticket_id: str, db: Session = Depends(get_db)) -> Rep
             detail=f"El ticket está en estado '{ticket.status}'. Solo se pueden reprocesar tickets en 'error' o 'descartado'.",
         )
 
-    # Resetear estado
+    # Resetear estado y limpiar datos de síntesis previa
     ticket.status = "analizando"
     ticket.error_detail = None
     ticket.classification_reason = None
+    ticket.handoff_payload = None
     db.add(ticket)
+    db.commit()
+    # Eliminar metadatos previos para que se regeneren limpios
+    old_meta = db.exec(
+        select(RfpMetadataDB).where(RfpMetadataDB.ticket_id == ticket_id)
+    ).all()
+    for m in old_meta:
+        db.delete(m)
     db.commit()
 
     logger.info("Ticket %s reabierto para reprocesamiento", ticket_id)

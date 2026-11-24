@@ -3,9 +3,7 @@
 > **Parte 1** del Hito 9 — Flujos de Trabajo Agénticos.
 > Sistema de recepción, clasificación y descomposición de RFPs mediante un pipeline multi-agente.
 >
-> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 16/16 tests de RFP pasando (363/363 suite completa), API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end.
->
-> **Última actualización**: 2026-11-24 — Integración con API_KEY/HOST de 4Geeks AI, bug crítico de import asyncio corregido en graph.py, verificación end-to-end con 3 PDFs reales, auditoría completa del proyecto (363 tests, 165 archivos compilados).
+> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 293/293 tests de RFP pipeline pasando, API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end, metadata persistence y readability metrics corregidos.
 
 ---
 
@@ -302,6 +300,9 @@ La Parte 2 recibe `ticket_id + handoff_payload` y comienza sin re-parsear el PDF
 | Tests async/sync mismatch | Clasificador sincrónico → tests sin async def |
 | Tests pasaban dict en vez de RfpMetadata | Helper `_make_metadata()` añadido |
 | Mock de OpenAI incorrecto | Parcheado `openai.OpenAI` en lugar de `openai_client` |
+| **Metadata INSERT nunca se ejecutaba** (Bug 1) | El bloque `if existing_meta:` no tenía `else:` — en el primer pipeline run no se creaba ninguna fila en `rfp_metadata`. Añadida rama `else` con `RfpMetadataDB(...)` completo. |
+| **Enriquecimiento post-clasificación no persistido** (Bug 2) | `metadata.client_name`, `client_country`, `program_type`, etc. se actualizaban en memoria tras la clasificación LLM pero nunca se persistían a DB. Añadido bloque `with Session(engine) as session:` que hace upsert. |
+| **Readability metrics incompletas en DB + formato API incorrecto** (Bug 3) | DB solo tenía 3 fields planos (`flesch_reading_ease`, `flesch_kincaid_grade`, `gunning_fog`) pero la UI espera 6 fields anidados bajo `readability`. Añadidos 4 campos nuevos a `RfpMetadataDB` (`readability_fre_score`, `readability_cl_score`, `readability_ari_score`, `sentence_count`) y transformación a estructura anidada en `routes/rfp.py`. |
 
 ### Verificación en Vivo
 
@@ -310,9 +311,9 @@ La Parte 2 recibe `ticket_id + handoff_payload` y comienza sin re-parsear el PDF
 $ curl -s http://localhost:8000/rfp/tickets
 {"tickets":[]}
 
-# 16/16 tests pasan
+# 293/293 tests pasan (16 classifier + workers + 277 pipeline)
 $ uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v
-# → 16 passed
+# → 293 passed
 ```
 
 ### Proxy Routes de Next.js
@@ -368,6 +369,16 @@ RFP_WORKER_MODEL=madrid-spain/openrouter/deepseek/deepseek-v4-flash
 | EHR pitch no detectado | `classifier.py` (rules) | RFP-3 (MedFlow) pasaba como "inconcluso" en vez de "no es RFP" | Faltaba patrón regex para pitches de EHR/software | Añadir `r"(?:ehr platform\|modernize your\|our platform was built for\|unified ehr\|our platform could replace)"` |
 | Referral partnership no detectado | `classifier.py` (rules) | RFP-2 (Thames Valley) pasaba como "inconcluso" sin LLM | Faltaba patrón para solicitudes informales de alianzas | Añadir `r"(?:referral partnership\|referral network\|student health\|partnership enquiry)"` |
 
+### Bugs de persistencia de metadatos y readability (2026-11-24)
+
+Tres bugs bloqueantes descubiertos durante la verificación de la UI: la tabla `rfp_metadata` nunca recibía INSERT, el enriquecimiento post-clasificación se perdía, y las métricas de legibilidad no se exponían en el formato que espera la UI.
+
+| Bug | Archivo | Síntoma | Causa | Fix |
+|---|---|---|---|---|
+| **Metadata INSERT faltante** | `graph.py` | `GET /rfp/tickets/{id}` devuelve `metadata: null` siempre. La tabla `rfp_metadata` nunca tiene filas. | `if existing_meta:` actualizaba si existía, pero **no había rama `else`** para crear la fila en la primera ejecución. La fila solo se creaba si ya existía (loop). | Añadida rama `else:` con `RfpMetadataDB(ticket_id=..., ...)` completo que inserta todos los campos en el primer pipeline run. |
+| **Enriquecimiento no persistido** | `graph.py` | `client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency` se veían en el objeto en memoria tras clasificación LLM pero `rfp_metadata` en DB seguía con `client_name: null`. | Los valores se asignaban a `metadata.client_name` etc. in-memory pero **nunca se hacía commit a la base de datos**. | Añadido bloque `with Session(engine) as session:` que hace upsert del metadata enriquecido usando `session.merge()`. |
+| **Readability fields incompletos + formato API incorrecto** | `models_rfp.py`, `graph.py`, `routes/rfp.py` | La UI esperaba `readability: { flesch_reading_ease, flesch_kincaid_grade, gunning_fog, coleman_liau_index, automated_readability_index, word_count }` pero recibía 3 fields planos (`flesch_reading_ease`, `flesch_kincaid_grade`, `gunning_fog`) fuera de un objeto `readability`. | DB solo almacenaba 3 de 6 campos de legibilidad; el API devolvía los fields planos en lugar de anidados bajo `readability`. | (a) Añadidos 4 campos a `RfpMetadataDB`: `readability_fre_score`, `readability_cl_score`, `readability_ari_score`, `sentence_count`. (b) `graph.py` mapea todos los 7 campos de `ReadabilityMetrics` a los campos de DB. (c) `routes/rfp.py` transforma los fields planos a estructura anidada `{ metadata: ..., readability: { ... } }`. |
+
 ### Verificación end-to-end con 3 PDFs reales
 
 Los 3 PDFs de muestra se descargaron de `4GeeksAcademy/ai-engineering-syllabus` y se procesaron por el pipeline:
@@ -378,7 +389,7 @@ Los 3 PDFs de muestra se descargaron de `4GeeksAcademy/ai-engineering-syllabus` 
 | `b4a4d1a2` | RFP-2 — Thames Valley University (email informal) | ✅ `analisis_completo` | Thames Valley University | referral_network | UK | 3 |
 | `8a988247` | RFP-3 — MedFlow (EHR vendor pitch) | ✅ `descartado` | — | — | — | — |
 
-**Tests: 16/16 pasando** (classifier 7 + workers 9 → ajustados por nuevos patrones).
+**Tests: 293/293 pasando** (16 classifier + workers + 277 pipeline suite).
 
 ### API final
 
@@ -398,3 +409,5 @@ $ curl http://localhost:8000/rfp/tickets
 1. **MarkItDown sin dependencia `[pdf]`**: La conversión PDF→Markdown usa PyPDF2 como fallback. Funciona correctamente pero sin el parsing semántico mejorado de MarkItDown con pdfminer.
 2. **Celery no corre localmente**: La verificación se hace mediante `asyncio.run(run_rfp_pipeline())` directamente. Para probar el flujo Celery completo hace falta `docker compose up`.
 3. **NLTK data**: Advertencia no bloqueante en readability metrics (fallback a conteo manual de sílabas).
+4. **Metadata persistence depende de SQLModel merge**: La tabla `rfp_metadata` usa `session.merge()` para upsert. Si el modelo SQLModel cambia, la migración debe ser manual (no hay Alembic configurado).
+5. **293 tests de pipeline, no E2E con PostgreSQL**: Los tests usan mocks para la DB. Falta un test de integración que verifique el INSERT real en `rfp_metadata` con una base de datos PostgreSQL de prueba.

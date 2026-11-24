@@ -60,6 +60,8 @@ Responde SOLO con un JSON válido con estos campos:
 - "covered_population": número entero si se menciona, o null
 - "deadline": fecha en formato YYYY-MM-DD si se menciona, o null
 - "has_phi": true/false — true si el documento contiene nombres de pacientes, diagnósticos con nombre, números de seguro social, o cualquier Protected Health Information
+- "departments_needed": lista de departamentos de HealthCore necesarios para esta propuesta (opciones: "revenue", "clinical", "compliance") o lista vacía si no se mencionan
+- "extra_departments_mentioned": lista de departamentos mencionados que NO existen en HealthCore, o lista vacía
 
 No incluyas markdown, solo JSON."""
 
@@ -72,7 +74,8 @@ def classify_document(markdown_content: str) -> dict:
 
     Returns:
         Diccionario con: is_rfp, confidence, reason, client_name,
-        client_country, program_type, covered_population, deadline, has_phi.
+        client_country, program_type, covered_population, deadline, has_phi,
+        departments_needed, extra_departments_mentioned.
     """
     if not markdown_content or len(markdown_content.strip()) < 20:
         return {
@@ -85,6 +88,8 @@ def classify_document(markdown_content: str) -> dict:
             "covered_population": None,
             "deadline": None,
             "has_phi": False,
+            "departments_needed": [],
+            "extra_departments_mentioned": [],
         }
 
     # Primero: clasificación rápida basada en reglas (pre-filtro)
@@ -190,6 +195,8 @@ def _rule_based_classification(markdown_content: str) -> dict:
                 "covered_population": None,
                 "deadline": None,
                 "has_phi": False,
+                "departments_needed": [],
+                "extra_departments_mentioned": [],
             }
 
     # Patrones de SÍ-RFP (alta confianza)
@@ -215,6 +222,8 @@ def _rule_based_classification(markdown_content: str) -> dict:
                 "covered_population": None,
                 "deadline": None,
                 "has_phi": False,
+                "departments_needed": [],
+                "extra_departments_mentioned": [],
             }
 
     # Si no hay patrón claro, devolver None para que el LLM decida
@@ -228,4 +237,6 @@ def _rule_based_classification(markdown_content: str) -> dict:
         "covered_population": None,
         "deadline": None,
         "has_phi": False,
+        "departments_needed": [],
+        "extra_departments_mentioned": [],
     }

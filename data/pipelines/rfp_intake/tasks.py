@@ -51,7 +51,13 @@ def process_rfp_pipeline(self: RfpPipelineTask, ticket_id: str, pdf_path: str | 
     from data.pipelines.rfp_intake.graph import run_rfp_pipeline
 
     try:
-        result = asyncio.run(run_rfp_pipeline(ticket_id=ticket_id, pdf_path=pdf_path))
+        # Usar bucle nuevo para evitar conflictos con event loop existente (Celery + async)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(run_rfp_pipeline(ticket_id=ticket_id, pdf_path=pdf_path))
+        finally:
+            loop.close()
         logger.info("Pipeline completado para ticket %s: %s", ticket_id, result.get("status"))
         return result
     except Exception as e:
