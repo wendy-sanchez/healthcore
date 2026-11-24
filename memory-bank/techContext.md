@@ -702,6 +702,114 @@ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "memory"
 uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "phi"
 ```
 
+## RFP Intake Pipeline — Hito 9 · Parte 1 (data/pipelines/rfp_intake/)
+
+### Stack técnico
+- **Python 3.14+**, gestionado con `uv` (pyproject.toml raíz).
+- **Dependencias**: `markitdown>=0.1.9` (PDF→Markdown primario), `PyPDF2>=3.0.1` (fallback), `py-readability-metrics>=1.4.5` (5 métricas de legibilidad), `nltk>=3.9.0` (syllable counting fallback), `openai>=1.70.0` (clasificador y workers), `langgraph>=0.3.0` (pipeline graph), `langchain-openai>=0.3.0`.
+- **PostgreSQL/Supabase**: 3 tablas SQLModel — `rfp_tickets`, `rfp_metadata`, `rfp_department_sections`.
+- **Celery**: Tarea `process_rfp_pipeline` en `services/celery_app.py`, bound to `rfp.process_pipeline`, `autoretry_for=(Exception,)`.
+
+### Estructura de archivos
+
+```
+data/pipelines/rfp_intake/
+├── __init__.py          # Paquete
+├── models.py            # Enums (TicketStatus, DepartmentId, ProgramType), modelos (ReadabilityMetrics, RfpMetadata, etc.)
+├── converter.py         # PDF → Markdown (MarkItDown primario, PyPDF2 fallback)
+├── readability.py       # 5 métricas de legibilidad (Flesch, Kincaid, Gunning Fog, Coleman-Liau, ARI)
+├── classifier.py        # Two-stage: reglas pre-filter → OpenAI gpt-4o-mini (json response_format)
+├── orchestrator.py      # Descompone documento en 3 secciones por departamento (regex patterns)
+├── workers.py           # Workers LLM con fallback rule-based. NUNCA inventa cifras.
+├── synthesizer.py       # Consolidación: executive summary, conflict detection, alerts, handoff
+├── graph.py             # run_rfp_pipeline(): 6 nodos secuenciales, cada uno persiste a PostgreSQL
+└── tasks.py             # Celery task wrapper (asyncio.run(run_rfp_pipeline(...)))
+
+services/api/
+├── models_rfp.py        # 3 tablas SQLModel (TicketDB, RfpMetadataDB, DepartmentSectionDB)
+└── routes/rfp.py        # 4 endpoints FastAPI
+
+uis/backoffice/app/
+├── rfp/page.tsx             # Upload + ticket list (polling 5s)
+├── rfp/[ticket_id]/page.tsx # Detail con metadata, readability, departments, PHI alerts
+└── api/rfp/                 # 4 proxy routes Next.js
+
+scripts/
+├── rerun_rfp_ticket.py      # CLI reprocess sin Celery
+└── smoke_test_rfp.py        # Smoke test rápido
+
+tests/pipelines/
+├── test_rfp_classifier.py   # 8 tests
+└── test_rfp_workers.py      # 8 tests
+```
+
+### Pipeline Graph (6 nodos secuenciales)
+
+| Nodo | Función | Descripción |
+|---|---|---|
+| N1 | `convert_pdf_to_markdown(pdf_path)` | PDF → Markdown vía MarkItDown, fallback PyPDF2 |
+| N2 | `extract_metadata_and_readability(content)` | 5 métricas de legibilidad + metadatos del cliente |
+| N3 | `classify_document(content)` | Two-stage: reglas pre-filter + LLM gpt-4o-mini |
+| N4 | `orchestrate(content, metadata)` | Descompone en 3 secciones por departamento |
+| N5 | `workers(departments, metadata)` | Enriquecimiento con key_aspects + open_questions |
+| N6 | `synthesize(departments, metadata, ticket_id)` | Consolidación, conflict detection, handoff |
+
+### Endpoints API (rutas reales: `/rfp/*`)
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `POST` | `/rfp/upload` | Sube PDF, crea ticket, encola Celery. Responde 202 |
+| `GET` | `/rfp/tickets` | Lista tickets con client_name |
+| `GET` | `/rfp/tickets/{ticket_id}` | Detalle con metadata + department_sections |
+| `POST` | `/rfp/tickets/{ticket_id}/reprocess` | Reabre ticket fallido/descartado |
+
+### Proxy Routes (Next.js → Backend)
+
+| Navegador | Backend |
+|---|---|
+| `POST /api/rfp/upload` | `POST /rfp/upload` |
+| `GET /api/rfp/tickets` | `GET /rfp/tickets` |
+| `GET /api/rfp/tickets/{id}` | `GET /rfp/tickets/{id}` |
+| `POST /api/rfp/tickets/{id}/reprocess` | `POST /rfp/tickets/{id}/reprocess` |
+
+### Clasificador (classifier.py)
+- **Two-stage**: (1) reglas pre-filter sin LLM → detecta NO-RFP obvios (pitch, CV, newsletter), (2) OpenAI via 4Geeks AI (`deepseek-v4-flash`) con `response_format={"type": "json_object"}` para clasificación fina.
+- **Configuración LLM**: Lee `API_KEY` y `HOST` del `.env` (variables de 4Geeks AI). `OpenAI(api_key=LLM_API_KEY, base_url=LLM_HOST)`. Modelo definido en `RFP_CLASSIFIER_MODEL`.
+- **Early return**: Si las reglas pre-filter detectan YES-RFP con alta confianza, se retorna inmediatamente sin invocar LLM (con intento opcional de enriquecimiento en try/except).
+- **Patrones NO-RFP**: pitch de ventas ("cutting-edge", "revolutionize"), CV/currículum ("objective", "professional summary"), newsletter/artículo genérico, EHR vendor pitch ("our platform was built for", "unified ehr", "modernize your").
+- **Patrones YES-RFP**: "request for proposal", "solicitud de propuesta", HealthCore + programa de salud, referral partnership, student health, partnership enquiry.
+- **PHI detection**: si el clasificador detecta PHI en el documento, lo registra como alarma.
+
+### Workers (workers.py)
+- Cada worker recibe `(department_id, metadata, raw_extract)`.
+- **Configuración LLM**: Misma que classifier — `API_KEY`/`HOST` desde `.env`, modelo `RFP_WORKER_MODEL` (`deepseek-v4-flash`).
+- **Revenue worker**: extrae términos financieros, presupuesto, moneda. Fallback: asigna moneda según `client_country`.
+- **Clinical worker**: extrae capacidad operativa, clínicas, personal, volúmenes. Detecta PHI.
+- **Compliance worker**: extrae requisitos regulatorios, tipo de datos, cláusulas. Fallback: BAA (US) o DPA (UK) según `client_country`.
+- **Regla inquebrantable**: NUNCA inventa cifras, volúmenes, headcount ni PHI. Si falta información → se registra como `open_questions`.
+
+### DB Tables (SQLModel)
+
+- **`rfp_tickets`**: `ticket_id` (UUID, PK), `status` (analizando/descartado/analisis_completo/error), `raw_pdf_path`, `classification_reason`, `synthesis`, `handoff_payload` (JSONB), `error_detail`, `created_at`, `updated_at`.
+- **`rfp_metadata`**: `ticket_id` (FK unique), `client_name`, `client_country` (US/UK), `program_type`, `covered_population`, `deadline`, `budget_range`, `currency`, `departments_needed` (JSONB), `extra_departments_mentioned` (JSONB), `readability` (JSONB), `word_count`, `estimated_complexity`.
+- **`rfp_department_sections`**: `ticket_id` (FK indexed), `department_id`, `key_aspects` (JSONB), `open_questions` (JSONB), `contains_phi`, `draft_content`, `evaluation_results` (JSONB para Parte 2), `approval_status` (para Parte 3), `approver`, `approved_at`.
+
+### Comandos
+
+```bash
+# Tests (16/16)
+uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v
+
+# Verificar API
+curl http://localhost:8000/rfp/tickets
+
+# Reprocesar ticket desde CLI
+uv run python scripts/rerun_rfp_ticket.py <ticket_id>
+
+# Smoke test
+uv run python scripts/smoke_test_rfp.py
+```
+
 ### Decisiones técnicas clave
 
 | Decisión | Opción | Motivo |

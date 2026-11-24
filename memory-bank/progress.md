@@ -507,13 +507,32 @@
 - **Pronóstico de ventas**: el modelo no conoce variables exógenas (campañas, aperturas de clínica, cambios de tarifa). Su error explotará si el negocio cambia de régimen.
 - **Pronóstico de ventas**: el pipeline se ejecuta como script, no hay endpoint ni dashboard; la reutilización desde otro servicio requeriría exponer `train_sales_model()` detrás de una API.
 
+18. **Hito 9 · Parte 1 — RFP Intake Pipeline (completado — 2026-11-24)**:
+- **Pipeline completo** en `data/pipelines/rfp_intake/` (9 archivos): models, converter (MarkItDown + PyPDF2 fallback), readability (5 métricas), classifier (rule pre-filter + deepseek-v4-flash), orchestrator (descomposición por departamento), workers (revenue/clinical/compliance con fallback rule-based), synthesizer (consolidación + conflict detection), graph (6 nodos secuenciales, cada uno persiste a PostgreSQL), tasks (Celery wrapper).
+- **Backend**: 3 tablas SQLModel en PostgreSQL (rfp_tickets, rfp_metadata, rfp_department_sections). 4 endpoints FastAPI en routes/rfp.py (upload → 202, list, detail, reprocess). Router registrado en main.py.
+- **Frontend**: 2 páginas en backoffice (rfp/page.tsx — upload + ticket list con polling 5s; rfp/[ticket_id]/page.tsx — detail con metadata, readability, department aspects, PHI alerts, reprocess). 4 proxy routes Next.js.
+- **Scripts**: rerun_rfp_ticket.py (CLI reprocess sin Celery), smoke_test_rfp.py (prueba rápida).
+- **Tests**: 16/16 tests pasando (classifier 7, workers 9). Verificación: `curl http://localhost:8000/rfp/tickets` → `{"tickets":[...]}` con 3 tickets reales.
+- **Documentación**: agentic-workflows.md actualizado con estado de implementación, endpoints corregidos a `/rfp/*`, proxy routes documentados.
+- **Integración 4Geeks AI**: classifier.py y workers.py ahora usan `API_KEY`/`HOST` del `.env` en lugar de `OPENAI_API_KEY`. El modelo `gpt-4o-mini` ficticio se reemplazó por `deepseek-v4-flash`. Variables `RFP_CLASSIFIER_MODEL` y `RFP_WORKER_MODEL` añadidas al `.env`.
+- **Bugs corregidos (auditoría 2026-11-24)**:
+  1. `converter.py`: `PermissionError` en `shutil.copy2()` entre devices Docker/host → fallback a `shutil.copy()`
+  2. `classifier.py`: `OpenAI()` sin API_KEY crasheaba todo el pipeline → early return para YES-RFP + configuración `LLM_API_KEY`/`LLM_HOST`
+  3. `classifier.py` (rules): EHR pitch no detectado → patrón regex añadido para "our platform was built for", "unified ehr", etc.
+  4. `classifier.py` (rules): Referral partnership informal no detectado → patrón regex para "referral partnership", "student health", etc.
+- **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy y procesados con LLM real:
+  - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅ — client_name: "Meridian Manufacturing, Inc.", country: US, program: occupational_health
+  - RFP-2 (Thames Valley University) → `analisis_completo` ✅ — client_name: "Thames Valley University", country: UK, program: referral_network
+  - RFP-3 (MedFlow EHR pitch) → `descartado` ✅ — "Parece un pitch de proveedor de EHR/software, no una RFP."
+- **Docker**: contenedor reconstruido y funcionando. 3 tablas RFP verificadas en PostgreSQL.
+
 ## Próximos pasos previstos
 1. Documentar el tracker con README especifico de dominio (setup, variables de entorno, endpoints, flujo funcional).
 2. Incorporar pruebas unitarias para utilidades de src/ y validaciones del tracker.
 3. Persistir como suite de tests (pytest) la auditoría ad hoc de la API de proveedores.
 4. Agregar pruebas de integracion básicas para operaciones críticas del tracker (listado, detalle, PATCH, notas).
 5. Ejecutar auditoría de accesibilidad y rendimiento en despliegue público, con plan de mejora si la puntuacion < 80.
-6. Continuar hitos siguientes del roadmap (telemetría, RAG y automatizaciones) reutilizando los tipos y patrones actuales.
+6. Continuar hitos siguientes del roadmap (RFP Intake Pipeline Part 2, telemetría, RAG y automatizaciones) reutilizando los tipos y patrones actuales.
 7. **Probar `docker compose up` real** para verificar el funcionamiento en runtime de todos los servicios.
 8. Extender tests de backend para cubrir casos borde de serialización (schemas de listado, análisis).
 9. **Migrar a Redis** si el deployment escala a múltiples workers (la caché en memoria actual no comparte estado entre workers).

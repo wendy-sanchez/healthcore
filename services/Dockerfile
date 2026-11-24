@@ -12,16 +12,19 @@ WORKDIR ${WORKSPACE}
 # ── Instalar uv (gestor de paquetes ultra-rápido) ─────────────────────
 RUN pip install --no-cache-dir uv==0.6.14
 
-# ── Copiar requirements ───────────────────────────────────────────────
+# ── Copiar archivos de dependencias ──────────────────────────────────
+COPY pyproject.toml ./pyproject.toml
 COPY services/api/requirements.txt services/api/pyproject.toml ./services/api/
 COPY services/incidents-api/requirements.txt ./services/incidents-api/
 
 # ── Instalar dependencias ─────────────────────────────────────────────
-# Instalamos las dependencias de ambos servicios para no tener que
-# reconstruir la imagen al cambiar entre servicios.
+# Primero las del proyecto principal (pyproject.toml),
+# luego los requirements específicos de cada servicio.
 RUN uv pip install --system --no-cache-dir \
     -r services/api/requirements.txt \
-    -r services/incidents-api/requirements.txt
+    -r services/incidents-api/requirements.txt \
+    && uv pip install --system --no-cache-dir -e . \
+    || true
 
 # ── Copiar código fuente de ambos servicios ───────────────────────────
 # (En desarrollo los bind mounts de docker-compose sobreescriben estos archivos)

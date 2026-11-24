@@ -11,5 +11,6 @@ Each subfolder inside `uis/` must correspond to **one specific user interface** 
 
 ## Current apps in this repository
 
-- `talent-pipeline-tracker`: Next.js app for candidate pipeline operations.
-- `website`: Next.js + TypeScript public corporate website for HealthCore (milestone 1 migration).
+- `website`: Next.js + TypeScript public corporate website for HealthCore. Landing page bilingual (EN/ES) with Schema.org markup, patient inquiry form, RAG Q&A page.
+- `backoffice`: Next.js admin panel for internal operations. Supplier directory, medical inventory, incidents dashboard, telemetry dashboard, monthly reporting dashboard, RFP ticket viewer.
+- `talent-pipeline-tracker`: Next.js app for candidate pipeline operations. Filters, detail view, status updates, notes.

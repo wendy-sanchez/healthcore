@@ -181,3 +181,19 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Auditoría completa**: 8 tipos de eventos auditables (`created`, `rejected`, `edited`, `phi_blocked`, `discarded`, `consolidated`, `expired`, `proposal_skipped`). Cada decisión del usuario queda registrada con timestamp, propuesta original, contenido final (si aplica) y resultado de validación PHI.
 - **Tests**: 32 nuevos tests específicos de memoria + 32 tests originales = 64 tests total. PHI tests cubren los 8 patrones individualmente. Tests de integración verifican el flujo completo en el grafo.
 - **Ciclos de evidencia documentados**: 4 ciclos completos en `agent-memory-harness-guard.md`: (1) propuesta aprobada, (2) propuesta rechazada, (3) propuesta editada por el usuario, (4) propuesta bloqueada por PHI.
+
+15. **RFP Intake Pipeline — Automatización de recepción y clasificación de RFP (Dec 2026)**
+- **Pipeline automático** que recibe documentos PDF de solicitudes de propuesta (RFP), los clasifica, extrae metadatos, descompone por departamento, y genera un payload estructurado para el equipo de Ventas de HealthCore.
+- **¿Qué problema resuelve?**: El equipo de Ventas recibe documentos RFP de potenciales clientes (planes de salud, gobiernos, empleadores) y actualmente debe leerlos manualmente, determinar si realmente es una RFP o un pitch comercial/CV genérico, extraer fechas, presupuestos y población cubierta, y distribuir secciones a los departamentos de Revenue, Clinical y Compliance para análisis. Este pipeline automatiza todo ese proceso de principio a fin.
+- **Pipeline de 6 nodos secuenciales** (LangGraph):
+  1. **Convertir PDF a Markdown** — MarkItDown con fallback PyPDF2.
+  2. **Extraer metadata y legibilidad** — 5 métricas (Flesch, Kincaid, Fog, Coleman-Liau, ARI).
+  3. **Clasificar documento** — Two-stage: reglas pre-filter (descarta pitches/CV/newsletters/EHR vendor pitches) → LLM deepseek-v4-flash vía 4Geeks AI. Early return cuando las reglas ya determinan YES-RFP con alta confianza.
+  4. **Orquestar por departamento** — Descompone el documento en 3 secciones (Revenue, Clinical, Compliance) usando patrones regex.
+  5. **Workers departamentales** — Cada worker enriquece su sección con aspectos clave y preguntas abiertas. Reglas de negocio: moneda según país del cliente; cláusulas BAA/DPA según país. NUNCA inventa cifras.
+  6. **Sintetizar** — Consolidación: executive summary, análisis por departamento, detección de conflictos entre secciones, alertas (PHI, fechas próximas), y payload de handoff para la Parte 2.
+- **4 estados de ticket**: `analizando` → `descartado` (si no es RFP legítima), `analisis_completo` (éxito), `error` (fallo técnico).
+- **Handoff para Parte 2 (Hito 9)**: El payload `handoff_payload` (JSONB en `rfp_tickets`) contiene `executive_summary`, `departments_analysis`, `conflicts_detected`, `alerts`, y `handoff_instructions`. Esta estructura será consumida por el pipeline de Parte 2 para la evaluación técnica por departamento.
+- **Interfaz de Backoffice**: Dos páginas en `uis/backoffice/app/rfp/` — listado con upload (polling 5s) y detalle con metadata, legibilidad, secciones departamentales, alertas PHI, y botón de reproceso.
+- **API asíncrona**: `POST /rfp/upload` responde 202 Accepted con `ticket_id`, el procesamiento continúa en background via Celery. El frontend polling detecta la transición a `analisis_completo`.
+- **Arquitectura de proxy**: Next.js sirve rutas `/api/rfp/*` que redirigen al backend en `/rfp/*`, solucionando la diferencia de paths entre navegador y servidor FastAPI.

@@ -6,3 +6,9 @@ Cada subcarpeta dentro de `uis/` debe corresponder a **una interfaz de usuario c
 
 - **Propósito principal**: centralizar en un único lugar todas las aplicaciones frontend que dan soporte a los casos de uso de la compañía.
 - **Recomendación**: documenta en este archivo (o en sub-READMEs) las aplicaciones que vayas añadiendo, su objetivo, tecnología usada y cómo ejecutarlas.
+
+## Aplicaciones actuales
+
+- `website`: Sitio web corporativo público en Next.js + TypeScript. Landing page bilingüe (EN/ES) con marcado Schema.org, formulario de consulta, página Q&A RAG.
+- `backoffice`: Panel de administración Next.js para operaciones internas. Directorio de proveedores, inventario médico, incidencias, telemetría, reporting mensual, visor de tickets RFP.
+- `talent-pipeline-tracker`: App Next.js para seguimiento de candidatos. Filtros, vista detalle, actualización de estado, notas.

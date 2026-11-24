@@ -1,0 +1,10 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run RFP tests",
+			"type": "shell",
+			"command": "cd /workspaces/healthcore && uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v --tb=short 2>&1 | head -120"
+		}
+	]
+}

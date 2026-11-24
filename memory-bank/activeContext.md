@@ -348,6 +348,74 @@
 - Reglas de privacidad compartidas cierran valores sensibles en campos allowlisted; timestamp ISO estricto y expiración restaurada con identidad efímera segura.
 - Productor `services/api/telemetry_delivery.py` captura señales en origen y las envía por lotes sin depender del navegador. Caducidad se deduplica tras acuse del stub. Cola en memoria, sin almacenamiento analítico.
 - Proxy frontend delega HTTP a `TelemetryService.server.ts`; componentes siguen usando solo `track()`.
+
+## Hito 9 · Parte 1 — RFP Intake Pipeline (2026-12) — ✅ COMPLETADO
+
+> **Estado**: 21 archivos creados, 2 modificados, 16/16 tests pasando, API verificada, 3 tablas PostgreSQL creadas.
+
+### Arquitectura del Pipeline
+
+Pipeline **async** de 6 nodos en `data/pipelines/rfp_intake/graph.py`. Los 3 workers del Nodo 5 se ejecutan **en paralelo** via `asyncio.gather()` con `asyncio.to_thread()` para las funciones síncronas. Cada nodo persiste su resultado en PostgreSQL.
+
+```
+PDF → [N1: Convert] → Markdown → [N2: Readability + Metadata] → [N3: Classify]
+→ [N4: Orchestrate] → [N5: Workers] → [N6: Synthesize] → Complete
+```
+
+### Componentes Creados
+
+**Pipeline (`data/pipelines/rfp_intake/`)**:
+- `models.py` — Enums (TicketStatus, DepartmentId, ProgramType), modelos (ReadabilityMetrics, RfpMetadata, DepartmentSection, RfpPipelineState, HandoffPayload)
+- `converter.py` — PDF → Markdown via MarkItDown (con fallback PyPDF2)
+- `readability.py` — 5 métricas (Flesch, Kincaid, Gunning Fog, Coleman-Liau, ARI) + word_count via py-readability-metrics
+- `classifier.py` — Two-stage: reglas pre-filter → OpenAI gpt-4o-mini con `response_format={"type": "json_object"}`. Patrones NO-RFP (pitch, CV, newsletter) y YES-RFP ("request for proposal" + programa)
+- `orchestrator.py` — Descompone documento en 3 secciones por departamento usando patrones regex
+- `workers.py` — Workers LLM con fallback rule-based: Revenue (moneda por país), Clinical (PHI detection), Compliance (BAA/DPA según país). **Nunca inventa cifras**
+- `synthesizer.py` — Consolidación final con executive summary, conflict detection, alerts, handoff payload
+- `graph.py` — **`run_rfp_pipeline(ticket_id, pdf_path)`**: async, 6 nodos. Nodo 5 workers en paralelo via `asyncio.gather()`. Cada nodo persiste a PostgreSQL
+- `tasks.py` — Celery task `process_rfp_pipeline`, autoretry_for=(Exception,), max_retries=2
+
+**Backend (`services/api/`)**:
+- `models_rfp.py` — 3 tablas SQLModel: `TicketDB` (rfp_tickets), `RfpMetadataDB` (rfp_metadata), `DepartmentSectionDB` (rfp_department_sections)
+- `routes/rfp.py` — 4 endpoints: upload (202), list (GET /rfp/tickets), detail (GET /rfp/tickets/{id}), reprocess (POST /rfp/tickets/{id}/reprocess)
+- `main.py` — router `rfp_router` registrado
+
+**Frontend (`uis/backoffice/app/`)**:
+- `rfp/page.tsx` — Upload form (drag & drop) + ticket list with status badges + polling 5s
+- `rfp/[ticket_id]/page.tsx` — Detail with metadata, readability, department aspects, PHI alerts, synthesis, reprocess button
+- `api/rfp/upload/route.ts` — Next.js proxy POST
+- `api/rfp/tickets/route.ts` — Next.js proxy GET
+- `api/rfp/tickets/[ticket_id]/route.ts` — Next.js proxy GET
+- `api/rfp/tickets/[ticket_id]/reprocess/route.ts` — Next.js proxy POST
+
+**Scripts**:
+- `scripts/rerun_rfp_ticket.py` — CLI reprocess (carga pipeline directamente sin Celery)
+- `scripts/smoke_test_rfp.py` — Smoke test: genera RFP, inserta en DB, corre pipeline, verifica output
+
+**Tests** (16/16 pasando):
+- `tests/pipelines/test_rfp_classifier.py` — 8 tests: RFP detected, pitch/CV/newsletter rejected, empty/short docs, PHI detection (mocked)
+- `tests/pipelines/test_rfp_workers.py` — 8 tests: Compliance BAA/DPA (US/UK), no country, Revenue USD/GBP, no numbers, DepartmentSection model
+
+### Problemas Resueltos Durante la Implementación
+
+1. Tests async/sync mismatch → removido `async`/`await`
+2. Workers esperaban dict, no RfpMetadata → helper `_make_metadata()`
+3. Mock de OpenAI patcheaba variable incorrecta → `openai.OpenAI` en lugar de `openai_client`
+4. Dependencias faltantes en Docker → añadidas a requirements.txt (openai, markitdown, py-readability-metrics, pypdf2, nltk, langgraph, langchain-openai)
+5. Starlette incompatible → instalado starlette 0.41.3
+6. psycopg/psycopg-binary faltantes → instalados
+7. database.py missing import → `from sqlalchemy import text` añadido
+8. API routes sin prefijo `/api` → creados 4 proxy routes en Next.js
+
+### Verificación
+
+```bash
+curl http://localhost:8000/rfp/tickets    # → {"tickets":[]}
+uv run pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v  # 16/16
+```
+
+- **Documentación**: `agentic-workflows.md` actualizado con estado de implementación, endpoints corregidos (`/rfp/*` en vez de `/api/rfp/*`), proxy routes documentados.
+- **Branch pendiente**: sin branch específico creado aún.
 - Verificado: 152 pruebas backend y 62 frontend (2 de 3 tests de control channel corregidos, 1 reintento pendiente); integración real de middleware → lote de cinco obligatorios + alta → stub 200. Canario de auditoría bloqueado.
 - Pendientes: recorrido completo en Chromium, cuatro errores TypeScript preexistentes y persistencia/outbox futura. Reiniciar backend para activar el nuevo worker.
 
@@ -742,6 +810,42 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 - Website público (uis/website) como aplicación Next.js independiente.
 - Scripts de análisis de datos (scripts/analyze.py, seed_incidents.py).
 - Estructuras preparadas para escalado: agents/, skills/, workflows/, docs/, infra/.
+
+---
+
+## RFP Intake Pipeline — Hito 9 · Parte 1 (2026-11-24)
+
+### Estado actual
+- **Completado**: Pipeline de 6 nodos (LangGraph secuencial) en `data/pipelines/rfp_intake/`: converter, readability, classifier, orchestrator, workers, synthesizer.
+- **Completado**: 3 tablas SQLModel en PostgreSQL (rfp_tickets, rfp_metadata, rfp_department_sections). 4 endpoints FastAPI en `/rfp/*`.
+- **Completado**: Frontend de backoffice con upload + listado con polling 5s + detalle con metadata, readability, department aspects, PHI alerts, reprocess.
+- **Completado**: 4 proxy routes Next.js (`/api/rfp/*` → `/rfp/*`).
+- **Completado**: Integración con LLM real de 4Geeks AI — `classifier.py` y `workers.py` usan `API_KEY`/`HOST` del `.env` en lugar de `OPENAI_API_KEY`.
+- **Completado**: Clasificación rule-based con early return para YES-RFP (evita LLM cuando las reglas ya determinaron el resultado).
+- **Bugs corregidos**:
+  1. `converter.py`: `PermissionError` en `shutil.copy2()` entre devices Docker/host → fallback a `shutil.copy()`
+  2. `classifier.py`: `OpenAI()` sin API_KEY crasheaba antes de ejecutar reglas → early return para YES-RFP + configuración de `LLM_API_KEY`/`LLM_HOST`
+  3. `classifier.py` (rules): EHR pitch no detectado como NO-RFP → patrón añadido
+  4. `classifier.py` (rules): Referral partnership informal no detectado como YES-RFP → patrón añadido
+- **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy/ai-engineering-syllabus y procesados:
+  - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅
+  - RFP-2 (Thames Valley University) → `analisis_completo` ✅
+  - RFP-3 (MedFlow EHR pitch) → `descartado` ✅
+- **Tests: 16/16 pasando**.
+- **Variables de entorno**: `RFP_CLASSIFIER_MODEL`, `RFP_WORKER_MODEL` añadidas al `.env` apuntando a `deepseek-v4-flash`.
+
+### Archivos clave
+- `data/pipelines/rfp_intake/` (9 archivos: models, converter, readability, classifier, orchestrator, workers, synthesizer, graph, tasks)
+- `services/api/models_rfp.py` — 3 SQLModel tables
+- `services/api/routes/rfp.py` — 4 endpoints
+- `uis/backoffice/app/rfp/` — 2 páginas + 4 proxy routes
+- `scripts/rerun_rfp_ticket.py`, `scripts/smoke_test_rfp.py`
+- `tests/pipelines/test_rfp_classifier.py`, `tests/pipelines/test_rfp_workers.py`
+
+### Limitaciones
+- MarkItDown sin dependencia `[pdf]` (usa PyPDF2 fallback)
+- Celery no corre localmente (verificación via `asyncio.run()`)
+- NLTK data warning no bloqueante
 
 ---
 

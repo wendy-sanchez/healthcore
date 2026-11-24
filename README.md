@@ -31,6 +31,7 @@
 | 13 | **LangGraph Agent — External Tools** — Added real-time incident and inventory query tools. Auto-routing between RAG, tools, or both via regex classification (no LLM). 5s timeout, honest fallback. 32 tests. | LangGraph, httpx, regex | ✅ Complete |
 | 14 | **MCP Server — OAuth-Protected Tools** — Model Context Protocol server exposing Incidents (5 tools) and Inventory (5 tools) as MCP tools, protected with OAuth 2.1 Resource Server via mcpauth. Inventory write operations explicitly rejected (RETO 2). LangGraph agent integrated via langchain-mcp-adapters. 9/9 acceptance criteria. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Complete |
 | 15 | **LangGraph Agent — Persistent Memory + Guardrails** — Agent learns from interaction without accumulating junk forever. TinyDB-backed memory (separate from RAG), dual PHI validation (8 HIPAA+UK GDPR patterns), explicit user approval required (never assumed), lexical intent classifier (no LLM), single pending proposal, full audit trail (8 event types), automatic consolidation (threshold 50 facts, TTL 90 days). **Plus**: 3-layer deterministic guardrails (regex, no LLM): system prompt hardening (5 rules), input classification (6 categories, ~100 patterns), output validation (PHI/instruction leak/format). RAG content isolation markers. Graph integration with 2 guardrail nodes + observability. 62 guardrail tests + 94 agent/graph tests = 286 total. 11/11 acceptance criteria. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Complete |
+| 16 | **RFP Intake Pipeline** — Automated ingestion of RFPs from PDF upload. MarkItDown conversion, readability metrics (py-readability-metrics), two-stage classifier (regex pre-filter + DeepSeek-v4 LLM), multi-agent orchestration (orchestrator→3 parallel workers→synthesizer), per-department analysis (Revenue, Clinical, Compliance), handoff payload for Part 2. Async upload with Celery, 202 response with polling. 4 REST endpoints, 16 tests. 3 real PDFs verified end-to-end. | FastAPI, Celery, SQLModel/PostgreSQL, DeepSeek-v4 | ✅ Complete |
 
 ---
 
@@ -203,6 +204,24 @@ Retrieval-Augmented Generation over 4 HealthCore policy documents. Embedded with
 
 ---
 
+## 🗃️ RFP Intake Pipeline — Key Details
+
+Automated pipeline for ingesting RFPs (Requests for Proposals) from PDF upload. Built for **Hito 9, Part 1** (Agentic Workflows — intake/reception).
+
+**Flow:** `PDF upload → MarkItDown conversion → Readability metrics → Two-stage classifier (regex pre-filter + DeepSeek-v4 LLM) → Orchestrator → 3 parallel workers (Revenue, Clinical, Compliance) → Synthesizer → Handoff payload → PostgreSQL persistence`
+
+**Key characteristics:**
+- **Async architecture:** `POST /rfp/upload` returns `202 Accepted` with ticket UUID. Celery background task executes the full pipeline. Frontend polls `GET /rfp/tickets/{ticket_id}` for status updates.
+- **Classifier:** Two-stage design. First, regex patterns detect non-RFP documents (pitch, CV, newsletter — early discard). Second, DeepSeek-v4 LLM with structured JSON output (is_rfp, confidence, reason, client_name, program_type, deadline). Hard gate: non-RFP → `descartado` with reason.
+- **Multi-agent orchestration:** Orchestrator decomposes the document into per-department extracts. 3 workers run in parallel via `asyncio.gather()` with `asyncio.to_thread()` — Revenue (currency by country), Clinical (PHI detection), Compliance (BAA/DPA by country). LLM primary, rule-based fallback. Workers **never invent figures** — missing data recorded as `open_questions`.
+- **Handoff for Part 2:** Synthesizer generates `handoff_payload` JSON with ticket_id, rfp_metadata, per-department analysis, and synthesis. Ready for Part 2 (draft generation).
+- **Statuses:** `analizando` → (`analisis_completo` | `descartado` | `error`). Bilingual Spanish (aligned with CONTEXT.md briefing).
+- **3 verified PDFs:** Real academic and business RFPs from 4GeeksAcademy verified end-to-end.
+- **16 tests:** 7 classifier tests (RFP, pitch, CV, newsletter, empty, short, PHI) + 9 worker tests (Compliance BAA/DPA, Revenue USD/GBP, DepartmentSection model).
+- **Docs:** [`agentic-workflows.md`](./agentic-workflows.md), [`data/pipelines/rfp_intake/`](./data/pipelines/rfp_intake/)
+
+---
+
 ## 📁 Key Documentation
 
 | File | Content |
@@ -216,6 +235,7 @@ Retrieval-Augmented Generation over 4 HealthCore policy documents. Embedded with
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Overall architecture proposal |
 | [`mcp-server.md`](./mcp-server.md) | MCP Server — OAuth-protected tools, architecture, setup |
 | [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | LangGraph Agent Persistent Memory + Harness & Guardrails — architecture, system prompt hardening, 3-layer deterministic safety, flow diagrams |
+| [`agentic-workflows.md`](./agentic-workflows.md) | RFP Intake Pipeline (Hito 9, Part 1) — design, architecture, bugs, verification, limitations |
 | [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns, tech decisions |
 
 ---
