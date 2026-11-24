@@ -1,4 +1,3 @@
-import asyncio
 """Grafo LangGraph del pipeline RFP Intake.
 
 Define los nodos del pipeline y la función run_rfp_pipeline que ejecuta
@@ -21,6 +20,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+import asyncio
 
 from data.pipelines.rfp_intake.classifier import classify_document
 from data.pipelines.rfp_intake.converter import convert_pdf_to_markdown, read_converted_markdown

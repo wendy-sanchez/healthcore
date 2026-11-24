@@ -520,11 +520,13 @@
   2. `classifier.py`: `OpenAI()` sin API_KEY crasheaba todo el pipeline → early return para YES-RFP + configuración `LLM_API_KEY`/`LLM_HOST`
   3. `classifier.py` (rules): EHR pitch no detectado → patrón regex añadido para "our platform was built for", "unified ehr", etc.
   4. `classifier.py` (rules): Referral partnership informal no detectado → patrón regex para "referral partnership", "student health", etc.
+  5. **`graph.py` (CRÍTICO)**: `import asyncio` insertado en línea 1 por `sed` quedó ANTES de `from __future__ import annotations` → `SyntaxError`. Movido a después del bloque de imports estándar. El pipeline completo (`run_rfp_pipeline`) no podía importarse.
 - **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy y procesados con LLM real:
   - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅ — client_name: "Meridian Manufacturing, Inc.", country: US, program: occupational_health
   - RFP-2 (Thames Valley University) → `analisis_completo` ✅ — client_name: "Thames Valley University", country: UK, program: referral_network
   - RFP-3 (MedFlow EHR pitch) → `descartado` ✅ — "Parece un pitch de proveedor de EHR/software, no una RFP."
 - **Docker**: contenedor reconstruido y funcionando. 3 tablas RFP verificadas en PostgreSQL.
+- **Auditoría completa del proyecto (2026-11-24)**: 165/165 archivos .py compilan sin errores, 363/363 tests pasan (333 main + 30 nightly). Sin `except:` desnudos en todo el proyecto. 9/9 módulos del pipeline RFP con `from __future__` en posición correcta. Todos los imports del pipeline verificados (converter, classifier, orchestrator, workers, synthesizer, tasks, models).
 
 ## Próximos pasos previstos
 1. Documentar el tracker con README especifico de dominio (setup, variables de entorno, endpoints, flujo funcional).

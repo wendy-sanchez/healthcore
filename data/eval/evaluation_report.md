@@ -1,6 +1,6 @@
 # HealthCore — Evaluación técnica del modelo de pronóstico de ventas
 
-**Fecha:** 2026-11-08 18:25 UTC
+**Fecha:** 2026-11-24 16:49 UTC
 **Modelo:** XGBoost (regularizado)
 **Target:** `revenue_usd` (serie consolidada)
 **Split:** 8 años entrenamiento (2016-01..2023-12) / 2 años prueba (2024-01..2025-12)
@@ -258,7 +258,7 @@ uv run python -m pytest tests/pipelines/ -v
 ```
 
 **Total: 64 tests · 64 pasaron · 0 fallaron**
-**Ejecutado:** 2026-11-08 18:25 UTC
+**Ejecutado:** 2026-11-24 16:49 UTC
 
 ### 6.2 Tests de validación cruzada temporal (`test_temporal_cv.py`)
 

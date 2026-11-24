@@ -3,9 +3,9 @@
 > **Parte 1** del Hito 9 — Flujos de Trabajo Agénticos.
 > Sistema de recepción, clasificación y descomposición de RFPs mediante un pipeline multi-agente.
 >
-> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 16/16 tests pasando, API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end.
+> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 16/16 tests de RFP pasando (363/363 suite completa), API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end.
 >
-> **Última actualización**: 2026-11-24 — Integración con API_KEY/HOST de 4Geeks AI, bugs corregidos, verificación end-to-end con 3 PDFs reales.
+> **Última actualización**: 2026-11-24 — Integración con API_KEY/HOST de 4Geeks AI, bug crítico de import asyncio corregido en graph.py, verificación end-to-end con 3 PDFs reales, auditoría completa del proyecto (363 tests, 165 archivos compilados).
 
 ---
 
