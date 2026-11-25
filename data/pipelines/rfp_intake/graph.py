@@ -344,6 +344,7 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                         dept_out.evaluation.model_dump(mode="json", by_alias=True)
                         if dept_out.evaluation else None
                     )
+                    dept_db.draft_content = dept_out.finalized_draft
                     dept_db.approval_status = dept_out.approval_status
                     session.add(dept_db)
             session.commit()

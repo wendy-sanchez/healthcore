@@ -130,14 +130,148 @@ async def evaluate_readability(draft_content: str, section_id: str, department_i
     )
 
 
+
+
+
+# Palabras que no aportan en matching cross-idioma
+_STOPWORDS = {"the", "and", "for", "with", "from", "that", "this", "are",
+              "will", "has", "have", "been", "were", "was", "its", "per",
+              "del", "los", "las", "una", "uno", "para", "por", "que",
+              "con", "los", "las", "más", "mas", "entre", "sobre",
+              "como", "cada", "debe", "dice"}
+
+
+# Mapa de traducciones inglés→español para términos comunes de RFP
+_BI_TERMS: dict[str, set[str]] = {
+    "hipaa": {"hipaa", "privacidad", "datos"},
+    "compliance": {"compliance", "cumplimiento", "normativo", "regulatorio"},
+    "baa": {"baa", "business associate", "asociado comercial"},
+    "soc": {"soc", "certificacion"},
+    "data breach": {"breach", "violacion", "notificacion"},
+    "confidenciality": {"confidencialidad", "confidenciality"},
+    "privacy": {"privacidad", "privacy"},
+    "security": {"seguridad", "security"},
+    "audit": {"auditoria", "audit"},
+    "covered": {"cubierta", "cubiertos", "covered", "poblacion"},
+    "population": {"poblacion", "population", "empleados", "employees"},
+    "employees": {"empleados", "employees"},
+    "clinical": {"clinico", "clinical", "clinica"},
+    "revenue": {"revenue", "ingresos", "economic"},
+    "budget": {"presupuesto", "budget", "precio", "costo"},
+    "timeline": {"cronograma", "timeline", "plazo", "fecha", "inicio"},
+    "deadline": {"fecha", "deadline", "vencimiento"},
+    "contract": {"contrato", "contract", "plazo"},
+    "report": {"reporte", "report", "informe"},
+    "quarterly": {"trimestral", "quarterly"},
+    "wellness": {"wellness", "bienestar"},
+    "chronic": {"cronico", "chronic", "cronicas"},
+    "telehealth": {"telemedicina", "telehealth", "telemedicina"},
+    "behavioral": {"conductual", "behavioral", "salud mental"},
+    "primary care": {"primaria", "primary care", "atencion primaria"},
+    "preventive": {"preventivo", "preventive", "prevencion"},
+    "coordination": {"coordinacion", "coordination"},
+    "assessment": {"evaluacion", "assessment", "evaluaciones"},
+    "high-risk": {"alto riesgo", "high-risk", "miembros de alto"},
+    "claims": {"claims", "reclamos", "siniestros"},
+    "hedis": {"hedis"},
+    "stars": {"stars"},
+    "metric": {"metricas", "metric", "indicadores"},
+    "governance": {"gobierno", "governance", "datos"},
+    "notification": {"notificacion", "notification"},
+    "procedure": {"procedimiento", "procedure", "procedimientos"},
+    "certification": {"certificacion", "certification"},
+    "vendor": {"proveedor", "vendor", "vendedor"},
+    "regulatory": {"regulatorio", "regulatory", "normativo"},
+    "obligation": {"obligacion", "obligation"},
+    "term": {"plazo", "term", "duracion"},
+    "coverage": {"cobertura", "coverage", "cubrir"},
+    "service": {"servicio", "service", "servicios"},
+    "member": {"miembro", "member", "miembros", "afiliado"},
+    "care": {"cuidado", "care", "atencion"},
+    "program": {"programa", "program"},
+    "manage": {"gestion", "manage", "manejo", "gestion"},
+    "disease": {"enfermedad", "disease", "cronica", "cronicas"},
+    "initiative": {"iniciativa", "initiative"},
+    "promotion": {"promocion", "promotion", "promover"},
+    "support": {"apoyo", "support", "soporte"},
+    "risk": {"riesgo", "risk"},
+    "health": {"salud", "health"},
+    "data": {"datos", "data"},
+    "annual": {"annual", "anual"},
+    "united states": {"estados unidos", "united states", "ee.uu.", "us"},
+    "us": {"estados unidos", "us", "ee.uu."},
+}
+
+
+def _normalize_number(text: str) -> set[str]:
+    """Extrae numeros normalizando separadores . y , para match cross-idioma."""
+    patterns = set()
+    # Cantidades monetarias: $2,500,000 o $2.500.000
+    for m in re.finditer(r'[\$£€]?\s*[\d]+[,.]?[\d]*(?:[,.]\d{3})*(?:[,.]\d+)?', text):
+        val = m.group().replace(" ", "")
+        # Normalizar miles: 12,000 -> 12000, 12.000 -> 12000
+        normalized = re.sub(r'(?<=\d)[,.](?=\d{3}(?:[,.]|$))', '', val)
+        patterns.add(val)
+        patterns.add(normalized)
+        # Pure digits
+        digits_only = re.sub(r'[^\d]', '', val).strip()
+        if digits_only:
+            patterns.add(digits_only)
+    return patterns
+
+
+def _has_bilingual_match(aspect: str, detail: str, content_lower: str) -> bool:
+    """Verifica si el contenido cubre el aspecto considerando traducciones."""
+    # 1) Match exacto del aspect
+    if aspect and aspect.lower() in content_lower:
+        return True
+
+    # 2) Match exacto del detail
+    if detail and detail.lower() in content_lower:
+        return True
+
+    # 3) Match por termino bilingue
+    aspect_lower = aspect.lower() if aspect else ""
+    detail_lower = detail.lower() if detail else ""
+    combined = aspect_lower + " " + detail_lower
+
+    for eng_term, spanish_terms in _BI_TERMS.items():
+        # Si el termino ingles aparece en aspect/detail
+        if eng_term in combined:
+            # Verificar si ALGUN termino espanol/ingles aparece en contenido
+            for alt in spanish_terms:
+                if alt in content_lower:
+                    return True
+
+    # 4) Token overlap (≥20%) con stopwords filtradas
+    STOPWORDS = _STOPWORDS
+    aspect_tokens = {w for w in re.findall(r"[a-zA-Z0-9$]{3,}", aspect.lower()) if w not in STOPWORDS} if aspect else set()
+    detail_tokens = {w for w in re.findall(r"[a-zA-Z0-9$]{3,}", detail.lower()) if w not in STOPWORDS} if detail else set()
+    tokens = aspect_tokens | detail_tokens
+    content_tokens = {w for w in re.findall(r"[a-zA-Z0-9$]{3,}", content_lower) if w not in STOPWORDS}
+
+    if tokens and content_tokens:
+        overlap = tokens & content_tokens
+        ratio = len(overlap) / len(tokens) if tokens else 0
+        if ratio >= 0.20:  # Lowered threshold
+            return True
+
+    return False
+
+
+def _extract_numeric_patterns(text: str) -> set[str]:
+    """Extrae patrones numericos/monetarios language-agnostic."""
+    return _normalize_number(text)
+
+
 async def evaluate_relevance(draft_content: str, department_id: str, rfp_metadata: Any, key_aspects: list[dict]) -> RelevanceEval:
-    """Evalúa pertinencia del borrador respecto a la RFP y key_aspects.
+    """Evalua pertinencia del borrador respecto a la RFP y key_aspects.
 
     Verifica que el borrador:
     - Mencione al cliente por nombre
     - Responda los key_aspects relevantes
     - No divague sobre temas fuera del alcance
-    - Use la moneda correcta según país
+    - Use la moneda correcta segun pais
     """
     missing_aspects = []
     issues = []
@@ -146,24 +280,39 @@ async def evaluate_relevance(draft_content: str, department_id: str, rfp_metadat
     client_name = getattr(rfp_metadata, "client_name", "")
     country = getattr(rfp_metadata, "client_country", "US")
 
-    # Verificar mención del cliente
+    # Verificar mencion del cliente
     if client_name and client_name.lower() not in content_lower:
-        # Intentar el primer token del nombre
         first_word = client_name.split()[0].lower() if client_name.split() else ""
         if first_word and first_word not in content_lower:
-            missing_aspects.append(f"mención del cliente '{client_name}'")
+            missing_aspects.append(f"mencion del cliente '{client_name}'")
             issues.append(f"No se menciona al cliente '{client_name}'")
 
-    # Verificar aspectos clave cubiertos
+    # Numeros clave del contenido (para matching cross-idioma)
+    content_nums = _extract_numeric_patterns(draft_content)
+
     for ka in key_aspects:
         aspect = ka.get("aspect", "") if isinstance(ka, dict) else getattr(ka, "aspect", "")
-        if aspect and aspect.lower() not in content_lower:
-            missing_aspects.append(aspect)
+        detail = ka.get("detail", "") if isinstance(ka, dict) else getattr(ka, "detail", "")
+        if not aspect:
+            continue
 
-    # Verificar moneda
-    if country == "US" and not USDPattern.search(draft_content) and not BAAPatterns.search(draft_content):
+        # Estrategia 1-2-4: matching bilingue
+        if _has_bilingual_match(aspect, detail, content_lower):
+            continue
+
+        # Estrategia 3: Patrones numericos cross-idioma (normalizados)
+        if detail:
+            detail_nums = _extract_numeric_patterns(detail)
+            if detail_nums and detail_nums & content_nums:
+                continue
+
+        # No paso ningun filtro
+        missing_aspects.append(aspect)
+
+    # B9: solo moneda, sin mezclar con compliance
+    if country == "US" and not USDPattern.search(draft_content):
         missing_aspects.append("moneda USD")
-    elif country == "UK" and not GBPPattern.search(draft_content) and not DPAPatterns.search(draft_content):
+    elif country == "UK" and not GBPPattern.search(draft_content):
         missing_aspects.append("moneda GBP")
 
     details = f"Departamento: {department_id}, Aspectos faltantes: {len(missing_aspects)}"
@@ -177,7 +326,6 @@ async def evaluate_relevance(draft_content: str, department_id: str, rfp_metadat
         missing_aspects=missing_aspects,
         details=details,
     )
-
 
 async def evaluate_compliance(draft_content: str, department_id: str, rfp_metadata: Any) -> ComplianceEval:
     """Evalúa cumplimiento contra lineamientos del CONTEXT.md §5.

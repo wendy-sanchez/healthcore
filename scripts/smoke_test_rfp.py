@@ -156,7 +156,7 @@ async def run_smoke_test():
             print(f"   Programa:      {meta.program_type}")
             print(f"   Población:     {meta.covered_population}")
             print(f"   Deptos:        {meta.departments_needed}")
-            print(f"   Legibilidad:   Flesch={meta.readability.get('flesch_reading_ease', '?') if meta.readability else '?'}")
+            print(f"   Legibilidad:   Flesch-Kincaid={meta.readability_fk_score}, FRE={meta.readability_fre_score}, GF={meta.readability_gf_score}")
         else:
             print(f"   Metadatos:     ✗ No encontrados")
 
