@@ -137,6 +137,10 @@ class DepartmentSectionDB(SQLModel, table=True):
     """Preguntas abiertas que necesita respuesta."""
     contains_phi: bool = Field(default=False)
     """True si el worker detectó PHI en su extracto."""
+    generation_status: str | None = Field(default=None, max_length=32)
+    """Estado de generación (Parte 2): generando, evaluando, completado."""
+    generation_iteration: int | None = Field(default=None)
+    """Iteración actual de generación (1, 2, 3...)."""
     draft_content: str | None = Field(default=None)
     """Borrador de sección (Parte 2)."""
     evaluation_results: dict | None = Field(

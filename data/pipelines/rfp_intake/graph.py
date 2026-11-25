@@ -321,6 +321,16 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
 
         part2_handoff = await run_part2_pipeline(handoff, max_iterations=3)
 
+        # Transición: GENERANDO_BORRADOR → EN_EVALUACION (ciclo internamente)
+        # El estado EN_EVALUACION refleja que el ciclo generador-evaluador está en progreso
+        with Session(engine) as session:
+            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+            ticket = session.exec(stmt).first()
+            if ticket:
+                ticket.status = TicketStatus.EN_EVALUACION.value
+                session.add(ticket)
+            session.commit()
+
         # Persistir resultados de Parte 2 en DepartmentSectionDB
         with Session(engine) as session:
             for dept_out in part2_handoff.departments:
@@ -334,6 +344,8 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                         dept_out.evaluation.model_dump(mode="json", by_alias=True)
                         if dept_out.evaluation else None
                     )
+                    dept_db.generation_status = "completado"
+                    dept_db.generation_iteration = dept_out.iteration_count
                     dept_db.draft_content = dept_out.finalized_draft
                     dept_db.approval_status = dept_out.approval_status
                     session.add(dept_db)

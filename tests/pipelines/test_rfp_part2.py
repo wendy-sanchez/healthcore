@@ -555,3 +555,95 @@ class TestRunPart2Pipeline:
         assert len(result.departments) == 0
         assert result.overall_status == "analisis_completo"
         assert result.ticket_id == "empty-test"
+
+    async def test_intermediate_state_progression_failing_then_passing(
+        self, sample_handoff
+    ):
+        """Verifica que el estado interno progresa a través de iteraciones: 
+        Iter 1 (falla) → Iter 2 (pasa).
+        
+        Este test observa cómo el draft mejora y la evaluación pasa en la 2ª iteración.
+        """
+        
+        # Simulamos:
+        # - Iteración 1: draft pobre, evaluación falla
+        # - Iteración 2: draft mejorado (con feedback aplicado), evaluación pasa
+        
+        call_count = [0]
+        
+        async def mock_generate(department_id, rfp_metadata, key_aspects, previous_feedback=None):
+            """El generador recibe feedback y lo incorpora."""
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return "# Draft 1 — pricing info missing"
+            else:
+                # Iteración 2: incorporó el feedback
+                return "# Draft 2 — pricing corrected: $50/member/month"
+        
+        async def mock_evaluate(draft_content, department_id, rfp_metadata, key_aspects, section_id):
+            """La evaluación falla en Iter 1, pasa en Iter 2."""
+            if "Draft 1" in draft_content:
+                return EvaluationResult(
+                    department_id=department_id,
+                    readability=ReadabilityEval(pass_=True, score=65.0),
+                    relevance=RelevanceEval(
+                        pass_=False,
+                        missing_aspects=["pricing"],
+                    ),
+                    compliance=ComplianceEval(pass_=True, rule_ids=[], violations=[]),
+                    overall_pass=False,
+                    feedback_for_generator="Missing pricing details. Must include $/member/month.",
+                )
+            else:
+                # Iter 2: todo pasa
+                return EvaluationResult(
+                    department_id=department_id,
+                    readability=ReadabilityEval(pass_=True, score=72.0),
+                    relevance=RelevanceEval(pass_=True, missing_aspects=[]),
+                    compliance=ComplianceEval(pass_=True, rule_ids=[], violations=[]),
+                    overall_pass=True,
+                    feedback_for_generator="✅ All requirements met.",
+                )
+        
+        with (
+            patch("data.pipelines.rfp_intake.cycle.generate_draft", new_callable=AsyncMock) as mock_gen,
+            patch("data.pipelines.rfp_intake.cycle.evaluate_section", new_callable=AsyncMock) as mock_eval,
+        ):
+            mock_gen.side_effect = mock_generate
+            mock_eval.side_effect = mock_evaluate
+            
+            # max_iterations=2 para permitir que falle en iter 1 y pase en iter 2
+            result = await run_part2_pipeline(sample_handoff, max_iterations=2)
+            
+            # Verificaciones:
+            assert len(result.departments) == 1
+            dept_out = result.departments[0]
+            
+            # 1. Debe haber realizado 2 iteraciones
+            assert dept_out.iteration_count == 2, (
+                f"Expected 2 iterations (fail then pass), got {dept_out.iteration_count}"
+            )
+            
+            # 2. El draft final debe ser el de la 2ª iteración (mejorado)
+            assert "Draft 2" in dept_out.finalized_draft, (
+                f"Final draft should be from Iter 2 (mejorado), got: {dept_out.finalized_draft}"
+            )
+            assert "$50/member/month" in dept_out.finalized_draft, (
+                "Final draft should include pricing info from feedback application"
+            )
+            
+            # 3. La evaluación final debe haber pasado
+            assert dept_out.evaluation is not None
+            assert dept_out.evaluation.overall_pass is True, (
+                "Final evaluation should pass after improvements"
+            )
+            
+            # 4. El estado debe ser analisis_completo (no needs_human_review)
+            assert dept_out.needs_human_review is False
+            assert result.overall_status == "analisis_completo"
+            
+            # 5. Debe tener approval_status pendiente (Parte 3 lo aprobará)
+            assert dept_out.approval_status == "pending"
+            
+            # 6. Verificar feedback de cada iteración
+            assert dept_out.evaluation.feedback_for_generator == "✅ All requirements met."

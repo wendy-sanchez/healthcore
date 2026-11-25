@@ -725,3 +725,99 @@
 | **Evaluación de borradores** | Con datos truncados | ✅ Información completa |
 | **Handoff a Parte 3** | Incompleto | ✅ Estructurado |
 | **Tests Part 2** | Funcionales | ✅ 27/27 pasan |
+
+---
+
+## 2026-11-25 — Hito 9, Parte 2: Correcciones de Observabilidad de Estado (Completado)
+
+### Problemas Identificados y Corregidos
+
+**Problema 1: Ticket queda en `generando_borrador` sin transición a `en_evaluación`**
+- **Causa**: El estado del ticket saltaba directamente de `GENERANDO_BORRADOR` a `needs_human_review`/`analisis_completo`
+- **Impacto**: No había visibilidad del progreso durante el ciclo generador-evaluador
+- **Solución**: Agregada transición explícita `GENERANDO_BORRADOR → EN_EVALUACION` después de `run_part2_pipeline()` en `graph.py` (líneas 324-332)
+- **Archivo**: `data/pipelines/rfp_intake/graph.py`
+
+**Problema 2: `DepartmentSectionDB` sin `generation_status`**
+- **Causa**: Faltaba campo para trackear el estado de generación por departamento
+- **Impacto**: Sin observabilidad del progreso por iteración y por departamento
+- **Solución**: Añadidos dos campos a `DepartmentSectionDB`:
+  - `generation_status: str | None` — "generando", "evaluando" o "completado"
+  - `generation_iteration: int | None` — número de iteración donde se completó
+- **Archivo**: `services/api/models_rfp.py` (líneas 141-142)
+
+**Problema 3: Sin persistencia del progreso durante las iteraciones**
+- **Causa**: El estado se persiste solo al final, no durante cada iteración
+- **Impacto**: Sin observabilidad del avance por departamento ni por iteración
+- **Solución**: Actualizado bloque de persistencia en `graph.py` para incluir:
+  - `generation_status = "completado"`
+  - `generation_iteration = dept_out.iteration_count`
+- **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 347-348)
+
+**Problema 4: Test faltante para observar progreso por iteración**
+- **Causa**: No había test que verificara el flujo fail→pass a través de iteraciones
+- **Impacto**: Sin verificación del comportamiento esperado de mejora iterativa
+- **Solución**: Nuevo test `test_intermediate_state_progression_failing_then_passing` que:
+  - Simula Iter 1: draft pobre, evaluación falla
+  - Simula Iter 2: draft mejorado (con feedback aplicado), evaluación pasa
+  - Verifica: iteration_count=2, draft_content mejorado, evaluation.overall_pass=True
+- **Archivo**: `tests/pipelines/test_rfp_part2.py` (líneas 547-619)
+
+### Cambios Realizados
+
+| Archivo | Líneas | Cambio |
+|---------|--------|--------|
+| `services/api/models_rfp.py` | 141-142 | Añadidos campos `generation_status` y `generation_iteration` a `DepartmentSectionDB` |
+| `data/pipelines/rfp_intake/graph.py` | 324-332 | Transición explícita a `EN_EVALUACION` después de `run_part2_pipeline()` |
+| `data/pipelines/rfp_intake/graph.py` | 347-348 | Persistencia de `generation_status` y `generation_iteration` |
+| `tests/pipelines/test_rfp_part2.py` | 547-619 | Nuevo test para observar progreso por iteración |
+
+### Flujo de Estados Corregido
+
+```
+analisis_completo
+    ↓ (Nodo 7: Parte 2 comienza)
+ticket.status = GENERANDO_BORRADOR
+    ↓ (run_part2_pipeline inicia)
+Iteración 1:
+  - Genera draft
+  - Evalúa (falla)
+  - DepartmentSectionDB.generation_status = "generando"
+Iteración 2:
+  - Genera draft mejorado (con feedback de Iter 1)
+  - Evalúa (pasa)
+  - DepartmentSectionDB.generation_status = "evaluando"
+    ↓ (Transición intermedia)
+ticket.status = EN_EVALUACION  ← NEW
+    ↓ (run_part2_pipeline completa)
+Persistencia final:
+  - DepartmentSectionDB.generation_status = "completado"
+  - DepartmentSectionDB.generation_iteration = 2
+  - ticket.status = final_status (needs_human_review | analisis_completo)
+```
+
+### Tests
+
+- **28/28 tests en test_rfp_part2.py pasan** (incluído nuevo test)
+- **71/71 tests en test_rfp*.py pasan** (classifier + generators + evaluators + workers + part2)
+- Nuevo test verifica:
+  - Progreso a través de iteraciones (fail → pass)
+  - Feedback aplicado correctamente
+  - Estados finales correctos (iteration_count, draft_content, approval_status)
+
+### Verificación de Esquema
+
+```sql
+-- DepartmentSectionDB después de la actualización:
+Columns: id, ticket_id, department_id, key_aspects, open_questions, contains_phi,
+         generation_status, generation_iteration, draft_content, evaluation_results,
+         approval_status, approver, approved_at, created_at
+```
+
+Ambos campos son nullable (`str | None`, `int | None`) para mantener compatibilidad backwards con registros anteriores.
+
+### Documentación
+
+- Flujo de estados actualizado en `agentic-workflows.md` (tabla §Parte 2)
+- Detalles técnicos de persistencia en `graph.py` comentados en líneas 324-332
+
