@@ -319,16 +319,6 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                 session.add(ticket)
             session.commit()
 
-        # Marcar como en_evaluación mientras corren los evaluadores
-        state["status"] = TicketStatus.EN_EVALUACION.value
-        with Session(engine) as session:
-            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
-            ticket = session.exec(stmt).first()
-            if ticket:
-                ticket.status = TicketStatus.EN_EVALUACION.value
-                session.add(ticket)
-            session.commit()
-
         part2_handoff = await run_part2_pipeline(handoff, max_iterations=3)
 
         # Persistir resultados de Parte 2 en DepartmentSectionDB

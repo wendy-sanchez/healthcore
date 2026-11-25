@@ -185,5 +185,5 @@ def _extract_key_aspects(dept_id: str, departments: list[Any]) -> list[dict]:
         else:
             if getattr(dept, "department_id", None) == dept_id:
                 aspects = getattr(dept, "key_aspects", [])
-                return [a if isinstance(a, dict) else {"aspect": str(a)} for a in aspects]
+                return [a if isinstance(a, dict) else a.model_dump() if hasattr(a, "model_dump") else {"aspect": str(a)} for a in aspects]
     return []

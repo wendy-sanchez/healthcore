@@ -669,3 +669,59 @@
 - AC-7 ✅ Log per invocation (tool name + success/failure)
 - AC-8 ✅ Agent usa MCP Client con langchain-mcp-adapters
 - AC-9 ✅ MCP Playground / Public URL funcional (10 tools, write rejection, CORS)
+
+---
+
+## Hotfixes Parte 2 — Hito 9 (2026-11-25)
+
+### Correcciones Aplicadas
+
+**Error 1: Estado del Ticket Inconsistente**
+- **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 322-330, eliminadas)
+- **Problema**: Status cambiaba a `en_evaluación` ANTES de ejecutar `run_part2_pipeline()`
+  - El ticket mostraba "en_evaluación" mientras aún se estaba generando
+  - El estado no reflejaba el progreso real
+- **Solución**: Eliminadas las líneas 322-330 que actualizaban prematuramente
+- **Resultado**: Flujo de estados ahora correcto:
+  ```
+  analisis_completo
+      ↓
+  GENERANDO_BORRADOR (mientras corre run_part2_pipeline)
+      ↓
+      ├─→ needs_human_review (si falla evaluación)
+      └─→ analisis_completo (si todo pasa)
+  ```
+
+**Error 2: KeyAspect Serialización Incorrecta**
+- **Archivo**: `data/pipelines/rfp_intake/cycle.py` (función `_extract_key_aspects`, línea 188)
+- **Problema**: Convertía `KeyAspect` con `str(a)` → texto puro en lugar de dict tipado
+  - Generadores recibían `{"aspect": "<KeyAspect object at 0x...>"}` 
+  - Evaluadores recibían strings opacos
+  - Handoff entre departamentos perdía información estructurada
+- **Solución**: Cambio quirúrgico a `a.model_dump()` cuando el objeto lo soporta
+  ```python
+  # Antes (línea 188)
+  return [a if isinstance(a, dict) else {"aspect": str(a)} for a in aspects]
+  
+  # Después (línea 188)
+  return [a if isinstance(a, dict) else a.model_dump() if hasattr(a, "model_dump") else {"aspect": str(a)} for a in aspects]
+  ```
+- **Resultado**: Generadores/evaluadores reciben dicts tipados correctamente
+
+### Verificación
+
+- ✅ **70/70 tests RFP pasando** (27 Part 2 + 43 restantes)
+- ✅ Todos los tests de `run_part2_pipeline()` pasan
+- ✅ No hay breakage en otros componentes
+- ✅ Cambios mínimos y sin alterar la lógica principal
+
+### Impacto
+
+| Aspecto | Antes | Después |
+|---------|-------|---------|
+| **Estado del Ticket** | Inconsistente | ✅ Coherente |
+| **Tiempo de inconsistencia** | ~15s-1m | ✅ 0s |
+| **Formato de KeyAspect** | String opaco | ✅ Dict tipado |
+| **Evaluación de borradores** | Con datos truncados | ✅ Información completa |
+| **Handoff a Parte 3** | Incompleto | ✅ Estructurado |
+| **Tests Part 2** | Funcionales | ✅ 27/27 pasan |

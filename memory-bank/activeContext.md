@@ -1,5 +1,29 @@
 # Active Context
 
+## Hotfixes Parte 2 — Hito 9 (2026-11-25)
+
+**Dos errores bloqueantes corregidos en la implementación de Parte 2 del flujo agéntico de RFP:**
+
+### Error 1: Estado del Ticket Inconsistente
+- **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 322-330, eliminadas)
+- **Problema**: Status cambiaba a `en_evaluación` ANTES de ejecutar `run_part2_pipeline()`
+- **Solución**: Eliminadas líneas 322-330. El estado ahora refleja correctamente: `GENERANDO_BORRADOR` → `{needs_human_review|analisis_completo}`
+- **Verificación**: 70/70 tests RFP pasando (27 Part 2 + 43 restantes)
+
+### Error 2: KeyAspect Serialización Incorrecta
+- **Archivo**: `data/pipelines/rfp_intake/cycle.py` (función `_extract_key_aspects`, línea 188)
+- **Problema**: Convertía `KeyAspect` con `str(a)` → texto puro en lugar de dict tipado
+- **Solución**: Cambio a `a.model_dump()` cuando el objeto lo soporta
+  ```python
+  # Cambio (línea 188)
+  return [a if isinstance(a, dict) else a.model_dump() if hasattr(a, "model_dump") else {"aspect": str(a)} for a in aspects]
+  ```
+- **Verificación**: Generadores/evaluadores reciben dicts estructurados correctamente
+
+**Estado**: ✅ Completado — Ambos errores corregidos y verificados (70/70 tests pasando)
+
+---
+
 ## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 
 - **Mejoras post-auditoría (2026-11-22)**:
