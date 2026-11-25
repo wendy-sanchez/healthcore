@@ -251,12 +251,16 @@ def arbitrage_node(state: Part3PipelineState) -> Dict[str, Any]:
 # Node: Request Approvals (by department, with interrupt)
 # ============================================================================
 
-def request_approvals_node(state: Part3PipelineState) -> Dict[str, Any]:
+def request_approvals_node(state: Part3PipelineState, checkpointer=None) -> Dict[str, Any]:
     """
     For each department, prepare approval request and pause the graph.
     Uses interrupt() to signal the graph to stop and wait for human input.
     
     Each department is handled independently (no blocking between depts).
+    
+    Args:
+        state: Part3PipelineState
+        checkpointer: Optional Part3SQLiteCheckpointer to persist checkpoints per department
     """
     start = time.time()
     
@@ -295,6 +299,11 @@ def request_approvals_node(state: Part3PipelineState) -> Dict[str, Any]:
         print(f"[INTERRUPT] Approval needed for {dept_id}")
         print(f"  Approver: {approver_info.get('name', 'Unknown')}")
         print(f"  Eval: {eval_summary[:100]}...")
+    
+    # SAVE CHECKPOINTS for each interrupted department
+    if checkpointer:
+        for dept_id in state.interrupted_departments.keys():
+            checkpointer.put(ticket_id=state.ticket_id, state_dict=state.model_dump(), department_id=dept_id)
     
     duration_ms = (time.time() - start) * 1000
     add_trace(

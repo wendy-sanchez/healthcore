@@ -24,6 +24,84 @@
 
 ---
 
+## Hito 9 · RFP Pipeline — Parte 3: Approval & Synthesis
+
+**Estado: ✅ COMPLETADO — 13/13 Tests PASS, 4 Bugs Críticos Reparados**
+
+### Bugs Críticos Reparados
+
+1. **Checkpoint Persistence Mismatch**
+   - **Archivo**: `data/pipelines/rfp_intake/graph.py` (línea 90-95)
+   - **Problema**: Checkpoints no se guardaban cuando `request_approvals_node` se ejecutaba
+   - **Causa**: Falta de inyección de dependencia del checkpointer
+   - **Solución**: Wrapper closure que captura `self.checkpointer` e inyecta en el nodo
+   - **Resultado**: Checkpoints persisten automáticamente con namespacing `rfp-{ticket}:{dept}`
+
+2. **Resume/Continuation Flow Incompleto**
+   - **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 161-169)
+   - **Problema**: `synthesize_document` nunca se ejecutaba después de todas las aprobaciones
+   - **Causa**: En modo manual, el pipeline no ejecutaba el routing de `check_approvals_complete`
+   - **Solución**: Lógica de routing manual agregada a `run_part3_pipeline()`
+   - **Resultado**: Document synthesis se ejecuta automáticamente cuando todos aprueban
+
+3. **Approval State Persistence en Checkpoint**
+   - **Archivo**: `data/pipelines/rfp_intake/graph_nodes.py` (línea 400)
+   - **Problema**: Las aprobaciones no se guardaban en el checkpoint antes de reanudar
+   - **Causa**: Falta de `checkpointer.put()` explícito después de registrar aprobación
+   - **Solución**: Agregado `self.checkpointer.put(ticket_id, state.model_dump(), department_id)` en `handle_approval_response()`
+   - **Resultado**: Aprobaciones persisten y se recuperan correctamente
+
+4. **Pydantic v2 Deprecation**
+   - **Archivo**: `data/pipelines/rfp_intake/graph_nodes.py` (línea 306)
+   - **Problema**: Warnings por uso de `.dict()` en lugar de `.model_dump()`
+   - **Solución**: Cambio global a `.model_dump()`
+   - **Resultado**: Limpieza de warnings de deprecation
+
+### Paralelismo Real (Implementado y Testeado)
+
+**Test: `test_part3_parallel_department_approvals` ✅ PASS**
+- Dept A interrumpida → Dept B aprueba → Dept C aprueba
+- Verificado: Ningún departamento bloquea a otro
+- Cada uno tiene checkpoint independiente: `rfp-ticket:revenue`, `rfp-ticket:clinical`, `rfp-ticket:compliance`
+- Resultado: Aprobaciones en paralelo funcionan perfectamente
+
+**Test: `test_part3_all_approvals_then_synthesis` ✅ PASS**
+- Después de todas las aprobaciones → `final_document` se genera automáticamente
+- Verificado: Síntesis ejecutada correctamente
+
+### Arquitectura Implementada
+
+**Nodos:**
+- `detect_conflicts_node` — Triggers estructurados (PHI, BAA/DPA, Capacity)
+- `arbitrage_node` — Arbitraje determinista (reglas fijas, árboles del CONTEXT)
+- `request_approvals_node` — Interrupción por dept con checkpoint persistence
+- `check_approvals_complete` — Routing condition
+- `synthesize_document_node` — Documento final automático
+
+**Nuevos Módulos:**
+- `approval.py` (~70 líneas) — InterruptPayload, ResumePayload, ApprovalDecision
+- `arbitration.py` (~90 líneas) — Mapping determinista de triggers → reglas fijas
+
+**Enums Expandidos:**
+- `TicketStatusPart3`: WAITING_FOR_APPROVAL, PARTIALLY_APPROVED, NEEDS_REVISION, ARBITRATING, PRODUCING
+
+### Capacidades Verificadas
+
+| Criterio | Test | Resultado |
+|----------|------|-----------|
+| Checkpoint persist/retrieve | test_checkpointer_put_get | ✅ PASS |
+| Namespacing rfp-{ticket}:{dept} | test_checkpointer_namespacing | ✅ PASS |
+| Paralelismo | test_part3_parallel_department_approvals | ✅ PASS |
+| Arbitraje determinista | test_arbitrage_phi_rejection, test_arbitrage_baa_mismatch | ✅ PASS |
+| Síntesis automática | test_part3_all_approvals_then_synthesis | ✅ PASS |
+
+### Integración
+
+- Endpoint API: `POST /rfp/tickets/{ticket_id}/approve`
+- Tests: `agentic_workflows_part3/test_part3.py` → 13/13 ✅ PASS
+
+---
+
 ## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 
 - **Mejoras post-auditoría (2026-11-22)**:

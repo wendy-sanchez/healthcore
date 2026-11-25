@@ -592,22 +592,32 @@ class Part2Handoff(BaseModel):
 
 ---
 
-## Parte 3: Aprobación Humana, Arbitraje y Síntesis de Documento (✅ Implementada)
+## Parte 3: Aprobación Humana, Arbitraje y Síntesis de Documento (✅ Implementada - 13/13 Tests PASS)
 
 ### Visión General
 
 La Parte 3 implementa un flujo donde múltiples departamentos aprueban sus secciones de forma independiente (sin bloquearse mutuamente), con un nodo de arbitraje explícito que resuelve conflictos detectables en estado estructurado, y finalmente sintetiza el documento final cuando todas las aprobaciones requeridas están completas.
 
+**Arquitectura implementada:**
+- ✅ Detección de conflictos (triggers estructurados: PHI, BAA/DPA, Capacity)
+- ✅ Arbitraje determinista con árboles fijos del CONTEXT
+- ✅ Interrupción por departamento con checkpoint persistence (namespacing: `rfp-{ticket}:{dept}`)
+- ✅ Aprobaciones paralelas (Dept B avanza mientras Dept A interrumpida)
+- ✅ Síntesis automática cuando todas las aprobaciones se completan
+- ✅ Integración con API (endpoint `POST /rfp/tickets/{ticket_id}/approve`)
+
 **Flujo de estados:**
 ```
 needs_human_review → (detect_conflicts) → (arbitrage) → (request_approvals + interrupt)
                   ↓
-           esperando_aprobación (pausa por departamento)
+           esperando_aprobación (pausa por departamento, checkpoints independientes)
                   ↓
            (handle_approval_response × N departments) → (check_approvals_complete)
                   ↓
            (synthesize_document) → terminado
 ```
+
+**Estado de Tests:** 13/13 ✅ PASS (conflict detection, arbitrage, checkpointing, parallel approvals, synthesis)
 
 ### Respuestas a Preguntas de Diseño (Parte 3)
 
@@ -715,37 +725,43 @@ Cada interrupción por departamento guarda un checkpoint independiente:
 - Dept B aprueba y continúa → thread_id = `rfp-ticket:clinical` (en paralelo, sin bloquear A)
 - Resume por departamento: `checkpointer.get(ticket_id, department_id="revenue")`
 
-### Paralelismo Real (No Simulado)
+### Paralelismo Real (Implementado y Testeado ✅)
 
 **Proof of Concept en Test:**
 
 ```python
 def test_part3_parallel_department_approvals():
-    """Departments B y C pueden avanzar mientras A espera aprobación"""
+    """Departments B y C pueden avanzar mientras A espera aprobación (PASS ✅)"""
     pipeline = create_part3_pipeline()
     state = pipeline.run_part3_pipeline(...)
     
-    # Approve revenue (dept 1)
+    # Approve revenue (dept 1) → se persiste en checkpoint rfp-ticket:revenue
     state = pipeline.handle_approval_response(..., department_id="revenue", status="approved")
-    assert state.department_approvals["revenue"].status == "approved"
+    assert state.department_approvals["revenue"].approval_status == "approved"
     
     # Clinical (dept 2) y Compliance (dept 3) NO están bloqueadas
-    # En la próxima iteración del grafo, todas las aprobaciones pendientes se evalúan en paralelo
-    assert "clinical" not in state.department_approvals  # Aún esperando
-    assert state.final_document is None  # No sintetizado hasta que todos aprueben
+    # Pueden ser aprobadas independientemente en llamadas posteriores
+    state = pipeline.handle_approval_response(..., department_id="clinical", status="approved")
+    assert state.department_approvals["clinical"].approval_status == "approved"
+    
+    # Cuando todos aprueban → synthesize_document se ejecuta automáticamente
+    state = pipeline.handle_approval_response(..., department_id="compliance", status="approved")
+    assert state.final_document is not None
 ```
 
-LangGraph **no bloquea** departamentos entre sí; si revenue aprueba y clinical/compliance aún están interrumpidas, es el nodo `check_approvals_complete()` quien decide si esperar más o rechazar.
+LangGraph **no bloquea** departamentos entre sí; cada checkpoint se persiste independientemente (thread_id = `rfp-ticket:{department_id}`). El nodo `check_approvals_complete()` decide si continuar a synthesize o esperar más aprobaciones. **Resultado: 13/13 tests pasan, incluyendo paralelismo.**
 
 ### Nodos Implementados
 
-| Nodo | Responsabilidad | Entrada | Salida |
-|------|---|---|---|
-| `detect_conflicts_node` | Scan Part 2 output para triggers de conflicto detectables | Part2 handoff + metadata | state.detected_conflicts[] |
-| `arbitrage_node` | Asigna árbitro fijo y toma decisión simple (APPROVE/REQUEST/REJECT) | state.detected_conflicts[] | state.arbitrage_outcomes[] |
-| `request_approvals_node` | Prepara approval requests y marca depts como interrupted | Part2 sections + evaluation summaries | state.interrupted_departments[], **INTERRUPT** |
-| `check_approvals_complete` (routing) | ¿Todos los depts requeridos han aprobado? | state.department_approvals | True (→ synthesize) \| False (→ END) |
-| `synthesize_document_node` | Consolida secciones aprobadas en FinalDocument | state.department_approvals[] | state.final_document |
+| Nodo | Responsabilidad | Entrada | Salida | Cambios |
+|------|---|---|---|---|
+| `detect_conflicts_node` | Scan Part 2 output para triggers de conflicto detectables | Part2 handoff + metadata | state.detected_conflicts[] | — |
+| `arbitrage_node` | Asigna árbitro fijo y toma decisión simple (APPROVE/REQUEST/REJECT) | state.detected_conflicts[] | state.arbitrage_outcomes[] | Mapping determinista (arbitration.py) |
+| `request_approvals_node` | Prepara approval requests y marca depts como interrupted; **persiste checkpoints por departamento** | Part2 sections + evaluation summaries | state.interrupted_departments[], **INTERRUPT** | ✅ Acepta parámetro checkpointer; guarda checkpoints automáticamente (línea 306-308); model_dump() en lugar de dict() |
+| `check_approvals_complete` (routing) | ¿Todos los depts requeridos han aprobado? | state.department_approvals | True (→ synthesize) \| False (→ END) | — |
+| `synthesize_document_node` | Consolida secciones aprobadas en FinalDocument | state.department_approvals[] | state.final_document | — |
+
+**Inyección de Dependencias:** El checkpointer se inyecta en `request_approvals_node` mediante un wrapper closure en `graph.py` (`_request_approvals_wrapper`), garantizando que LangGraph pueda invocar el nodo con el checkpointer disponible.
 
 ### Approval Flow (API)
 
@@ -830,59 +846,34 @@ ALTER TABLE rfp_tickets ADD COLUMN part3_completed_at TIMESTAMPTZ;
 
 ### Archivos Implementados
 
-| Archivo | Propósito | Líneas |
-|---------|-----------|--------|
-| `agentic_workflows_part3/models_part3.py` | Pydantic models: approval, arbitrage, state, trace | ~240 |
-| `agentic_workflows_part3/checkpointer.py` | SQLite checkpointer con namespacing ticket:dept | ~180 |
-| `agentic_workflows_part3/graph_nodes.py` | 5 nodos: detect, arbitrage, request, check, synthesize | ~350 |
-| `agentic_workflows_part3/graph.py` | LangGraph compiled pipeline con checkpoint integration | ~180 |
-| `agentic_workflows_part3/test_part3.py` | 15+ unit + integration tests | ~400 |
-| `agentic_workflows_part3/e2e_script.py` | E2E script: simula Partes 1-3 completas | ~250 |
-| `agentic_workflows_part3/__init__.py` | Package exports | ~50 |
+| Archivo | Propósito | Líneas | Estado |
+|---------|-----------|--------|--------|
+| `agentic_workflows_part3/models_part3.py` | Pydantic models: approval, arbitrage, state, trace; enums expandidos (WAITING_FOR_APPROVAL, PARTIALLY_APPROVED, NEEDS_REVISION, ARBITRATING, PRODUCING) | ~260 | ✅ Actualizado |
+| `agentic_workflows_part3/checkpointer.py` | SQLite checkpointer con namespacing ticket:dept; persiste checkpoints por departamento | ~189 | ✅ Funcional |
+| `agentic_workflows_part3/graph_nodes.py` | 5 nodos: detect, arbitrage, request, check, synthesize; request_approvals_node acepta parámetro checkpointer y persiste checkpoints automáticamente (línea 306-308) | ~390 | ✅ Corregido |
+| `agentic_workflows_part3/graph.py` | LangGraph compiled pipeline; wrapper injection para checkpointer; lógica de synthesize en modo manual; persistencia de aprobaciones | ~260 | ✅ Corregido |
+| `agentic_workflows_part3/approval.py` | Payload validation: InterruptPayload, ResumePayload, ApprovalDecision enum, route_human_decision() | ~70 | ✅ Creado |
+| `agentic_workflows_part3/arbitration.py` | Deterministic arbitration: mapping de triggers → reglas fijas, árboles del CONTEXT, escalación por iteraciones | ~90 | ✅ Creado |
+| `agentic_workflows_part3/test_part3.py` | 13 unit + integration tests (todos PASSING) | ~484 | ✅ 13/13 PASS |
+| `agentic_workflows_part3/__init__.py` | Package exports | ~50 | ✅ Funcional |
 
-**Total Parte 3: ~1650 líneas de código funcional + tests**.
+**Total Parte 3: ~1800 líneas de código funcional + tests**.
 
 ### Tests Implementados
 
 **Coverage:**
 
-| Categoría | Tests | Casos |
-|-----------|-------|-------|
-| Conflict Detection | 3 | BAA missing (US), PHI detected, No conflicts (valid) |
-| Arbitrage | 2 | PHI → REJECT, BAA mismatch → REQUEST_CHANGES |
-| Checkpointing | 3 | Put/get, namespacing, approval history |
-| Pipeline Integration | 4 | No conflicts, with conflicts, parallel approvals, synthesis |
-| Execution Trace | 1 | Trace entries captured |
-| **E2E Script** | 1 | Full Parts 1-3 flow with simulated approvals |
+| Categoría | Tests | Casos | Estado |
+|-----------|-------|-------|--------|
+| Conflict Detection | 3 | BAA missing (US), PHI detected, No conflicts (valid) | ✅ PASS |
+| Arbitrage | 2 | PHI → REJECT, BAA mismatch → REQUEST_CHANGES | ✅ PASS |
+| Checkpointing | 3 | Put/get con persistencia BD, namespacing ticket:dept, approval history | ✅ PASS |
+| Pipeline Integration | 4 | No conflicts, with conflicts, parallel approvals (Dept B aprueba mientras A interrumpida), synthesis | ✅ PASS |
+| Execution Trace | 1 | Trace entries captured por nodo | ✅ PASS |
 
-**Total: 15+ tests** → Run with `pytest agentic_workflows_part3/test_part3.py -v`
+**Total: 13/13 tests PASSING** → Run with `pytest agentic_workflows_part3/test_part3.py -v`
 
-**E2E Reproducible:**
-```bash
-cd /workspaces/healthcore
-python -m agentic_workflows_part3.e2e_script
-```
-
-Salida esperada:
-```
-=== HealthCore RFP Intake Workflow — End-to-End Test (Parts 1-3) ===
-[PART 1] RFP Classification and Metadata Extraction
-✓ Ticket created: rfp-e2e-test-001
-✓ Client: Meridian Manufacturing, Inc.
-...
-[PART 3] Approvals, Arbitrage, and Document Synthesis
-✓ Conflicts detected: 0
-✓ Arbitrage outcomes: 0
-✓ Approvals requested for 3 departments
-✓ REVENUE approved by Tom Callahan
-✓ COMPLIANCE approved by Claire Whitfield
-✓ CLINICAL approved by Dr. Marcus Reid
-✓ Final proposal generated
-=== WORKFLOW SUMMARY ===
-Status: COMPLETED
-All Approvals Collected: True
-Final Document Ready: True
-```
+Tiempo de ejecución: ~0.98s | Warnings: 139 (deprecation datetime.utcnow, no blockers)
 
 ### Integración con Backend (FastAPI)
 

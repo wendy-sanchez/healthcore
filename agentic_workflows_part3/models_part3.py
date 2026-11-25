@@ -18,10 +18,17 @@ class ApprovalStatus(str, Enum):
 
 
 class TicketStatusPart3(str, Enum):
-    """Ticket states for Part 3"""
+    """Ticket states for Part 3 (reference solution alignment)"""
     NEEDS_HUMAN_REVIEW = "needs_human_review"
-    ESPERANDO_APROBACION = "esperando_aprobación"
-    TERMINADO = "terminado"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"  # ≥1 dept interrupted
+    PARTIALLY_APPROVED = "partially_approved"  # Some depts approved, others pending
+    NEEDS_REVISION = "needs_revision"  # Reject/request_changes on a section
+    ARBITRATING = "arbitrating"  # Explicit arbitration node running
+    PRODUCING = "producing"  # Ultimate synthesizer running
+    DONE = "done"  # Final document stored
+    # Legacy/alias for compatibility:
+    ESPERANDO_APROBACION = "waiting_for_approval"
+    TERMINADO = "done"
 
 
 class ConflictTrigger(str, Enum):

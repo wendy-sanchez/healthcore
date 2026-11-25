@@ -55,10 +55,15 @@ class Part3Pipeline:
         
         graph = StateGraph(Part3PipelineState)
         
-        # ---- NODES ----
+        # ---- NODES WITH CHECKPOINTER INJECTION ----
+        # Create wrapper functions that capture self.checkpointer
+        def _request_approvals_wrapper(state: Part3PipelineState) -> dict:
+            """Wrapper that calls request_approvals_node with injected checkpointer"""
+            return request_approvals_node(state, checkpointer=self.checkpointer)
+        
         graph.add_node("detect_conflicts", detect_conflicts_node)
         graph.add_node("arbitrage", arbitrage_node)
-        graph.add_node("request_approvals", request_approvals_node)
+        graph.add_node("request_approvals", _request_approvals_wrapper)
         graph.add_node("synthesize_document", synthesize_document_node)
         
         # ---- EDGES ----
@@ -149,9 +154,16 @@ class Part3Pipeline:
             final_state.arbitrage_outcomes = result["arbitrage_outcomes"]
             final_state.execution_trace = result["execution_trace"]
             
-            result = request_approvals_node(final_state)
+            # Pass checkpointer to request_approvals_node
+            result = request_approvals_node(final_state, checkpointer=self.checkpointer)
             final_state.interrupted_departments = result["interrupted_departments"]
             final_state.execution_trace = result["execution_trace"]
+            
+            # Check if all approvals are complete and synthesize if so
+            if check_approvals_complete(final_state):
+                result = synthesize_document_node(final_state)
+                final_state.final_document = result.get("final_document")
+                final_state.execution_trace = result.get("execution_trace", final_state.execution_trace)
         
         # Save final checkpoint
         self.checkpointer.put(ticket_id, final_state.model_dump(), resume_department)
@@ -207,6 +219,9 @@ class Part3Pipeline:
         
         state.department_approvals[department_id] = response
         state.interrupted_departments.pop(department_id, None)
+        
+        # Save updated state to checkpoint
+        self.checkpointer.put(ticket_id, state.model_dump(), department_id)
         
         # Save to checkpointer history
         self.checkpointer.record_approval(
