@@ -31,7 +31,7 @@
 | 13 | **LangGraph Agent — External Tools** — Added real-time incident and inventory query tools. Auto-routing between RAG, tools, or both via regex classification (no LLM). 5s timeout, honest fallback. 32 tests. | LangGraph, httpx, regex | ✅ Complete |
 | 14 | **MCP Server — OAuth-Protected Tools** — Model Context Protocol server exposing Incidents (5 tools) and Inventory (5 tools) as MCP tools, protected with OAuth 2.1 Resource Server via mcpauth. Inventory write operations explicitly rejected (RETO 2). LangGraph agent integrated via langchain-mcp-adapters. 9/9 acceptance criteria. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Complete |
 | 15 | **LangGraph Agent — Persistent Memory + Guardrails** — Agent learns from interaction without accumulating junk forever. TinyDB-backed memory (separate from RAG), dual PHI validation (8 HIPAA+UK GDPR patterns), explicit user approval required (never assumed), lexical intent classifier (no LLM), single pending proposal, full audit trail (8 event types), automatic consolidation (threshold 50 facts, TTL 90 days). **Plus**: 3-layer deterministic guardrails (regex, no LLM): system prompt hardening (5 rules), input classification (6 categories, ~100 patterns), output validation (PHI/instruction leak/format). RAG content isolation markers. Graph integration with 2 guardrail nodes + observability. 62 guardrail tests + 94 agent/graph tests = 286 total. 11/11 acceptance criteria. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Complete |
-| 16 | **RFP Intake Pipeline** — Automated ingestion of RFPs from PDF upload. MarkItDown conversion, readability metrics (py-readability-metrics), two-stage classifier (regex pre-filter + DeepSeek-v4 LLM), multi-agent orchestration (orchestrator→3 parallel workers→synthesizer), per-department analysis (Revenue, Clinical, Compliance), handoff payload for Part 2. Async upload with Celery, 202 response with polling. 4 REST endpoints, 16 tests. 3 real PDFs verified end-to-end. | FastAPI, Celery, SQLModel/PostgreSQL, DeepSeek-v4 | ✅ Complete |
+| 16 | **RFP Pipeline** — Complete multi-stage pipeline for ingesting RFPs, generating draft proposals per department, and managing human approval workflows. PDF ingestion (MarkItDown), readability metrics, two-stage classifier (regex + DeepSeek-v4 LLM), multi-agent orchestration (orchestrator→3 parallel workers→synthesizer), per-department draft generation with LLM evaluator cycles (readability, relevance, compliance), conflict detection (PHI, BAA/DPA, Capacity), deterministic arbitration, interrupt-based human approval with checkpointed SQLite persistence scoped per ticket, and final document synthesis. 9-node LangGraph pipeline. 21/21 E2E tests with real LLM. | FastAPI, Celery, LangGraph, SQLModel/PostgreSQL, DeepSeek-v4 | ✅ Complete |
 
 ---
 
@@ -56,20 +56,27 @@ services/                   # Backend services
 mcps/                       # MCP Server (port 9100) — FastMCP + OAuth 2.1
                             #   10 tools (incidents + inventory) protected via mcpauth
 
+agentic_workflows_part3/    # Part 3: LangGraph pipeline — human approval, conflict detection,
+                            #   arbitration, checkpointing, final document synthesis
+
 data/                       # Data layer
 ├── raw/                    #   Raw data (CSV)
 ├── process/                #   Processed data, TinyDB databases
-├── pipelines/              #   RAG pipeline, ETL pipeline
+├── pipelines/              #   RAG pipeline, RFP intake pipeline, ETL pipeline
+│   └── rfp_intake/         #   RFP LangGraph pipeline: converter, classifier, workers,
+│                           #     orchestrator, Part 2 cycle, 9-node graph
+├── checkpoints/            #   Checkpoint SQLite databases per ticket (Part 3)
 ├── eval/                   #   Test queries, evaluation reports
 └── migrations/             #   Database migration SQL
 
 agents/                     # Agent templates and tool documentation
-docs/                       # Architecture, RAG design, telemetry plan
-scripts/                    # CLI tools: sales forecast, model evaluation, nightly export, seed data
-tests/                      # Test suites: pipelines, nightly, agent, RAG, evaluation
+docs/                       # Architecture, RAG design, telemetry plan, serialization audit
+scripts/                    # CLI tools: sales forecast, model evaluation, nightly export,
+                            #   seed data, E2E test, smoke test, RFP ticket reprocess
+tests/                      # Test suites: pipelines, nightly, agent, RAG, evaluation, RFP
 ```
 
-**Backend architecture:** Most APIs use TinyDB for auth and operational data. Inventory and reporting use Supabase PostgreSQL. A standalone auth server avoids SQLModel/Python 3.14 incompatibility. The MCP Server (`mcps/`) exposes incident and inventory tools via Model Context Protocol with OAuth 2.1 protection.
+**Backend architecture:** Most APIs use TinyDB for auth and operational data. Inventory and reporting use Supabase PostgreSQL. A standalone auth server avoids SQLModel/Python 3.14 incompatibility. The MCP Server (`mcps/`) exposes incident and inventory tools via Model Context Protocol with OAuth 2.1 protection. The **RFP Pipeline** (`data/pipelines/rfp_intake/`) uses LangGraph with 9 nodes across 3 integrated stages (ingestion, draft generation, human approval + synthesis), with checkpointing in SQLite (`data/checkpoints/`) and official state persisted to PostgreSQL. The **Part 3 module** (`agentic_workflows_part3/`) handles conflict detection, arbitration, interrupt-based approval, and final document synthesis.
 
 **Docker:** Services communicate via Docker Compose under `healthcore-net`. See [`docker-compose.yml`](./docker-compose.yml).
 
@@ -204,21 +211,18 @@ Retrieval-Augmented Generation over 4 HealthCore policy documents. Embedded with
 
 ---
 
-## 🗃️ RFP Intake Pipeline — Key Details
+## 🗃️ RFP Pipeline — Key Details
 
-Automated pipeline for ingesting RFPs (Requests for Proposals) from PDF upload. Built for **Hito 9, Part 1** (Agentic Workflows — intake/reception).
+Complete multi-stage pipeline for processing RFPs (Requests for Proposals) from PDF upload to approved final document. Built as a **9-node LangGraph pipeline** with three integrated stages covering ingestion, draft generation, and human approval workflows.
 
-**Flow:** `PDF upload → MarkItDown conversion → Readability metrics → Two-stage classifier (regex pre-filter + DeepSeek-v4 LLM) → Orchestrator → 3 parallel workers (Revenue, Clinical, Compliance) → Synthesizer → Handoff payload → PostgreSQL persistence`
+**Flow:** `PDF upload → MarkItDown conversion → Two-stage classifier (regex + LLM) → Orchestrator → 3 parallel workers (Revenue, Clinical, Compliance) → Synthesizer → Draft generation per department with LLM evaluator cycle → Conflict detection → Arbitration → Human approval with checkpoints → Final document synthesis`
 
 **Key characteristics:**
-- **Async architecture:** `POST /rfp/upload` returns `202 Accepted` with ticket UUID. Celery background task executes the full pipeline. Frontend polls `GET /rfp/tickets/{ticket_id}` for status updates.
-- **Classifier:** Two-stage design. First, regex patterns detect non-RFP documents (pitch, CV, newsletter — early discard). Second, DeepSeek-v4 LLM with structured JSON output (is_rfp, confidence, reason, client_name, program_type, deadline). Hard gate: non-RFP → `descartado` with reason.
-- **Multi-agent orchestration:** Orchestrator decomposes the document into per-department extracts. 3 workers run in parallel via `asyncio.gather()` with `asyncio.to_thread()` — Revenue (currency by country), Clinical (PHI detection), Compliance (BAA/DPA by country). LLM primary, rule-based fallback. Workers **never invent figures** — missing data recorded as `open_questions`.
-- **Handoff for Part 2:** Synthesizer generates `handoff_payload` JSON with ticket_id, rfp_metadata, per-department analysis, and synthesis. Ready for Part 2 (draft generation).
-- **Statuses:** `analizando` → (`analisis_completo` | `descartado` | `error`). Bilingual Spanish (aligned with CONTEXT.md briefing).
-- **3 verified PDFs:** Real academic and business RFPs from 4GeeksAcademy verified end-to-end.
-- **16 tests:** 7 classifier tests (RFP, pitch, CV, newsletter, empty, short, PHI) + 9 worker tests (Compliance BAA/DPA, Revenue USD/GBP, DepartmentSection model).
-- **Docs:** [`agentic-workflows.md`](./agentic-workflows.md), [`data/pipelines/rfp_intake/`](./data/pipelines/rfp_intake/)
+- **Async architecture:** `POST /rfp/upload` → `202 Accepted` with ticket UUID. Celery background task runs the pipeline. Frontend polls `GET /rfp/tickets/{ticket_id}`.
+- **9-node LangGraph** integrating ingestion, draft generation, per-department generator-evaluator cycle (3 parallel async evaluators: readability, relevance, compliance), conflict detection, interrupt-based human approval with SQLite checkpoints, and final synthesis.
+- **Status lifecycle:** 11 states from `nuevo` → `terminado` (see [`agentic-workflows.md`](./agentic-workflows.md) for details).
+- **Tests:** **21/21 E2E tests** with real LLM (DeepSeek v4 Flash via 4Geeks AI) covering all stages, DB persistence, and edge cases.
+- **Docs:** [`agentic-workflows.md`](./agentic-workflows.md) (full design), [`data/pipelines/rfp_intake/`](./data/pipelines/rfp_intake/), [`agentic_workflows_part3/`](./agentic_workflows_part3/)
 
 ---
 
@@ -235,7 +239,7 @@ Automated pipeline for ingesting RFPs (Requests for Proposals) from PDF upload. 
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Overall architecture proposal |
 | [`mcp-server.md`](./mcp-server.md) | MCP Server — OAuth-protected tools, architecture, setup |
 | [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | LangGraph Agent Persistent Memory + Harness & Guardrails — architecture, system prompt hardening, 3-layer deterministic safety, flow diagrams |
-| [`agentic-workflows.md`](./agentic-workflows.md) | RFP Intake Pipeline (Hito 9, Part 1) — design, architecture, bugs, verification, limitations |
+| [`agentic-workflows.md`](./agentic-workflows.md) | RFP Pipeline (Hito 9, Parts 1+2+3) — complete design from PDF ingestion through draft generation, human approval, and final document synthesis |
 | [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns, tech decisions |
 
 ---

@@ -339,7 +339,110 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
         state["status"] = final_status
         state["part2_handoff"] = part2_handoff.model_dump(mode="json")
 
-        logger.info("Pipeline RFP completado para ticket %s → %s", ticket_id, final_status)
+        # ── Nodo 9 (Parte 3): Conflict Detection, Arbitrage, Approval & Synthesis ─
+        logger.info("[Nodo 9/9] Ejecutando Parte 3 — detección de conflictos, arbitraje y aprobaciones...")
+        if final_status == "needs_human_review":
+            try:
+                from agentic_workflows_part3.graph import create_part3_pipeline
+                from agentic_workflows_part3.models_part3 import TicketStatusPart3
+                
+                # Crear pipeline Parte 3 con checkpoint scoped al ticket
+                checkpoint_dir = Path('/workspaces/healthcore/data/checkpoints')
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                part3_pipeline = create_part3_pipeline(
+                    checkpoint_db_path=str(checkpoint_dir / f'{ticket_id}.db')
+                )
+                part3_handoff = {
+                    "departments": part2_handoff.model_dump(mode="json").get("departments", [])
+                    if hasattr(part2_handoff, "model_dump")
+                    else part2_handoff.get("departments", []),
+                }
+                meta = state.get("metadata", {})
+                rfp_metadata_for_part3 = {
+                    "client_name": meta.get("client_name", "Unknown"),
+                    "client_country": meta.get("client_country", "US"),
+                    "program_type": meta.get("program_type", "unknown"),
+                    "covered_population": meta.get("covered_population", 0),
+                }
+
+                # Set arbitrando state before execution
+                with Session(engine) as session:
+                    stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+                    t = session.exec(stmt).first()
+                    if t:
+                        t.status = 'arbitrando'
+                        session.add(t)
+                    session.commit()
+
+                part3_state = part3_pipeline.run_part3_pipeline(
+                    ticket_id=ticket_id,
+                    part2_handoff=part3_handoff,
+                    rfp_metadata=rfp_metadata_for_part3,
+                )
+                
+                # Transition to produciendo while writing final document
+                if part3_state.all_departments_approved or part3_state.final_document:
+                    with Session(engine) as session:
+                        stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+                        t = session.exec(stmt).first()
+                        if t:
+                            t.status = 'produciendo'
+                            session.add(t)
+                        session.commit()
+
+                # Persistir resultados de Parte 3 en PostgreSQL
+                with Session(engine) as session:
+                    stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
+                    ticket = session.exec(stmt).first()
+                    if ticket:
+                        # Si hay conflictos no resueltos o arbitraje que requiere cambios
+                        if part3_state.arbitrage_outcomes:
+                            has_reject = any(
+                                o.decision == "reject"
+                                for o in part3_state.arbitrage_outcomes
+                            )
+                            if has_reject:
+                                ticket.status = "needs_human_review"
+                        elif part3_state.interrupted_departments:
+                            ticket.status = "esperando_aprobacion"
+                        
+                        # Si todas las aprobaciones se completaron y hay documento final
+                        if part3_state.all_departments_approved and part3_state.final_document:
+                            ticket.status = "terminado"
+                            ticket.final_document_path = part3_state.final_document.document_path
+                            ticket.part3_completed_at = datetime.now(timezone.utc)
+                        
+                        session.add(ticket)
+                    session.commit()
+
+                logger.info(
+                    "Parte 3 completada para ticket %s: %d conflictos, %d arbitrajes, aprobaciones=%s, documento=%s",
+                    ticket_id,
+                    len(part3_state.detected_conflicts),
+                    len(part3_state.arbitrage_outcomes),
+                    part3_state.all_departments_approved,
+                    part3_state.final_document is not None,
+                )
+                state["part3_result"] = {
+                    "conflicts": len(part3_state.detected_conflicts),
+                    "arbitrage": len(part3_state.arbitrage_outcomes),
+                    "all_approved": part3_state.all_departments_approved,
+                    "document_generated": part3_state.final_document is not None,
+                }
+                # Actualizar status final
+                if part3_state.all_departments_approved and part3_state.final_document:
+                    state["status"] = "terminado"
+                elif part3_state.interrupted_departments:
+                    state["status"] = "esperando_aprobacion"
+                    
+            except Exception as e3:
+                logger.warning("Parte 3 no disponible o falló para ticket %s: %s", ticket_id, e3)
+                # Parte 3 es opcional — el pipeline no falla si no está disponible
+                state["part3_result"] = {"error": str(e3)}
+        else:
+            logger.info("Parte 3 no requiere intervención (status=%s)", final_status)
+
+        logger.info("Pipeline RFP completado para ticket %s → %s", ticket_id, state["status"])
         return state
 
     except Exception as e:

@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.api.database import get_db
 from services.api.models_rfp import DepartmentSectionDB, RfpMetadataDB, TicketDB
@@ -309,3 +310,188 @@ async def reprocess_ticket(ticket_id: str, db: Session = Depends(get_db)) -> Rep
         status="analizando",
         message="Reprocesamiento iniciado. Consulta GET /rfp/tickets/{ticket_id} para ver el progreso.",
     )
+
+
+# ── Part 3 Endpoints: Approvals ─────────────────────────────────────
+
+
+class ApproveRequest(BaseModel):
+    approval_status: str = Field(..., description="approved | rejected | requested_changes")
+    approver_name: str
+    approver_email: str
+    rejection_reason: str | None = None
+    requested_changes: list[str] | None = None
+
+    @field_validator("requested_changes")
+    @classmethod
+    def validate_requested_changes(cls, v, info):
+        if info.data.get("approval_status") == "requested_changes" and not v:
+            raise ValueError("requested_changes is required when approval_status is requested_changes")
+        return v
+
+
+class ApprovalRecord(BaseModel):
+    ticket_id: str
+    department_id: str
+    approval_status: str
+    approver_name: str
+    approved_at: str
+
+
+class ApprovalsListResponse(BaseModel):
+    ticket_id: str
+    approvals: list[ApprovalRecord] = []
+
+
+@router.post("/tickets/{ticket_id}/approve", status_code=status.HTTP_200_OK)
+async def approve_ticket_department(
+    ticket_id: str,
+    department_id: str,
+    body: ApproveRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Registra una aprobación/rechazo de un departamento del pipeline Parte 3.
+
+    Valida que el ticket exista, que esté en estado 'esperando_aprobacion',
+    persiste la respuesta en PostgreSQL, y si todos los departamentos han
+    aprobado, desencadena la síntesis del documento final.
+    """
+    # 1. Validar ticket
+    ticket = db.exec(select(TicketDB).where(TicketDB.ticket_id == ticket_id)).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+
+    if ticket.status not in ("esperando_aprobacion", "needs_human_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"El ticket está en estado '{ticket.status}'. Solo se aceptan aprobaciones en estado 'esperando_aprobacion'.",
+        )
+
+    # 2. Validar department_id exists
+    department = db.exec(
+        select(DepartmentSectionDB).where(
+            DepartmentSectionDB.ticket_id == ticket_id,
+            DepartmentSectionDB.department_id == department_id,
+        )
+    ).first()
+    if not department:
+        raise HTTPException(status_code=404, detail=f"Departamento '{department_id}' no encontrado para este ticket")
+
+    # 3. Validar approval_status
+    valid_statuses = {"approved", "rejected", "requested_changes"}
+    if body.approval_status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"approval_status debe ser uno de: {', '.join(sorted(valid_statuses))}")
+
+    # 4. Persistir approbación en DepartmentSectionDB
+    department.approval_status = body.approval_status
+    department.approver = body.approver_name
+    department.approved_at = datetime.utcnow()
+    db.add(department)
+    db.commit()
+    db.refresh(department)
+
+    logger.info(
+        "Aprobación registrada: ticket=%s dept=%s status=%s approver=%s",
+        ticket_id, department_id, body.approval_status, body.approver_name,
+    )
+
+    # 5. Re-evaluar estado del ticket: si todos los deptos aprobaron -> terminar
+    all_sections = db.exec(
+        select(DepartmentSectionDB).where(DepartmentSectionDB.ticket_id == ticket_id)
+    ).all()
+
+    all_approved = all(
+        s.approval_status == "approved"
+        for s in all_sections
+        if s.approval_status is not None  # Solo considerar los que han sido evaluados
+    )
+
+    # Si hay secciones y todas las evaluadas están aprobadas, marcar completado
+    evaluated_sections = [s for s in all_sections if s.approval_status is not None]
+    pending_sections = [s for s in all_sections if s.approval_status is None]
+
+    if evaluated_sections and not pending_sections and all_approved:
+        # Todos los departamentos han aprobado -> intentar síntesis
+        ticket.status = "terminado"
+        ticket.part3_completed_at = datetime.utcnow()
+
+        # Intentar síntesis de documento final si está disponible Part 3
+        try:
+            from agentic_workflows_part3.graph import create_part3_pipeline
+            pipeline = create_part3_pipeline()
+            checkpoint = pipeline.checkpointer.get(ticket_id)
+            if checkpoint:
+                part3_state = pipeline.handle_approval_response(
+                    ticket_id=ticket_id,
+                    department_id=department_id,
+                    approval_response=body.model_dump(),
+                )
+                if part3_state and part3_state.final_document:
+                    ticket.final_document_path = part3_state.final_document.document_path
+                    logger.info("Documento final generado para ticket %s en %s", ticket_id, ticket.final_document_path)
+        except ImportError:
+            logger.warning("Part3 pipeline no disponible para síntesis posterior a aprobación")
+        except Exception as e:
+            logger.warning("Error en síntesis posterior a aprobación: %s", e)
+
+        db.add(ticket)
+        db.commit()
+
+        return {
+            "message": "Todos los departamentos aprobaron. Ticket completado.",
+            "ticket_id": ticket_id,
+            "status": "terminado",
+            "department": department_id,
+            "approval_status": body.approval_status,
+        }
+
+    # Si solo algunos aprobaron, actualizar estado con granularidad Part 3
+    if all_sections and all_approved:
+        ticket.status = "terminado"
+    elif body.approval_status == "rejected":
+        ticket.status = "needs_human_review"
+    elif body.approval_status == "requested_changes":
+        ticket.status = "needs_human_review"
+    elif evaluated_sections and pending_sections and all_approved is False:
+        ticket.status = "parcialmente_aprobado"
+    else:
+        ticket.status = "esperando_aprobacion"
+
+    db.add(ticket)
+    db.commit()
+
+    return {
+        "message": f"Aprobación registrada para departamento '{department_id}'.",
+        "ticket_id": ticket_id,
+        "department": department_id,
+        "approval_status": body.approval_status,
+        "ticket_status": ticket.status,
+    }
+
+
+@router.get("/tickets/{ticket_id}/approvals", response_model=ApprovalsListResponse)
+async def get_ticket_approvals(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+) -> ApprovalsListResponse:
+    """Obtiene el historial de aprobaciones de todos los departamentos de un ticket."""
+    ticket = db.exec(select(TicketDB).where(TicketDB.ticket_id == ticket_id)).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket no encontrado")
+
+    sections = db.exec(
+        select(DepartmentSectionDB).where(DepartmentSectionDB.ticket_id == ticket_id)
+    ).all()
+
+    approvals = [
+        ApprovalRecord(
+            ticket_id=s.ticket_id,
+            department_id=s.department_id,
+            approval_status=s.approval_status or "pending",
+            approver_name=s.approver or "",
+            approved_at=s.approved_at.isoformat() if s.approved_at else "",
+        )
+        for s in sections
+    ]
+
+    return ApprovalsListResponse(ticket_id=ticket_id, approvals=approvals)

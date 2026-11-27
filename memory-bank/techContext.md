@@ -148,6 +148,112 @@
 5. Priorizar funciones puras para lógica de negocio en src/utils.
 6. Validar en el borde con Pydantic: las reglas de negocio del CONTEXT (moneda por país, tarifa positiva, enums de estado y categoría) se rechazan con 422 antes de tocar TinyDB.
 7. Baja lógica en el directorio de proveedores: DELETE no borra, marca `archived_at`. `status` conserva únicamente los valores del CONTEXT.
+### Part 3 — Checkpointer Dual
+
+Part 3 usa un sistema de persistencia dual:
+
+1. **SQLite (checkpointer interno)**: Namespacing `rfp-{ticket_id}:{department_id}` para estado interno de cada departamento (checkpoints, approval_history, arbitrage_history). Rápido, sin dependencias externas. Persiste en disco, sobrevive reinicios.
+2. **PostgreSQL vía `Session(engine)` (persistencia oficial)**: `DepartmentSectionDB.approval_status/approver/approved_at` registran aprobaciones, `TicketDB.status/final_document_path/part3_completed_at` trackean el estado del ticket.
+
+### Flujo de estados del ticket (completo)
+
+```
+upload → analizando → clasificado → generando_borrador → en_evaluacion → 
+analisis_completo → needs_human_review → arbitrando → esperando_aprobacion →
+parcialmente_aprobado → needs_revision → produciendo → terminado
+```
+
+### Pipeline de 9 nodos (graph.py)
+
+1. Convert PDF → 2. Extract Metadata → 3. Classify → 4. Orchestrate → 5. Worker Loop → 6. Synthesize → 7. Part 2 (cycle) → 8. Final DB Commit → **9. Part 3 (conflict/arbitrage/approval/synthesis)**
+
+### Nodo 9 en graph.py
+
+El Nodo 9 se ejecuta solo cuando `final_status == "needs_human_review"`:
+- Importa `create_part3_pipeline` de `agentic_workflows_part3.graph`
+- Crea checkpoint scoped por ticket: `checkpoint_dir = Path('/workspaces/healthcore/data/checkpoints')` + `checkpoint_db_path = str(checkpoint_dir / f'{ticket_id}.db')`
+- Ejecuta `run_part3_pipeline()` con el handoff de Part 2
+- Transiciona estados: `needs_human_review` → `arbitrando` → `esperando_aprobacion` / `parcialmente_aprobado` → `produciendo` → `terminado`
+- Persiste resultados en PostgreSQL (`TicketDB.status`, `final_document_path`, `part3_completed_at`)
+
+### Endpoints FastAPI — Part 3
+
+- `POST /api/rfp/tickets/{ticket_id}/approve` — Registra aprobación/rechazo de departamento (body: `ApproveRequest` con `@field_validator` para `requested_changes`)
+- `GET /api/rfp/tickets/{ticket_id}/approvals` — Historial de aprobaciones (desde `DepartmentSectionDB`)
+- `GET /api/rfp/tickets/{ticket_id}/pending-approvals` — Payload estructurado de interrupt para UI (`section_summary`, `evaluation_snapshot`, `actions`)
+
+### Módulos de Parte 3
+
+- `agentic_workflows_part3/models_part3.py` — 7 estados lifecycle, 4 enums, 6 modelos Pydantic + `add_trace()` helper
+- `agentic_workflows_part3/checkpointer.py` — `Part3SQLiteCheckpointer` con 3 tablas (checkpoints, approval_history, arbitrage_history)
+- `agentic_workflows_part3/graph_nodes.py` — 5 nodos LangGraph + routing function, 3 fixed arbiters del CONTEXT
+- `agentic_workflows_part3/graph.py` — `Part3Pipeline` class con `_build_graph()`, `run_part3_pipeline()`, `handle_approval_response()`
+- `agentic_workflows_part3/arbitration.py` — Reglas deterministas, fixed arbiters (nunca LLM consensus)
+## Patrones de Persistencia (PostgreSQL via SQLModel)
+
+### Sesión con Context Manager
+En la pipeline RFP Parte 2, cada helper de persistencia abre su propia conexión:
+
+```python
+from sqlmodel import Session, select
+
+def _persist_example(engine, ticket_id, dept_id):
+    with Session(engine) as session:
+        stmt = select(DepartmentSectionDB).where(
+            DepartmentSectionDB.ticket_id == ticket_id,
+            DepartmentSectionDB.department_id == dept_id
+        )
+        dept_db = session.exec(stmt).first()
+        if dept_db:
+            dept_db.generation_status = "generando"
+            session.add(dept_db)
+            session.commit()
+```
+
+Cada helper hace `session.commit()` inmediato, asegurando que el cambio sea visible en DB sin depender de la transacción del llamante.
+
+### Mock de Session en Tests (unittest.mock)
+Para testear los helpers sin DB real, se usa el patrón de class context manager:
+
+```python
+from unittest.mock import MagicMock, patch
+import pytest
+
+@pytest.fixture
+def mock_session():
+    session = MagicMock(name="session")
+    session.__enter__.return_value = session  # Context manager
+    return session
+
+@pytest.fixture
+def session_factory(mock_session):
+    session_instance = MagicMock(name="session_instance")
+    session_instance.__enter__.return_value = mock_session
+    mock_session_cls = MagicMock(return_value=session_instance)
+    with patch("data.pipelines.rfp_intake.cycle.Session", mock_session_cls) as p:
+        yield p
+```
+
+**Puntos clave**:
+- `Session` se parchea como clase, su `return_value` es `session_instance`
+- `session_instance.__enter__` retorna el mock principal (donde se llama `exec`, `add`, `commit`)
+- `mock_session.exec(select(...)).first()` se configura con `return_value` para el objeto DB esperado
+- Para múltiples queries, usar `side_effect` o resetear `side_effect = None` antes de asignar `return_value`
+
+### Patrón de 4 Helpers (Parte 2)
+Cada helper en `cycle.py` sigue la misma estructura:
+1. `with Session(engine) as session:` (abrir conexión)
+2. `session.exec(select(...)).first()` (obtener registro)
+3. Modificar campos (ej: `dept_db.draft_content = draft`)
+4. `session.add(dept_db)` (opcional si se modifica in-place)
+5. `session.commit()` (persistir inmediatamente)
+
+Los helpers son: `_persist_generation_started`, `_persist_draft_complete`, `_persist_evaluation_started`, `_persist_evaluation_complete`.
+
+### Dónde se usa
+- `data/pipelines/rfp_intake/cycle.py` — 4 helpers con Session(engine)
+- `data/pipelines/rfp_intake/graph.py` — Session(engine) para operaciones CRUD en nodos
+- `services/api/database.py` — `get_sql_engine()` que crea el engine compartido desde `DATABASE_URL`
 8. No cargar datos en useEffect en el backoffice: la carga inicial es server-side y evita la regla react-hooks/set-state-in-effect.
 9. **Arquitectura dual de BD**: TinyDB para usuarios/auth/proveedores, Supabase PostgreSQL para inventario. El modelo User NO existe en SQLModel.
 10. **Dos APIs separadas**: API principal (puerto 8000) para proveedores, auth, inventario. API de incidencias (puerto 8010) independiente.
@@ -717,7 +823,7 @@ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "phi"
 
 ### Stack técnico
 - **Python 3.14+**, gestionado con `uv` (pyproject.toml raíz).
-- **Dependencias**: `markitdown>=0.1.9` (PDF→Markdown primario), `PyPDF2>=3.0.1` (fallback), `py-readability-metrics>=1.4.5` (5 métricas de legibilidad), `nltk>=3.9.0` (syllable counting fallback), `openai>=1.70.0` (clasificador y workers), `langgraph>=0.3.0` (pipeline graph), `langchain-openai>=0.3.0`.
+- **Dependencias**: `markitdown[pdf]>=0.1.9` (PDF→Markdown con pdfminer para parsing semántico), `py-readability-metrics>=1.4.5` (5 métricas de legibilidad), `nltk>=3.9.0` (syllable counting fallback), `openai>=1.70.0` (clasificador y workers), `langgraph>=0.3.0` (pipeline graph), `langchain-openai>=0.3.0`.
 - **PostgreSQL/Supabase**: 3 tablas SQLModel — `rfp_tickets`, `rfp_metadata`, `rfp_department_sections`.
 - **Celery**: Tarea `process_rfp_pipeline` en `services/celery_app.py`, bound to `rfp.process_pipeline`, `autoretry_for=(Exception,)`.
 
@@ -727,7 +833,7 @@ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "phi"
 data/pipelines/rfp_intake/
 ├── __init__.py          # Paquete
 ├── models.py            # Enums (TicketStatus, DepartmentId, ProgramType), modelos (ReadabilityMetrics, RfpMetadata, etc.)
-├── converter.py         # PDF → Markdown (MarkItDown primario, PyPDF2 fallback)
+├── converter.py         # PDF → Markdown (MarkItDown con pdfminer, sin fallback PyPDF2)
 ├── readability.py       # 5 métricas de legibilidad (Flesch, Kincaid, Gunning Fog, Coleman-Liau, ARI)
 ├── classifier.py        # Two-stage: reglas pre-filter → OpenAI gpt-4o-mini (json response_format)
 ├── orchestrator.py      # Descompone documento en 3 secciones por departamento (regex patterns)
@@ -758,7 +864,7 @@ tests/pipelines/
 
 | Nodo | Función | Descripción |
 |---|---|---|
-| N1 | `convert_pdf_to_markdown(pdf_path)` | PDF → Markdown vía MarkItDown, fallback PyPDF2 |
+| N1 | `convert_pdf_to_markdown(pdf_path)` | PDF → Markdown vía MarkItDown con pdfminer |
 | N2 | `extract_metadata_and_readability(content)` | 5 métricas de legibilidad + metadatos del cliente |
 | N3 | `classify_document(content)` | Two-stage: reglas pre-filter + LLM gpt-4o-mini |
 | N4 | `orchestrate(content, metadata)` | Descompone en 3 secciones por departamento |

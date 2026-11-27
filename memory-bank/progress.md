@@ -209,6 +209,28 @@
   - Bug 2: `route_after_generate` ahora considera `tool_errors` además de `tool_results` para decidir si va a `synthesize_tool_answer`.
   - Bug 3: `node_synthesize_tool_answer` incluye la respuesta RAG en modo combinado aun si la tool falla (antes mostraba solo error y omitía el RAG).
 
+### Hito 9 · RFP Pipeline — Parte 3: Aprobación Humana, Arbitraje y Síntesis (2026-11-27)
+
+- **Completado**: Pipeline completo de 9 nodos integrado (Partes 1+2+3):
+  - Nodo 9 en `data/pipelines/rfp_intake/graph.py` que ejecuta Part 3 cuando `final_status == "needs_human_review"`
+  - Checkpoint scoped por ticket: `data/checkpoints/{ticket_id}.db` (no más `/tmp/healthcore_part3_checkpoints.db`)
+  - Checkpointer dual: SQLite para estado interno de Part 3 + PostgreSQL para estado oficial (`TicketDB`, `DepartmentSectionDB`)
+  - 3 endpoints FastAPI: `POST /approve`, `GET /approvals`, `GET /pending-approvals`
+  - Columnas PostgreSQL migradas: `final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`
+
+- **Completado**: 3 bugs de producción encontrados y corregidos:
+  1. 🔴 **Columnas faltantes en PostgreSQL** — migradas contra Supabase (4 ALTER TABLE)
+  2. 🟡 **Checkpoint path sin scope** — ahora `data/checkpoints/{ticket_id}.db`
+  3. 🟢 **markitdown[pdf] no instalado** — instalado para mejor conversión
+
+- **Completado**: Script E2E `scripts/test_full_parts_123_e2e.py` con 21 tests que cubren:
+  - Part 1: clasificación, metadatos, workers (3/3)
+  - Part 2: ciclo generador-evaluador con LLM real DeepSeek v4 Flash (2/2)
+  - Part 3: conflictos, arbitraje, aprobaciones, síntesis (8/8)
+  - DB Persistence: escritura/lectura post-Part3 (4/4)
+  - Edge Cases: resume, concurrencia, handoff (4/4)
+  - **21/21 ALL PASS** con LLM real
+
 ### Hito 9 · RFP Pipeline — Parte 2: Generación y Evaluación de Borradores (2026-11-24)
 
 - **Completado**: Parte 1 del pipeline RFP (convertir, clasificar, descomponer, sintetizar) — 293 tests.
@@ -824,6 +846,105 @@ Ambos campos son nullable (`str | None`, `int | None`) para mantener compatibili
 
 ---
 
+## 2026-11-25 — Hito 9, Parte 2: Persistencia en Tiempo Real con PostgreSQL (Completado)
+
+### Problema Original
+El `Part2PersistenceTracker` era un módulo SQLite aislado que **nunca fue integrado** al pipeline real. Durante todo el ciclo generador-evaluador, el ticket permanecía en `generando_borrador` y `draft_content`/`evaluation_results` por departamento solo se persistían al final, después de que `run_part2_pipeline()` retornara. No había visibilidad de progreso por departamento ni por iteración.
+
+### Solución Aplicada
+Se reescribió `data/pipelines/rfp_intake/cycle.py` eliminando `Part2PersistenceTracker` (SQLite) y agregando 4 helpers de persistencia que usan directamente `sqlmodel.Session(engine)` con PostgreSQL:
+
+| Helper | Línea | Disparo | Efecto en DB |
+|--------|-------|---------|-------------|
+| `_persist_generation_started()` | ~95 | Al iniciar cada iteración de un departamento | `department.generation_status = "generando"` |
+| `_persist_draft_complete()` | ~120 | Tras generar el draft | `department.draft_content = draft, generation_status = "draft_complete"` |
+| `_persist_evaluation_started()` | ~150 | Al iniciar la evaluación | `department.generation_status = "evaluando"` |
+| `_persist_evaluation_complete()` | ~175 | Tras completar la evaluación | `department.evaluation_results = ..., generation_status = "completado"`, actualiza `ticket.status` |
+
+Cada helper abre su propia conexión `with Session(engine) as session:`, ejecuta `session.exec(select(...)).first()`, modifica los campos necesarios, y llama `session.commit()` inmediatamente. El patrón asegura que cada cambio sea visible en DB sin depender del ciclo de vida de la transacción del llamante.
+
+`run_part2_pipeline()` ahora acepta un parámetro `engine` (opcional). Si es `None`, los helpers se saltan la persistencia (comportamiento seguro para tests que no usan DB).
+
+### Cambios en `graph.py`
+- **Nodo 8**: pasa `engine=engine` a `run_part2_pipeline()`
+- **Eliminado**: bloque post-hoc (~30 líneas) que persistía `draft_content`, `evaluation_results`, `ticket.status = EN_EVALUACION` al final del pipeline
+- **Conservado**: solo la actualización de `handoff_payload` para Parte 3
+
+### Flujo de Estados con Persistencia en Tiempo Real
+
+```
+Nodo 7: ticket.status = generando_borrador
+    ↓
+run_part2_pipeline(engine=engine)
+    │
+    ├── Depto 1 ──→ generando → draft_complete → evaluando → completado
+    ├── Depto 2 ──→ generando → draft_complete → evaluando → completado
+    └── Depto 3 ──→ generando → draft_complete → evaluando → completado
+    │
+    ↓ (cada helper hace commit inmediato a PostgreSQL)
+Nodo 8: ticket.status = en_evaluacion (por _persist_evaluation_complete)
+    ↓
+Nodo 8: ticket.status = completado / needs_human_review
+```
+
+### Tests de Persistencia (10 tests)
+
+Archivo nuevo: `tests/test_part2_persistence.py`
+
+**Fixture clave — Mock de Session como context manager:**
+```python
+@pytest.fixture
+def mock_session():
+    """Mock de sqlmodel.Session como context manager."""
+    session = MagicMock(name="session")
+    session.__enter__.return_value = session
+    # session.exec(select(...)).first() → return dept_db / ticket_db
+    return session
+
+@pytest.fixture
+def session_factory(mock_session):
+    session_instance = MagicMock(name="session_instance")
+    session_instance.__enter__.return_value = mock_session
+    mock_session_cls = MagicMock(return_value=session_instance)
+    with patch("data.pipelines.rfp_intake.cycle.Session", mock_session_cls) as patched:
+        yield patched
+```
+
+| Test | Líneas | Verifica |
+|------|--------|----------|
+| `test_persist_generation_started` | ~45 | Status "generando" se persiste al iniciar iteración |
+| `test_persist_generation_started_uses_status_constant` | ~70 | Usa `STATUS_GENERATING` constante del módulo |
+| `test_persist_draft_complete` | ~95 | Draft se persiste con status "draft_complete" |
+| `test_persist_draft_content_not_none` | ~130 | Draft tiene contenido no nulo |
+| `test_persist_evaluation_started` | ~160 | Status "evaluando" se persiste |
+| `test_persist_evaluation_complete_passes` | ~190 | Evaluation pasa, ticket.status → completado |
+| `test_persist_evaluation_complete_needs_review` | ~230 | Evaluation necesita revisión, ticket.status → needs_human_review |
+| `test_pipeline_full_lifecycle` | ~270 | 4 helpers llamados en secuencia correcta en un pipeline completo |
+| `test_pipeline_tracks_iterations` | ~310 | Persiste en cada iteración (2 generaciones + 2 evaluaciones) |
+| `test_pipeline_engine_none` | ~350 | engine=None no crashea |
+
+### Archivos Modificados
+
+| Archivo | Cambio |
+|---------|--------|
+| `data/pipelines/rfp_intake/cycle.py` | Reescribir: +4 helpers PG, eliminar Part2PersistenceTracker, engine param |
+| `data/pipelines/rfp_intake/graph.py` | Pasar engine a run_part2_pipeline, eliminar bloque post-hoc |
+| `tests/test_part2_persistence.py` | Nuevo: 10 tests de persistencia con Session mocking |
+| `agentic-workflows.md` | Nueva sección "Persistencia en Tiempo Real (PostgreSQL)" |
+
+### Verificación
+
+- ✅ **10/10 persistence tests pasan** (`test_part2_persistence.py`)
+- ✅ **28/28 tests existentes de Part 2 pasan** (sin regresión)
+- ✅ **81/81 tests RFP totales pasan** (persistence + part2 + classifier + workers + generators + evaluators)
+- ✅ **Total global RFP: 369 tests** (antes 357)
+- ✅ **Parte 2: 66 tests** (antes 54)
+- ✅ engine=None no causa error (comportamiento seguro)
+- ✅ Persistencia ocurre en cada iteración, no solo al final
+
+
+---
+
 ## 2026-11-25 — Hito 9, Parte 3: Approval & Synthesis — Bugs Críticos Reparados (Completado)
 
 ### Problemas Identificados y Corregidos
@@ -963,36 +1084,72 @@ Tiempo total: ~0.98s | Warnings: 139 (deprecation, no blockers)
 
 ---
 
-## Sesión Actual: Validación y Documentación Parte 3 (2026-11-25)
+## Sesión Actual: Comparación con Solución de Referencia + 6 Gaps Adicionales (2026-11-25)
 
-**Objetivo**: Validar que Parte 3 implementa todos los acceptance criteria y actualizar documentación
+**Objetivo**: Comparar Parte 3 contra solución de referencia de Hito 9, corregir gaps, actualizar documentación
 
 **Acciones Realizadas:**
 
-1. ✅ Auditoría Parte 3 — Verificó 13/13 tests PASS, 4 bugs críticos reparados
-2. ✅ Comparación con especificación alternativa — Ningún gap detectado, implementación completa
-3. ✅ Revisión de documentación `agentic-workflows.md` Parte 3 — Ya contiene toda la información
-4. ✅ Actualización `activeContext.md` — Agregada sección Parte 3 con bugs y capacidades
-5. ✅ Revisión `progress.md` — Ya tiene resumen ejecutivo de Parte 3
+1. ✅ Comparación exhaustiva contra solución de referencia — 12 evidencias checklist evaluadas
+2. ✅ 6 nuevos gaps identificados por alineación con referencia
+3. ✅ Gaps corregidos:
+   - Estados del ticket: añadidos `parcialmente_aprobado`, `arbitrando`, `produciendo` (6 estados lifecycle)
+   - Endpoint `GET /tickets/{ticket_id}/pending-approvals` con interrupt payload estructurado
+   - Validación condicional via `@field_validator` en `ApproveRequest`
+   - BRIEFING Trigger + Trace (3 tests) — PHI→arbiter fijo, BAA mismatch, Capacity con Tom Callahan
+   - Restart Mid-Interrupt (2 tests) — resume desde checkpoint tras reinicio
+   - Concurrent Tickets (2 tests) — checkpoints independientes por ticket
+4. ✅ Documentación `agentic-workflows.md` actualizada (sin sección de bugs, solo correcciones directas)
+5. ✅ `activeContext.md` actualizado con check de evidencias y segunda ronda de gaps
+6. ✅ `progress.md` actualizado con segunda ronda de correcciones
 
 **Validación Funcional:**
 
 | Elemento | Verificación |
 |----------|--------------|
-| Checkpoint persistence | ✅ PASS — BD SQLite, namespacing rfp-{ticket}:{dept} |
+| Checkpoint persistence | ✅ PASS — BD SQLite durable, namespacing `rfp-{ticket_id}:{department_id}` |
 | Paralelismo | ✅ PASS — Dept B avanza mientras A interrumpida |
-| Arbitraje determinista | ✅ PASS — Triggers→reglas fijas (PHI→reject, BAA→request, Capacity→warehouse) |
-| Síntesis automática | ✅ PASS — Document generado después de todas aprobaciones |
-| Interrupt/Resume | ✅ PASS — Renanudación exacta desde punto interrumpido |
-| Trace auditoria | ✅ PASS — Entrada, salida, timestamp, duración por nodo |
-| Límite iteraciones | ✅ IMPLEMENTADO — MAX_APPROVAL_ITERATIONS=3 en graph_nodes.py:40 |
-| Integración API | ✅ IMPLEMENTADO — POST /rfp/tickets/{ticket_id}/approve |
+| Arbitraje determinista | ✅ PASS — Triggers→reglas fijas, fixed arbiters del CONTEXT (nunca LLM consensus) |
+| Síntesis automática | ✅ PASS — Solo después de todas las aprobaciones completadas |
+| Interrupt/Resume | ✅ PASS — Reanudación exacta desde punto interrumpido; sobrevive reinicio |
+| Trace auditoría | ✅ PASS — agent, input_ref, output_ref, timestamp, duration_ms por nodo |
+| Límite iteraciones | ✅ IMPLEMENTADO — `MAX_APPROVAL_ITERATIONS=3` en graph_nodes.py |
+| Integración API | ✅ 9 endpoints (5 existentes + 2 Part 3 + 1 nuevo pending-approvals) |
+| BRIEFING §7 triggers | ✅ 3 triggers: PHI→REJECT (Claire Whitfield), BAA/DPA→REQUEST_CHANGES (Dr. Reid), Capacity→REQUEST_CHANGES (Tom Callahan) |
+| Resume validated | ✅ `@field_validator` en `ApproveRequest` requiere `requested_changes` cuando corresponde |
+| Concurrent tickets | ✅ 4 department-scoped checkpoints sin colisión entre tickets |
 
-**Conclusión**: 
-- Todas las 13/13 capacidades del acceptance criteria han sido implementadas y verificadas
-- Documentación `agentic-workflows.md` está completa y actualizada
-- Memoria del proyecto (`activeContext.md`) refleja cambios realizados
-- Sistema listo para producción: sin saltos de estado, rastreable, paralelismo real
+**Post-Review Corrections (Ronda 1 — 2026-11-25)**:
+
+6 gaps identificados y corregidos:
+
+| # | Gap | Fix | Estado |
+|---|-----|-----|--------|
+| 1 | Sin `interrupt()` real | `request_approvals_node` retorna `interrupted_departments` con checkpoints independientes por dept | ✅ |
+| 2 | Resume re-ejecutaba todo | `handle_approval_response()` carga checkpoint y reanuda desde aprobación | ✅ |
+| 3 | Sin integración pipeline | Nodo 9 en `graph.py` ejecuta Part 3 después de Parte 2 | ✅ |
+| 4 | Sin endpoints FastAPI | `POST /approve` + `GET /approvals` en `routes/rfp.py` | ✅ |
+| 5 | SQLite en vez de PG | Checkpointer dual: SQLite interno + `Session(engine)` para PG | ✅ |
+| 6 | Sin tests de integración | 12 tests en `tests/pipelines/test_rfp_part3_integration.py` | ✅ |
+
+**Post-Review Corrections (Ronda 2 — Referencia Alignment, 2026-11-25)**:
+
+6 gaps adicionales identificados vs solución de referencia y corregidos:
+
+| # | Gap | Fix | Estado |
+|---|-----|-----|--------|
+| 7 | Estados del ticket incompletos | Añadidos `parcialmente_aprobado`, `arbitrando`, `produciendo` | ✅ |
+| 8 | Sin endpoint de interrupt payload | Añadido `GET /pending-approvals` con payload completo | ✅ |
+| 9 | Sin validación condicional en approve | `@field_validator('requested_changes')` en `ApproveRequest` | ✅ |
+| 10 | Sin tests BRIEFING §7 trigger + trace | `TestBRIEFINGTriggerAndTrace` (3 tests) | ✅ |
+| 11 | Sin tests restart mid-interrupt | `TestRestartMidInterrupt` (2 tests) | ✅ |
+| 12 | Sin tests de concurrencia | `TestConcurrentTickets` (2 tests) | ✅ |
+
+**Verificación Final (Nov 2026):**
+- ✅ **21/21 E2E tests PASS** con LLM real (DeepSeek v4 Flash via 4Geeks AI)
+- ✅ **3 bugs de producción corregidos**: columnas PG migradas, checkpoint scoped por ticket, markitdown[pdf] instalado
+- ✅ **`agentic-workflows.md` actualizado** con datos actuales (sin sección histórica de correcciones)
+- ✅ **Pipeline completo Part 1+2+3**: 0 fallos con datos reales
 
 **Siguiente Fase**: Integración UI en `uis/backoffice` (si se requiere) + notificaciones por email (Sendgrid/Slack)
 

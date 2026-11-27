@@ -147,7 +147,18 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Consistencia de datos**: los valores derivados (denial rates, no-show costs) se calculan una sola vez por render (useMemo) y no cambian durante la vida de la página, incluso si hay re-renders parciales.
 - **Frescura de datos en dashboards**: el resumen de incidencias y la lista de productos pueden tener hasta 30-60 segundos de desfase (caché). Esto es aceptable para dashboards operativos donde la inmediatez no es crítica.
 
-12. **RAG Knowledge Base — HealthCore Knowledge Q&A (Nov 2026)**
+13. **RFP Pipeline — Partes 1, 2 y 3: Clasificación, Generación de Borradores y Aprobación Humana (Nov 2026)**
+- **Pipeline completo de 9 nodos LangGraph** que procesa solicitudes RFP (Request for Proposal) desde PDF hasta documento final aprobado:
+  - **Parte 1**: Conversión PDF→Markdown (con markitdown[pdf]), extracción de metadatos, clasificación, descomposición por departamento, workers por departamento y síntesis.
+  - **Parte 2**: Ciclo generador-evaluador de borradores por departamento con LLM real (DeepSeek v4 Flash via 4Geeks AI). Evaluadores async en paralelo (readability, relevance, compliance).
+  - **Parte 3**: Aprobación humana con checkpoints scoped por ticket, arbitraje (PHI, BAA/DPA, Capacity), síntesis final y generación de documento completo.
+- **Estados del ticket**: `nuevo → analizandose → analisis_completo → generando_borrador → en_evaluacion → needs_human_review → arbitrando → esperando_aprobacion / parcialmente_aprobado → produciendo → terminado`
+- **Persistencia dual**: SQLite para checkpoints de Part 3 (en `data/checkpoints/{ticket_id}.db`) + PostgreSQL (Supabase) para estado oficial (TicketDB, DepartmentSectionDB).
+- **3 endpoints Part 3**: `POST /approve`, `GET /approvals`, `GET /pending-approvals`
+- **Tests**: 21 tests E2E que cubren Part 1, 2, 3, persistencia y edge cases. **21/21 ALL PASS** con LLM real.
+- **Bugs corregidos en producción**: migración de columnas PG (`final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`), checkpoint scoped por ticket, markitdown[pdf] instalado.
+
+## Usuarios clave
 - **Sistema de preguntas y respuestas** basado en Retrieval-Augmented Generation (RAG) que permite al equipo de HealthCore consultar en lenguaje natural las políticas documentadas de la clínica.
 - **Documentos fuente**: 4 archivos Markdown en `docs/company-knowledge-base/` (cobertura de seguros, política de citas, proceso de referencias internas, checklist de pacientes nuevos), todos en español.
 - **Arquitectura**: chunking semántico por párrafos → embedding con `pplx-embed-v1-0.6b` → indexado en Qdrant (vector DB) → recuperación por similitud coseno → generación de respuesta con `deepseek-v4-flash`.

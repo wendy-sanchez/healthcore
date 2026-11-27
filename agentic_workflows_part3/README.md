@@ -268,5 +268,5 @@ check_approvals_complete (routing)
 
 - **Main Workflow**: `/workspaces/healthcore/agentic-workflows.md` (Parte 3 section)
 - **Context & Requirements**: `/workspaces/healthcore/CONTEXT.md` (Hito 9 section)
-- **Part 1 (Classification)**: `agentic_workflows.md` (Parte 1 section)
-- **Part 2 (Generation & Evaluation)**: `agentic_workflows.md` (Parte 2 section)
+- **Part 1 (Classification)**: `agentic-workflows.md` (Parte 1 section)
+- **Part 2 (Generation & Evaluation)**: `agentic-workflows.md` (Parte 2 section)

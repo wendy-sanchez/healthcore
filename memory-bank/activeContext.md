@@ -1,106 +1,128 @@
 # Active Context
 
-## Hotfixes Parte 2 — Hito 9 (2026-11-25)
+## Persistencia en Tiempo Real (PostgreSQL) — Parte 2 (2026-11-25)
 
-**Dos errores bloqueantes corregidos en la implementación de Parte 2 del flujo agéntico de RFP:**
+**Fix completo del bug de persistencia: la Parte 2 ahora persiste cada estado del ciclo generador-evaluador en PostgreSQL en tiempo real.**
 
-### Error 1: Estado del Ticket Inconsistente
-- **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 322-330, eliminadas)
-- **Problema**: Status cambiaba a `en_evaluación` ANTES de ejecutar `run_part2_pipeline()`
-- **Solución**: Eliminadas líneas 322-330. El estado ahora refleja correctamente: `GENERANDO_BORRADOR` → `{needs_human_review|analisis_completo}`
-- **Verificación**: 70/70 tests RFP pasando (27 Part 2 + 43 restantes)
+### Problema Original
+El `Part2PersistenceTracker` existía como módulo SQLite aislado pero **nunca fue integrado** al pipeline real. La persistencia solo ocurría de forma post-hoc al final de `run_part2_pipeline()`, dejando al ticket en `generando_borrador` durante todo el proceso.
 
-### Error 2: KeyAspect Serialización Incorrecta
-- **Archivo**: `data/pipelines/rfp_intake/cycle.py` (función `_extract_key_aspects`, línea 188)
-- **Problema**: Convertía `KeyAspect` con `str(a)` → texto puro en lugar de dict tipado
-- **Solución**: Cambio a `a.model_dump()` cuando el objeto lo soporta
-  ```python
-  # Cambio (línea 188)
-  return [a if isinstance(a, dict) else a.model_dump() if hasattr(a, "model_dump") else {"aspect": str(a)} for a in aspects]
-  ```
-- **Verificación**: Generadores/evaluadores reciben dicts estructurados correctamente
+### Solución: 4 Helpers de Persistencia PostgreSQL en `cycle.py`
 
-**Estado**: ✅ Completado — Ambos errores corregidos y verificados (70/70 tests pasando)
+Se reescribió `data/pipelines/rfp_intake/cycle.py` agregando 4 funciones helper que abren su propia conexión `with Session(engine) as session:` y hacen commit inmediato:
+
+| Helper | Disparo | Estado de DB |
+|--------|---------|-------------|
+| `_persist_generation_started()` | Al iniciar cada iteración de un departamento | `department.generation_status = "generando"` |
+| `_persist_draft_complete()` | Tras generar el draft | `department.draft_content = ..., generation_status = "draft_complete"` |
+| `_persist_evaluation_started()` | Al iniciar la evaluación | `department.generation_status = "evaluando"` |
+| `_persist_evaluation_complete()` | Tras completar la evaluación (pase o falle) | `department.evaluation_results = ..., generation_status = "completado"`, actualiza ticket.status |
+
+**Flujo de `generation_status` por departamento:**
+```
+null → generando → draft_complete → evaluando → completado
+```
+
+**Flujo de `ticket.status`:**
+```
+analisis_completo → generando_borrador → en_evaluacion → completado / needs_human_review
+```
+
+### Cambios en `graph.py`
+- **Nodo 8**: ahora pasa `engine=engine` a `run_part2_pipeline()`
+- **Eliminado**: bloque post-hoc (~30 líneas) que persistía al final del pipeline
+- **Conservado**: solo el `handoff_payload` final para Parte 3
+
+### Tests de Persistencia (10 nuevos)
+
+Archivo: `tests/test_part2_persistence.py`
+
+| Test | Verifica |
+|------|----------|
+| `test_persist_generation_started` | Status "generando" se persiste al iniciar iteración |
+| `test_persist_generation_started_uses_status_constant` | Usa `STATUS_GENERATING` constante |
+| `test_persist_draft_complete` | Draft se persiste con status "draft_complete" |
+| `test_persist_draft_content_not_none` | Draft tiene contenido no nulo |
+| `test_persist_evaluation_started` | Status "evaluando" se persiste |
+| `test_persist_evaluation_complete_passes` | Evaluation pasa, ticket.status se actualiza |
+| `test_persist_evaluation_complete_needs_review` | Evaluation necesita revisión |
+| `test_pipeline_full_lifecycle` | 4 helpers llamados en secuencia completa |
+| `test_pipeline_tracks_iterations` | Persiste en cada iteración |
+| `test_pipeline_engine_none` | engine=None no crashea |
+
+### Resultados
+- ✅ **81/81 tests RFP pasando** (10 persistence + 28 Part 2 + 43 classifier/workers/generators/evaluators)
+- ✅ **Total global RFP: 369 tests** (antes 357)
+- ✅ **Parte 2: 66 tests** (antes 54: 27 generators + 19 evaluators + 8 nuevos en previous + 10 persistence + falta de part2)
+
+---
+
+## Hito 9 · RFP Pipeline — Parte 3: Approval & Synthesis (Integración Completa)
+
+**Estado: ✅ INTEGRACIÓN COMPLETADA — 21/21 E2E Tests PASS (LLM real, PostgreSQL, checkpoint scoped)**
+
+### Correcciones de Producción (3 bugs identificados y corregidos en Nov 2026)
+
+| # | Bug | Severidad | Fix |
+|---|-----|-----------|-----|
+| 1 | Columnas faltantes en PostgreSQL (`final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`) | 🔴 CRITICAL | Migración SQL ejecutada contra Supabase: 4 ALTER TABLE |
+| 2 | `create_part3_pipeline()` sin `checkpoint_db_path` — todos los workers compartían `/tmp/healthcore_part3_checkpoints.db` | 🟡 MEDIUM | Ahora usa `data/checkpoints/{ticket_id}.db` scoped por ticket, creado automáticamente |
+| 3 | `markitdown[pdf]` no instalado — PDF conversion usaba PyPDF2 fallback | 🟢 LOW | `uv pip install 'markitdown[pdf]'` ejecutado |
+
+### Arquitectura Final
+
+**Pipeline de 9 nodos (graph.py):**
+1. Convert PDF → 2. Extract Metadata → 3. Classify → 4. Orchestrate → 5. Worker Loop → 6. Synthesize → 7. Part 2 (cycle) → 8. Final DB Commit → **9. Part 3 (conflict/arbitrage/approval/synthesis)**
+
+**Flujo de estados del ticket (6 estados Part 3):**
+```
+analizando → clasificado → generando_borrador → en_evaluacion → 
+analisis_completo → needs_human_review → arbitrando → esperando_aprobacion → 
+parcialmente_aprobado → needs_revision → produciendo → terminado
+```
+
+**Módulos de Parte 3:**
+- `agentic_workflows_part3/models_part3.py` — Pydantic models (~260 lines) con 7 estados lifecycle + traceability ✅
+- `agentic_workflows_part3/checkpointer.py` — SQLite checkpointer durable con namespacing `rfp-{ticket}:{dept}` (~189 lines) ✅
+- `agentic_workflows_part3/graph_nodes.py` — 5 nodos LangGraph: detect_conflicts, arbitrage, request_approvals, check_approvals_complete (routing), synthesize_document (~390 lines) ✅
+- `agentic_workflows_part3/graph.py` — Pipeline compilado + resume entrypoint + handle_approval_response (~260 lines) ✅
+- `agentic_workflows_part3/approval.py` — Payload validation (~70 lines) ✅
+- `agentic_workflows_part3/arbitration.py` — Reglas de arbitraje deterministas con fixed arbiters del CONTEXT (~90 lines) ✅
+
+**Endpoints FastAPI (9 totales):**
+- `POST /api/rfp/upload` — Subir PDF (existente)
+- `GET /api/rfp/tickets` — Listar tickets (existente)
+- `GET /api/rfp/tickets/{id}` — Detalle ticket (existente)
+- `POST /api/rfp/tickets/{id}/reprocess` — Reprocesar (existente)
+- `POST /api/rfp/tickets/{ticket_id}/approve` — Registrar aprobación/rechazo departamento (con validación condicional)
+- `GET /api/rfp/tickets/{ticket_id}/approvals` — Historial de aprobaciones
+- **`GET /api/rfp/tickets/{ticket_id}/pending-approvals`** — Payload estructurado de interrupt para UI
+
+**Tests:**
+- 13 unit/integration en `agentic_workflows_part3/test_part3.py` ✅
+- 19 integration en `tests/pipelines/test_rfp_part3_integration.py` ✅ (incluye BRIEFING trigger + trace, restart mid-interrupt, concurrent tickets)
+- **Suite completa: estado actual — E2E 21/21 PASS con LLM real**
+
+### Evidence Checklist (Alineación con Referencia) — ✅ Todo Completado
+- ✅ Scoped interrupt per department + durable checkpointer (SQLite, namespaced `rfp-{ticket_id}:{department_id}`)
+- ✅ Resume entrypoint con validated human decisions (`field_validator` en `ApproveRequest`)
+- ✅ Test/trace: approve B while A still interrupted
+- ✅ `thread_id` namespaced by ticket (and dept)
+- ✅ Arbitration on BRIEFING triggers + fixed arbiter + iteration limit (`MAX_APPROVAL_ITERATIONS=3`)
+- ✅ Per-node trace with agent/input/output/timestamp/duration
+- ✅ Final document only after all approvals
+- ✅ Ticket `done` + accessible artifact (`final_document_path`)
+- ✅ Reproducible E2E/fixture with simulated approvals (`e2e_script.py`)
+- ✅ Tests: interrupt/resume, iteration limit, arbitration, parallel-under-interrupt, BRIEFING trigger + trace, restart mid-interrupt, concurrent tickets
+- ✅ Approvers del CONTEXT (Tom Callahan/revenue, Dr. Marcus Reid/clinical, Claire Whitfield/compliance)
+- ✅ BRIEFING §7 arbitration triggers (PHI, BAA/DPA, Capacity) con fixed arbiters
+- ✅ **3 bugs de producción corregidos**: migración PG, checkpoint scoped, markitdown[pdf]
+- ✅ **21/21 E2E tests pasando** con LLM real (DeepSeek v4 Flash via 4Geeks AI)
+- ✅ **markitdown[pdf] instalado**: conversión PDF mejorada
 
 ---
 
-## Hito 9 · RFP Pipeline — Parte 3: Approval & Synthesis
-
-**Estado: ✅ COMPLETADO — 13/13 Tests PASS, 4 Bugs Críticos Reparados**
-
-### Bugs Críticos Reparados
-
-1. **Checkpoint Persistence Mismatch**
-   - **Archivo**: `data/pipelines/rfp_intake/graph.py` (línea 90-95)
-   - **Problema**: Checkpoints no se guardaban cuando `request_approvals_node` se ejecutaba
-   - **Causa**: Falta de inyección de dependencia del checkpointer
-   - **Solución**: Wrapper closure que captura `self.checkpointer` e inyecta en el nodo
-   - **Resultado**: Checkpoints persisten automáticamente con namespacing `rfp-{ticket}:{dept}`
-
-2. **Resume/Continuation Flow Incompleto**
-   - **Archivo**: `data/pipelines/rfp_intake/graph.py` (líneas 161-169)
-   - **Problema**: `synthesize_document` nunca se ejecutaba después de todas las aprobaciones
-   - **Causa**: En modo manual, el pipeline no ejecutaba el routing de `check_approvals_complete`
-   - **Solución**: Lógica de routing manual agregada a `run_part3_pipeline()`
-   - **Resultado**: Document synthesis se ejecuta automáticamente cuando todos aprueban
-
-3. **Approval State Persistence en Checkpoint**
-   - **Archivo**: `data/pipelines/rfp_intake/graph_nodes.py` (línea 400)
-   - **Problema**: Las aprobaciones no se guardaban en el checkpoint antes de reanudar
-   - **Causa**: Falta de `checkpointer.put()` explícito después de registrar aprobación
-   - **Solución**: Agregado `self.checkpointer.put(ticket_id, state.model_dump(), department_id)` en `handle_approval_response()`
-   - **Resultado**: Aprobaciones persisten y se recuperan correctamente
-
-4. **Pydantic v2 Deprecation**
-   - **Archivo**: `data/pipelines/rfp_intake/graph_nodes.py` (línea 306)
-   - **Problema**: Warnings por uso de `.dict()` en lugar de `.model_dump()`
-   - **Solución**: Cambio global a `.model_dump()`
-   - **Resultado**: Limpieza de warnings de deprecation
-
-### Paralelismo Real (Implementado y Testeado)
-
-**Test: `test_part3_parallel_department_approvals` ✅ PASS**
-- Dept A interrumpida → Dept B aprueba → Dept C aprueba
-- Verificado: Ningún departamento bloquea a otro
-- Cada uno tiene checkpoint independiente: `rfp-ticket:revenue`, `rfp-ticket:clinical`, `rfp-ticket:compliance`
-- Resultado: Aprobaciones en paralelo funcionan perfectamente
-
-**Test: `test_part3_all_approvals_then_synthesis` ✅ PASS**
-- Después de todas las aprobaciones → `final_document` se genera automáticamente
-- Verificado: Síntesis ejecutada correctamente
-
-### Arquitectura Implementada
-
-**Nodos:**
-- `detect_conflicts_node` — Triggers estructurados (PHI, BAA/DPA, Capacity)
-- `arbitrage_node` — Arbitraje determinista (reglas fijas, árboles del CONTEXT)
-- `request_approvals_node` — Interrupción por dept con checkpoint persistence
-- `check_approvals_complete` — Routing condition
-- `synthesize_document_node` — Documento final automático
-
-**Nuevos Módulos:**
-- `approval.py` (~70 líneas) — InterruptPayload, ResumePayload, ApprovalDecision
-- `arbitration.py` (~90 líneas) — Mapping determinista de triggers → reglas fijas
-
-**Enums Expandidos:**
-- `TicketStatusPart3`: WAITING_FOR_APPROVAL, PARTIALLY_APPROVED, NEEDS_REVISION, ARBITRATING, PRODUCING
-
-### Capacidades Verificadas
-
-| Criterio | Test | Resultado |
-|----------|------|-----------|
-| Checkpoint persist/retrieve | test_checkpointer_put_get | ✅ PASS |
-| Namespacing rfp-{ticket}:{dept} | test_checkpointer_namespacing | ✅ PASS |
-| Paralelismo | test_part3_parallel_department_approvals | ✅ PASS |
-| Arbitraje determinista | test_arbitrage_phi_rejection, test_arbitrage_baa_mismatch | ✅ PASS |
-| Síntesis automática | test_part3_all_approvals_then_synthesis | ✅ PASS |
-
-### Integración
-
-- Endpoint API: `POST /rfp/tickets/{ticket_id}/approve`
-- Tests: `agentic_workflows_part3/test_part3.py` → 13/13 ✅ PASS
-
----
+## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 
 ## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 

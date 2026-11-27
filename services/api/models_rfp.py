@@ -26,7 +26,9 @@ class TicketDB(SQLModel, table=True):
     """Ticket de recepción RFP — ciclo de vida completo (Partes 1-3).
 
     Un ticket se crea cuando se sube un PDF. Atraviesa los estados:
-    analizando → descartado | analisis_completo → ... (Parte 2+)
+    analizando → descartado | analisis_completo → generando_borrador
+    → en_evaluacion → needs_human_review → esperando_aprobacion |
+      parcialmente_aprobado | arbitrando | produciendo | terminado
     """
     __tablename__: str = "rfp_tickets"
 
@@ -36,7 +38,7 @@ class TicketDB(SQLModel, table=True):
     rfp_id: str | None = Field(default=None, max_length=64)
     """Identificador opcional de la RFP (ej. número de referencia)."""
     status: str = Field(default="analizando", max_length=32, nullable=False)
-    """Estado actual: analizando, descartado, analisis_completo, error."""
+    """Estado actual: analizando, descartado, analisis_completo, generando_borrador, en_evaluacion, needs_human_review, esperando_aprobacion, parcialmente_aprobado, arbitrando, produciendo, terminado, error."""
     raw_pdf_path: str | None = Field(default=None, max_length=512)
     """Ruta absoluta al PDF original en data/raw/{ticket_id}/original.pdf."""
     classification_reason: str | None = Field(default=None, max_length=500)
@@ -47,7 +49,11 @@ class TicketDB(SQLModel, table=True):
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )
-    """Payload de handoff hacia la Parte 2."""
+    """Payload de handoff hacia la Parte 2/3."""
+    final_document_path: str | None = Field(default=None, max_length=512)
+    """Ruta al documento final generado (Parte 3)."""
+    part3_completed_at: datetime | None = Field(default=None)
+    """Timestamp de cuando la Parte 3 completó la síntesis."""
     error_detail: str | None = Field(default=None, max_length=500)
     """Detalle del error si el pipeline falló."""
     created_at: datetime = Field(default_factory=_utc_now, nullable=False)

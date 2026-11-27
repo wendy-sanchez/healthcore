@@ -59,7 +59,26 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Supplier para la respuesta, con los campos que genera el sistema (id, updated_at, archived_at).
 - Los campos generados por el sistema se ignoran si el cliente los envía.
 
-### 10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
+### ### 9) Persistencia Inmediata (Session-Query-Commit)
+
+En la pipeline RFP Parte 2, cada operación de persistencia sigue el patrón:
+
+```python
+with Session(engine) as session:
+    obj = session.exec(select(Model).where(...)).first()
+    if obj:
+        obj.field = value
+        session.commit()
+```
+
+**Características**:
+- Cada helper abre su propia conexión (`with Session(engine)`)
+- Cada helper hace commit inmediato (`session.commit()`)
+- No hay transacciones largas ni dependencia del ciclo de vida del llamante
+- 4 helpers en `cycle.py`: `_persist_generation_started`, `_persist_draft_complete`, `_persist_evaluation_started`, `_persist_evaluation_complete`
+- El engine se recibe como parámetro (opcional — `None` salta persistencia)
+
+10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
 
 **Ubicación**: `services/agent/guardrails/`, `services/agent/graph.py`, `data/pipelines/rag.py`
 
