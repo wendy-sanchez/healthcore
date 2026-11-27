@@ -103,8 +103,8 @@ El producto en este repositorio tiene las siguientes superficies:
 - Equipo de recepción y experiencia del paciente.
 - Equipo de People/HR para seguimiento de candidaturas.
 - Diane Foster (VP of People): gestión del gasto y contratos con proveedores.
-- Claire Whitfield (Chief Compliance Officer): verificación de acuerdos BAA/DPA y auditoría de cambios de coste, más auditoría de incidencias de datos de pacientes.
-- James Osei (CTO): prioriza la API de inventario como base del panel de operaciones clínicas.
+- Claire Whitfield (Chief Compliance Officer): verificación de acuerdos BAA/DPA y auditoría de cambios de coste, más auditoría de incidencias de datos de pacientes. También responsable de compliance IA y revisión de prompt injection tests según NIST AI RMF.
+- James Osei (CTO): prioriza la API de inventario como base del panel de operaciones clínicas. También CISO interino para el AI Systems Inventory NIST.
 - Dra. Okonkwo (Dirección Ejecutiva): necesita visibilidad del stock en toda la red clínica.
 - Personal clínico y administrativo de las 12 clínicas: registran consumos y recepciones de suministros.
 - Stakeholders operativos y ejecutivos que necesitan datos consistentes.

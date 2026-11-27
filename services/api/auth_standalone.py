@@ -39,7 +39,7 @@ _PROFILES_TABLE = "profiles"
 # Cargar .env desde services/api/
 load_dotenv(_PROJECT_ROOT / "services" / "api" / ".env")
 
-JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "change-me-generate-a-random-secret")
+JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "")
 JWT_ALGORITHM: str = "HS256"
 TOKEN_EXPIRE_SECONDS: int = 86400  # 24 horas
 

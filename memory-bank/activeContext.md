@@ -1,32 +1,38 @@
 # Active Context
 
-## OWASP Top 10 Security Audit & Server Hardening (2026-11-27)
+## NIST AI Security Framework Audit — Prácticas Seguras en IA (2026-11-27)
 
-**Estado: ✅ COMPLETADO — Auditoría OWASP Top 10 completa, 4 vulnerabilidades críticas corregidas, servidor endurecido, 477 tests pass (0 fallos)**
+**Estado: ✅ COMPLETADO — NIST AI RMF + CSF 2.0, 6 funciones auditadas, 15 correcciones totales, 477 tests pass (0 fallos)**
 
 ### Resumen
 
-Se realizó una auditoría completa de seguridad basada en OWASP Top 10 sobre los 3 lanes del sistema (backend FastAPI, frontend Next.js, sistema agéntico LangGraph). Se identificaron 4 vulnerabilidades críticas, todas corregidas con evidencia reproducible. Endurecimiento del servidor aplicado: SSH root deshabilitado, firewall iptables, usuario dedicado, permisos restringidos.
+Se realizó una auditoría completa basada en el NIST AI Risk Management Framework (AI RMF 1.0) y NIST Cybersecurity Framework (CSF 2.0) sobre todos los sistemas de IA de HealthCore. La auditoría cubre las 6 funciones NIST (Govern, Identify, Protect, Detect, Respond, Recover), el inventario completo de 7 sistemas de IA, y el mapeo regulatorio HIPAA (EE. UU.) vs UK GDPR (Reino Unido).
+
+**Nuevas protecciones implementadas en este ciclo:**
+1. Rate limiting en `POST /auth/login` — 10 intentos por IP cada 60 segundos (in-memory)
+2. Rate limiting en `POST /agent/query` — 30 queries por usuario cada 60 segundos (in-memory)
+3. Documentación completa de prompt injection test cases (4 casos: jailbreak, indirect via RAG, PHI, extraction graduale)
+4. `_get_table_or_log()` — helper fail-open para rate limiter TinyDB
 
 ### Documentos Generados
 
 | Documento | Contenido |
 |-----------|-----------|
-| [`secure-ai-applications.md`](../secure-ai-applications.md) | Reporte OWASP Top 10 — 10 categorías × 3 lanes, hallazgos, correcciones, evidencia |
-| [`docs/security/server-hardening.md`](../docs/security/server-hardening.md) | Documento de endurecimiento del servidor con comandos de verificación |
+| [`nist-security-practices.md`](../nist-security-practices.md) | NIST AI RMF completo — 6 funciones, inventario de 7 sistemas de IA, plan de mejora priorizado, casos de prompt injection, verificación PHI en logs |
+| [`secure-ai-applications.md`](../secure-ai-applications.md) | Reporte OWASP Top 10 — 10 categorías × 3 lanes (completado previamente) |
+| [`docs/security/server-hardening.md`](../docs/security/server-hardening.md) | Documento de endurecimiento del servidor |
 | [`tests/security/`](../tests/security/) | 5 archivos de test: CORS, agent auth, env perms, Redis, JWT (9 tests) |
 
-### Vulnerabilidades Críticas Corregidas
+### Correcciones Realizadas en este Ciclo
 
-| # | OWASP | Vulnerabilidad | Antes | Después |
-|---|-------|---------------|-------|---------|
-| 1 | A01/A07 | Agent endpoints sin auth | `POST /agent/query`, `GET /agent/trace`, `GET /agent/traces` sin protección | `Depends(get_current_user)` en los 3 endpoints |
-| 2 | A02 | JWT hardcodeado | `"dev-secret-key-change-in-production"` en `chat_ws.py` | `os.getenv("JWT_SECRET_KEY")` — None si no está |
-| 3 | A02 | `.env` world-readable | Permisos 666 | Permisos 600 |
-| 4 | A05 | CORS `*` | `allow_origins=["*"]` con `allow_credentials=True` | Whitelist: localhost:3000/3001/8000 + healthcore.app |
-| 5 | A05 | Redis expuesto | `0.0.0.0:6379` sin auth | `ports: !reset []` + `docker stop` |
+| # | Corrección | Función NIST | Archivos modificados |
+|---|-----------|-------------|---------------------|
+| 1 | Rate limiting en login (10 intentos/60s por IP) | Protect/Detect | `services/api/rate_limiter.py`, `services/api/routes/auth.py` |
+| 2 | Rate limiting en agente (30 queries/min por usuario) | Protect/Detect | `services/api/rate_limiter.py`, `services/agent/routes.py` |
+| 3 | Refactor rate_limiter con helper `_get_table_or_log()` fail-open | Protect | `services/api/rate_limiter.py` |
+| 4 | Signal `inventory_telemetry.signal()` movido a import global en rate_limiter | Detect | `services/api/rate_limiter.py` |
 
-### Endurecimiento del Servidor
+### Endurecimiento del Servidor (del ciclo OWASP)
 
 | Medida | Estado |
 |--------|--------|
@@ -36,13 +42,18 @@ Se realizó una auditoría completa de seguridad basada en OWASP Top 10 sobre lo
 | SSH rate limiting: 6 conexiones/60s | ✅ Activo |
 | Project root permisos 750 (era 777) | ✅ Aplicado |
 | Redis no expuesto (contenedor detenido) | ✅ Verificado |
+| CORS whitelist (4 orígenes) | ✅ Verificado |
+| JWT sin fallback hardcodeado | ✅ Verificado |
+| `.env` permisos 600 | ✅ Verificado |
+| Agent endpoints con JWT auth | ✅ Verificado |
 
 ### Tests
 
 | Suite | Resultado |
 |-------|-----------|
-| Tests de seguridad (9 nuevos) | ✅ 9/9 pass |
+| Tests de seguridad (9 existentes) | ✅ 9/9 pass |
 | Suite completa (477 tests) | ✅ 477 pass, 0 fail, 7 skipped |
+| Sin regresiones tras cambios de rate limiting | ✅ Verificado |
 
 ---
 

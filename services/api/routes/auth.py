@@ -36,7 +36,22 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=Token)
-def login(payload: LoginRequest) -> Token:
+def login(payload: LoginRequest, request: Request) -> Token:
+    ip_address = request.client.host if request.client else "unknown"
+
+    # Rate limiting por IP: 10 intentos por IP cada 60 segundos
+    if not rate_limiter.check_login_ip_rate_limit(ip_address):
+        signal("auth_login_failed", {
+            "application": "backoffice",
+            "request_outcome": "rate_limited",
+            "reason": "ip_rate_limit",
+            "ip": ip_address,
+        })
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiados intentos de inicio de sesión. Intenta de nuevo más tarde.",
+        )
+
     user = user_service.get_user_by_email(payload.email)
     if user is None or not user.is_active or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(
