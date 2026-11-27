@@ -2,6 +2,32 @@
 
 ## Estado actual del desarrollo
 
+### Notificaciones SSE en Tiempo Real — RFP Dashboard (2026-11-27)
+
+**✅ COMPLETADO — Sistema de notificaciones en tiempo real para tickets RFP vía Server-Sent Events**
+
+**Arquitectura**: SSEManager singleton con colas `asyncio.Queue` por suscriptor, buffer circular (50 eventos), broadcast O(n) bajo `asyncio.Lock`.
+
+**Componentes backend**:
+- `services/api/sse/manager.py` — `SSEManager` con subscribe/publish/buffer circular/keep-alive 30s. `subscribe()` acepta `request` opcional para `is_disconnected()`.
+- `services/api/sse/__init__.py` — Paquete SSE, exporta `SSEManager` y `get_sse_manager`.
+- `services/api/routes/rfp.py` — 3 endpoints: `GET /rfp/events` (SSE stream JWT-protegido con Last-Event-ID), `POST /rfp/kpi-alert` (KPI threshold alerts), `POST /rfp/upload` modificado (publica `rfp_ticket_created`).
+- Replay: buffer circular + `Last-Event-ID` header + refetch reconciliación.
+
+**Componentes frontend**:
+- `uis/backoffice/lib/sseClient.ts` — Cliente SSE con `fetch()` + `ReadableStream` (no `EventSource`). Backoff exponencial (1s→2s→...→30s), dedup via `Set<eventId>`, `Last-Event-ID` en reconexión, callbacks `onEvent`/`onReconnected`/`onStatusChange`, detención en 401.
+- `uis/backoffice/app/rfp/page.tsx` — Dashboard reemplaza polling por SSE. Banners de notificación (máx 5, auto-dismiss 10s) con ícono N, nombre cliente, estado, timestamp, indicador SSE (verde "Tiempo real activo" / rojo "Reconectando...").
+
+**Tests**: 16/16 tests SSE + 35/35 tests RFP existentes = **51 tests PASS** sin regresiones.
+- `TestSSEManager` (7): publish broadcast, IDs, buffer replay, subscriber count, unsubscribe
+- `TestSseWireFormat` (3): formatos rfp_ticket_created, kpi_threshold_alert, keepalive
+- `TestSseEndpoint` (4): auth, streaming, kpi alert, kpi auth
+- `TestSseManagerSingleton` (2): singleton state preservation
+
+**Auditoría**: ✅ 6/6 criterios de aceptación cumplidos — SSEManager, endpoint SSE, publicación upload, frontend SSE, dashboard refactorizado, KPI alerts.
+
+**Decisiones técnicas**: SSE raw sin sse-starlette; fetch+ReadableStream en frontend por headers JWT; is_disconnected() para limpieza temprana de conexiones caídas; singleton seguro con asyncio.Lock.
+
 ### Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora (2026-11/12)
 
 - **Completado**: Paquete `services/agent/memory/` con 5 módulos:
