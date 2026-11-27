@@ -1,10 +1,16 @@
 """Rutas HTTP para el pipeline RFP Intake.
 
-Endpoints:
-  POST /api/rfp/upload    — Sube un PDF, crea ticket, encola pipeline async
-  GET  /api/rfp/tickets   — Lista todos los tickets
+Endpoints existentes:
+  POST /api/rfp/upload              — Sube un PDF, crea ticket, encola pipeline async
+  GET  /api/rfp/tickets             — Lista todos los tickets
   GET  /api/rfp/tickets/{ticket_id} — Detalle de un ticket
   POST /api/rfp/tickets/{ticket_id}/reprocess — Reintenta un ticket fallido/descartado
+  POST /api/rfp/tickets/{ticket_id}/approve   — Aprueba/rechaza un departamento (Parte 3)
+  GET  /api/rfp/tickets/{ticket_id}/approvals — Historial de aprobaciones
+
+Endpoints SSE (tiempo real):
+  GET  /api/rfp/events              — Stream SSE: notificaciones en vivo (JWT required)
+  POST /api/rfp/kpi-alert           — Publica alerta de umbral KPI via SSE (JWT required)
 """
 
 from __future__ import annotations
@@ -14,12 +20,16 @@ import logging
 from datetime import datetime
 import uuid
 from pathlib import Path
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from services.api.database import get_db
 from services.api.models_rfp import DepartmentSectionDB, RfpMetadataDB, TicketDB
+from services.api.security import get_current_user
+from services.api.sse.manager import get_sse_manager
 from sqlmodel import Session, select
 
 logger = logging.getLogger(__name__)
@@ -144,7 +154,121 @@ async def upload_rfp(
         logger.warning("No se pudo encolar tarea Celery: %s. El ticket queda pendiente.", e)
         # No bloqueamos — el ticket existe y se puede reprocesar manualmente
 
+    # Publicar evento SSE para notificar en tiempo real al dashboard
+    try:
+        sse_manager = get_sse_manager()
+        await sse_manager.publish(
+            event="rfp_ticket_created",
+            data={
+                "ticket_id": ticket_id,
+                "rfp_id": f"rfp_{ticket_id.split('-')[0][:6]}",
+                "client_name": None,
+                "client_country": None,
+                "program_type": None,
+                "status": "analizando",
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        )
+    except Exception as e:
+        logger.warning("No se pudo publicar evento SSE para ticket %s: %s", ticket_id, e)
+
     return UploadResponse(ticket_id=ticket_id)
+
+
+# ── SSE Endpoint ─────────────────────────────────────────────────────
+
+
+async def _sse_event_stream(request: Request) -> AsyncGenerator[str, None]:
+    """
+    Generador asíncrono para StreamingResponse SSE.
+
+    Suscribe al SSEManager, maneja Last-Event-ID para replay,
+    detecta desconexión del cliente vía request.is_disconnected(),
+    y mantiene la conexión abierta con keep-alive.
+    """
+    sse_manager = get_sse_manager()
+
+    # Replay: si el cliente envía Last-Event-ID, reenviar eventos perdidos
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        events = sse_manager.get_history(since_event_id=last_event_id)
+        for ev in events:
+            if await request.is_disconnected():
+                logger.debug("Cliente desconectado durante replay SSE — abortando")
+                return
+            payload = json.dumps(ev.data, ensure_ascii=False, default=str)
+            yield f"id: {ev.event_id}\nevent: {ev.event_name}\ndata: {payload}\n\n"
+
+    # Stream en vivo (pasa request para detección temprana de desconexión)
+    async for message in sse_manager.subscribe(request=request):
+        yield message
+
+
+@router.get("/events")
+async def rfp_events(
+    request: Request,
+    _user=Depends(get_current_user),
+) -> StreamingResponse:
+    """
+    SSE (Server-Sent Events) endpoint para notificaciones en tiempo real.
+
+    Emite eventos cuando:
+      - Un nuevo ticket RFP es creado (event: rfp_ticket_created)
+      - Un KPI cruza un umbral crítico (event: kpi_threshold_alert)
+
+    Requiere JWT (Authorization: Bearer <token>).
+    No usa EventSource del lado cliente; usa fetch + ReadableStream
+    para poder enviar el header Authorization.
+
+    Ver: real-time-communication.md para detalles de diseño.
+    """
+    return StreamingResponse(
+        _sse_event_stream(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── KPI Alert Endpoint ────────────────────────────────────────────────
+
+
+class KpiAlertPayload(BaseModel):
+    """Payload para publicar una alerta de umbral de KPI."""
+    location_id: str
+    location_name: str
+    kpi_type: str = Field(..., description="Tipo de KPI (no_show_rate, denial_rate, etc.)")
+    kpi_value: float
+    threshold: float
+    unit: str = "%"
+    detected_at: str | None = None
+
+
+@router.post("/kpi-alert", status_code=status.HTTP_202_ACCEPTED)
+async def rfp_kpi_alert(
+    body: KpiAlertPayload,
+    _user=Depends(get_current_user),
+) -> dict:
+    """
+    Publica una alerta de umbral de KPI via SSE.
+
+    Este endpoint es llamado por el pipeline de reporting cuando
+    detecta condiciones críticas (no-show rate > 25%, denial rate > 10%).
+    Reutiliza el mismo canal SSE que los eventos de tickets RFP.
+    """
+    sse_manager = get_sse_manager()
+    await sse_manager.publish(
+        event="kpi_threshold_alert",
+        data=body.model_dump(exclude_none=True),
+    )
+    logger.info(
+        "Alerta KPI publicada: %s=%.1f%% (umbral %.1f%%) en %s",
+        body.kpi_type, body.kpi_value, body.threshold, body.location_id,
+    )
+    return {"status": "published", "event": "kpi_threshold_alert"}
 
 
 @router.get("/tickets", response_model=TicketsListResponse)

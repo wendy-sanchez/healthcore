@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { jsonRequest, request } from "@/lib/httpClient";
+import { request } from "@/lib/httpClient";
+import { SseClient } from "@/lib/sseClient";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -19,17 +20,39 @@ interface ApiResponse {
   tickets: TicketListItem[];
 }
 
+interface SseNotification {
+  ticket_id: string;
+  rfp_id?: string;
+  client_name?: string | null;
+  client_country?: string | null;
+  program_type?: string | null;
+  status?: string;
+  created_at?: string;
+}
+
 const STATUS_LABELS: Record<string, string> = {
   analizando: "Analizando",
-  descartado: "Descartado",
   analisis_completo: "Análisis completo",
+  generando_borrador: "Generando borrador",
+  en_evaluacion: "En evaluación",
+  esperando_aprobacion: "Esperando aprobación",
+  parcialmente_aprobado: "Parcialmente aprobado",
+  produciendo: "Produciendo",
+  terminado: "Terminado",
+  descartado: "Descartado",
   error: "Error",
 };
 
 const STATUS_COLORS: Record<string, string> = {
   analizando: "bg-yellow-100 text-yellow-800 border-yellow-300",
-  descartado: "bg-red-100 text-red-800 border-red-300",
   analisis_completo: "bg-green-100 text-green-800 border-green-300",
+  generando_borrador: "bg-blue-100 text-blue-800 border-blue-300",
+  en_evaluacion: "bg-purple-100 text-purple-800 border-purple-300",
+  esperando_aprobacion: "bg-indigo-100 text-indigo-800 border-indigo-300",
+  parcialmente_aprobado: "bg-orange-100 text-orange-800 border-orange-300",
+  produciendo: "bg-teal-100 text-teal-800 border-teal-300",
+  terminado: "bg-green-200 text-green-800 border-green-400",
+  descartado: "bg-red-100 text-red-800 border-red-300",
   error: "bg-red-100 text-red-800 border-red-300",
 };
 
@@ -41,22 +64,28 @@ export default function RfpListPage() {
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [notifications, setNotifications] = useState<SseNotification[]>([]);
+  const [sseConnected, setSseConnected] = useState(false);
+  const sseClientRef = useRef<SseClient | null>(null);
 
-  // ── Fetch tickets ────────────────────────────────────────────────
+  // ── Notificación entrante (banner) ───────────────────────────────
+
+  const addNotification = useCallback((notif: SseNotification) => {
+    setNotifications((prev) => [notif, ...prev].slice(0, 5)); // max 5 banners
+
+    // Auto-descartar después de 10 segundos
+    setTimeout(() => {
+      setNotifications((prev) => prev.filter((n) => n.ticket_id !== notif.ticket_id));
+    }, 10000);
+  }, []);
+
+  // ── Fetch tickets (full refresh) ─────────────────────────────────
 
   const fetchTickets = useCallback(async () => {
     try {
       const data = await request<ApiResponse>("/api/rfp/tickets");
       setTickets(data.tickets);
       setError(null);
-
-      // Check if any ticket is still "analizando" — keep polling
-      const hasActive = data.tickets.some((t) => t.status === "analizando");
-      if (!hasActive && pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Error al cargar tickets");
     } finally {
@@ -64,18 +93,47 @@ export default function RfpListPage() {
     }
   }, []);
 
+  // ── Inicialización ───────────────────────────────────────────────
+
   useEffect(() => {
+    // 1. Fetch inicial de tickets
     fetchTickets();
 
-    // Poll every 5s while there are active tickets
-    pollingRef.current = setInterval(() => {
-      fetchTickets();
-    }, 5000);
+    // 2. Conectar SSE para notificaciones en vivo
+    const sse = new SseClient({
+      url: "/api/rfp/events",
+      onEvent: (eventName: string, data: Record<string, unknown>) => {
+        if (eventName === "rfp_ticket_created") {
+          const notif = data as unknown as SseNotification;
+          addNotification(notif);
+          // Refrescar la lista para que aparezca en la tabla
+          void fetchTickets();
+        } else if (eventName === "kpi_threshold_alert") {
+          // Las alertas KPI se manejan en el dashboard principal
+          addNotification({
+            ticket_id: `kpi-${data.location_id}-${Date.now()}`,
+            client_name: data.location_name as string,
+            status: data.kpi_type as string,
+          });
+        }
+      },
+      onReconnected: () => {
+        // Reconexión: refetch completo para reconciliación
+        void fetchTickets();
+      },
+      onStatusChange: (connected: boolean) => {
+        setSseConnected(connected);
+      },
+    });
+
+    sse.connect();
+    sseClientRef.current = sse;
 
     return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
+      sse.disconnect();
+      sseClientRef.current = null;
     };
-  }, [fetchTickets]);
+  }, [fetchTickets, addNotification]);
 
   // ── Upload handler ───────────────────────────────────────────────
 
@@ -129,14 +187,74 @@ export default function RfpListPage() {
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6 lg:px-8">
       <section className="mb-8">
-        <h1 className="text-2xl font-bold text-slate-900">
-          RFP Intake — Recepción de Propuestas
-        </h1>
-        <p className="mt-1 text-sm text-slate-600">
-          Sube una RFP en PDF para que el pipeline agéntico la analice y distribuya
-          el trabajo entre los departamentos correspondientes.
-        </p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900">
+              RFP Intake — Recepción de Propuestas
+            </h1>
+            <p className="mt-1 text-sm text-slate-600">
+              Sube una RFP en PDF para que el pipeline agéntico la analice y distribuya
+              el trabajo entre los departamentos correspondientes.
+            </p>
+          </div>
+          {/* Indicador de estado SSE */}
+          <div className="flex items-center gap-2 text-xs">
+            <span
+              className={`inline-block h-2.5 w-2.5 rounded-full ${
+                sseConnected ? "bg-green-500" : "bg-red-500"
+              }`}
+            />
+            <span className={`text-slate-500 ${sseConnected ? "text-green-700" : "text-red-600"}`}>
+              {sseConnected ? "Tiempo real activo" : "Reconectando..."}
+            </span>
+          </div>
+        </div>
       </section>
+
+      {/* Notificaciones SSE en vivo */}
+      {notifications.length > 0 && (
+        <section className="mb-4 space-y-2">
+          {notifications.map((notif) => (
+            <div
+              key={notif.ticket_id}
+              className="flex items-start gap-3 rounded-lg border-l-4 border-blue-500 bg-blue-50 p-3 shadow-sm"
+            >
+              <div className="flex-shrink-0">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-blue-100 text-xs font-bold text-blue-700">
+                  N
+                </span>
+              </div>
+              <div className="flex-1">
+                <p className="text-xs font-bold text-blue-800 uppercase tracking-wide">
+                  {notif.rfp_id || "Nuevo ticket"}
+                </p>
+                <p className="text-sm font-medium text-slate-900">
+                  {notif.client_name || "Cliente pendiente de clasificación"}
+                </p>
+                <p className="text-xs text-slate-500">
+                  Estado: <span className="font-mono">{notif.status || "analizando"}</span>
+                  {notif.created_at && (
+                    <span className="ml-2">
+                      • {new Date(notif.created_at).toLocaleTimeString()}
+                    </span>
+                  )}
+                </p>
+              </div>
+              <button
+                onClick={() =>
+                  setNotifications((prev) =>
+                    prev.filter((n) => n.ticket_id !== notif.ticket_id)
+                  )
+                }
+                className="flex-shrink-0 text-slate-400 hover:text-slate-600"
+                aria-label="Descartar notificación"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </section>
+      )}
 
       {/* Upload form */}
       <section className="mb-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">

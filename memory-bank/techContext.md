@@ -7,6 +7,15 @@
 - Configuración estricta en tsconfig.json (strict, noImplicitAny, noUnusedLocals, noUnusedParameters).
 - Script de validación: npm run typecheck.
 
+### Notificaciones SSE en Tiempo Real (2026-11-27)
+- **Backend**: SSE raw sobre FastAPI `StreamingResponse(text/event-stream)` — sin dependencias externas (no `sse-starlette`). Formato `event:`/`data:`/`id:` con `\n\n` delimitador.
+- **SSEManager**: `services/api/sse/manager.py` — Singleton con `asyncio.Queue` por suscriptor, buffer circular `deque(maxlen=50)`, `asyncio.Lock` para lista de suscriptores, keep-alive cada 30s con `asyncio.wait_for`. `subscribe()` acepta `request` opcional para `await request.is_disconnected()`.
+- **Endpoint SSE**: `GET /rfp/events` — `StreamingResponse(async _sse_event_stream())`, JWT via `Depends(get_current_user)`, soporta `Last-Event-ID` header para replay.
+- **KPI Alert endpoint**: `POST /rfp/kpi-alert` — acepta `KpiAlertPayload` (location_id, kpi_type, kpi_value, threshold, etc.) y publica vía SSEManager.
+- **Frontend SSE Client**: `uis/backoffice/lib/sseClient.ts` — `fetch()` + `ReadableStream<Uint8Array>` (no `EventSource` por headers JWT). `TextDecoder` para UTF-8. Backoff exponencial (1s→2s→...→30s). `Set<eventId>` para dedup. Callbacks: `onEvent`, `onReconnected`, `onStatusChange`.
+- **Dashboard SSE**: `uis/backoffice/app/rfp/page.tsx` — `useEffect()` con `SSEClient`, reemplaza polling `setInterval`. Banners de notificación con indicador de conexión (verde/rojo).
+- **Tests**: `tests/pipelines/test_sse_events.py` — 16 tests (SSEManager, wire format, endpoint, singleton). Se ejecutan con `uv run python -m pytest tests/pipelines/test_sse_events.py`.
+
 ### Sitio estático (hito web)
 - HTML semántico (index/application en EN y ES).
 - Tailwind CSS via CDN para estilos utilitarios.

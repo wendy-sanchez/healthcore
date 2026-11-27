@@ -1,5 +1,48 @@
 # Active Context
 
+## Notificaciones SSE en Tiempo Real — RFP Dashboard (2026-11-27)
+
+**Estado: ✅ IMPLEMENTADO — 16/16 tests SSE + 35/35 tests RFP = 51 tests PASS (todos pasan)**
+
+### Componentes Implementados
+
+| Componente | Archivo | Descripción |
+|------------|---------|-------------|
+| **SSEManager** | `services/api/sse/manager.py` | Singleton con colas `asyncio.Queue` por suscriptor, buffer circular (50 eventos), broadcast O(n), keep-alive 30s |
+| **Paquete SSE** | `services/api/sse/__init__.py` | Init del paquete |
+| **Endpoint SSE** | `GET /rfp/events` en `services/api/routes/rfp.py` | `StreamingResponse(text/event-stream)`, JWT requerido, soporta `Last-Event-ID` para replay |
+| **KPI Alert** | `POST /rfp/kpi-alert` en `services/api/routes/rfp.py` | Publica evento `kpi_threshold_alert` cuando KPI cruza umbral (no-show >25%, denial_rate >10%) |
+| **Publicación upload** | `POST /rfp/upload` modificado | Publica `rfp_ticket_created` después de encolar en Celery |
+| **SSE Client** | `uis/backoffice/lib/sseClient.ts` | `fetch()` + `ReadableStream`, backoff exponencial (1s→...→30s), `Last-Event-ID`, dedup via `Set<eventId>`, callbacks `onEvent`/`onReconnected`/`onStatusChange` |
+| **Dashboard** | `uis/backoffice/app/rfp/page.tsx` | Conexión SSE reemplaza polling, banners de notificación (máx 5, auto-dismiss 10s), indicador verde/rojo de estado SSE |
+| **Tests** | `tests/pipelines/test_sse_events.py` | 16 tests: SSEManager (7), wire format (3), endpoint (4), singleton (2) |
+
+### Detalles Técnicos Clave
+
+- **SSE sin dependencias externas**: implementación raw sobre `StreamingResponse` (sin `sse-starlette`). Formato `event:`/`data:`/`id:` con `\n\n` delimitador.
+- **Detección de desconexión temprana**: `SSEManager.subscribe(request)` acepta parámetro `request` opcional. Si se provee, verifica `await request.is_disconnected()` al inicio de cada iteración del generador.
+- **Replay vía Last-Event-ID**: en `_sse_event_stream()`, primero verifica header `Last-Event-ID`, busca en buffer circular, envía eventos pendientes (con verificación per-event de `is_disconnected()`), luego suscribe a stream en vivo.
+- **Singleton seguro**: `get_sse_manager()` con `asyncio.Lock` y variable global `_sse_manager_instance`.
+- **Frontend**: usa `fetch()` con `Authorization: Bearer` en lugar de `EventSource` (no soporta headers personalizados). Decodifica UTF-8 manualmente con `TextDecoder`.
+- **Manejo de 401**: el cliente SSE detiene reconexión automática al recibir 401, notifica al usuario vía callback.
+
+### Tests
+
+- `TestSSEManager` (7): publish broadcast, auto event ID, custom ID, buffer circular replay, replay since_event_id, subscriber count, unsubscribe on disconnect
+- `TestSseWireFormat` (3): rfp_ticket_created format, kpi_threshold_alert format, keepalive timeout
+- `TestSseEndpoint` (4): requires auth, streaming response, kpi alert endpoint, kpi alert requires auth
+- `TestSseManagerSingleton` (2): same instance, preserves state
+
+### Auditoría
+
+✅ **6/6 criterios de aceptación cumplidos** contra solución de referencia:
+1. ✅ SSEManager con asyncio.Queue por suscriptor + buffer circular
+2. ✅ SSE endpoint JWT-protected en GET /rfp/events
+3. ✅ POST /rfp/upload publica evento SSE (rfp_ticket_created)
+4. ✅ Frontend SSE client con fetch+ReadableStream, backoff, Last-Event-ID, dedup
+5. ✅ Dashboard refactorizado: banners de notificación, reemplazo de polling
+6. ✅ POST /rfp/kpi-alert para alertas de umbral KPI
+
 ## Persistencia en Tiempo Real (PostgreSQL) — Parte 2 (2026-11-25)
 
 **Fix completo del bug de persistencia: la Parte 2 ahora persiste cada estado del ciclo generador-evaluador en PostgreSQL en tiempo real.**
