@@ -1,0 +1,85 @@
+{
+  "run_id": "a79bfc4f-291e-404c-95ee-c41b9fa4b7cd",
+  "question": "¿Cuál es la política de no-show?",
+  "answer": "Respuesta simulada.",
+  "error": null,
+  "routing_log": [
+    "receive_question → classify_query (pregunta válida)",
+    "input_guardrail → OK",
+    "check_pending_proposal → continue (sin propuesta pendiente)",
+    "classify_query → rag",
+    "retrieve_context → generate_answer (1 fragmentos recuperados)",
+    "generate_answer → END (respuesta generada con harness)",
+    "output_guardrail → OK"
+  ],
+  "events": [
+    {
+      "node": "receive_question",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.369399+00:00",
+      "metadata": {
+        "question_length": 32
+      }
+    },
+    {
+      "node": "input_guardrail",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.370508+00:00",
+      "metadata": {
+        "classification": "domain",
+        "blocked": false,
+        "confidence": 0.9,
+        "reason": "Input is within the HealthCore compliance domain."
+      }
+    },
+    {
+      "node": "load_memory_context",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.372867+00:00",
+      "metadata": {
+        "num_memory_facts": 5,
+        "has_pending_proposal": false
+      }
+    },
+    {
+      "node": "classify_query",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.374967+00:00",
+      "metadata": {
+        "decision": "rag",
+        "has_incident": false,
+        "has_inventory": false,
+        "has_rag": true
+      }
+    },
+    {
+      "node": "retrieve_context",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.375936+00:00",
+      "metadata": {
+        "num_chunks": 1
+      }
+    },
+    {
+      "node": "generate_answer",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.376886+00:00",
+      "metadata": {
+        "answer_length": 19,
+        "llm_proposal": false,
+        "harness_active": true
+      }
+    },
+    {
+      "node": "output_guardrail",
+      "status": "ok",
+      "timestamp": "2026-11-27T16:15:58.380533+00:00",
+      "metadata": {
+        "answer_length": 19
+      }
+    }
+  ],
+  "num_chunks_retrieved": 1,
+  "final_answer_length": 19,
+  "timestamp": "2026-11-27T16:15:58.381020+00:00"
+}

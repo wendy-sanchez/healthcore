@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from uuid import UUID, uuid4
 from pathlib import Path
@@ -47,15 +48,39 @@ async def lifespan(application: FastAPI):
         telemetry_delivery.service.stop()
 
 
-app = FastAPI(title="HealthCore API", version="1.1.0", lifespan=lifespan)
+# Restringir docs/redoc en producción — no exponer esquema completo de la API
+_docs_enabled = os.getenv("ENABLE_DOCS", "false").lower() == "true"
+
+app = FastAPI(
+    title="HealthCore API",
+    version="1.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+)
 app.state.telemetry_endpoint = TELEMETRY_ENDPOINT
+
+# ── CORS ───────────────────────────────────────────────────────────────────
+# Lista blanca explícita de orígenes.  Nunca uses allow_origins=["*"] con
+# allow_credentials=True — cualquier sitio externo podría hacer peticiones
+# autenticadas contra la API.
+#
+# En desarrollo, los frontends corren en localhost:3000 (website) y
+# localhost:3001 (backoffice).  En producción, sustituir por los dominios reales.
+
+_cors_origins = [
+    "http://localhost:3000",       # Website (Next.js dev)
+    "http://localhost:3001",       # Backoffice (Next.js dev)
+    "http://localhost:8000",       # API self (swagger UI)
+    "https://healthcore.app",      # Producción (ajustar al dominio real)
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-Telemetry-Events"],
     expose_headers=["X-Telemetry-Events", "X-Request-ID"],
 )
 

@@ -1,5 +1,51 @@
 # Active Context
 
+## OWASP Top 10 Security Audit & Server Hardening (2026-11-27)
+
+**Estado: ✅ COMPLETADO — Auditoría OWASP Top 10 completa, 4 vulnerabilidades críticas corregidas, servidor endurecido, 477 tests pass (0 fallos)**
+
+### Resumen
+
+Se realizó una auditoría completa de seguridad basada en OWASP Top 10 sobre los 3 lanes del sistema (backend FastAPI, frontend Next.js, sistema agéntico LangGraph). Se identificaron 4 vulnerabilidades críticas, todas corregidas con evidencia reproducible. Endurecimiento del servidor aplicado: SSH root deshabilitado, firewall iptables, usuario dedicado, permisos restringidos.
+
+### Documentos Generados
+
+| Documento | Contenido |
+|-----------|-----------|
+| [`secure-ai-applications.md`](../secure-ai-applications.md) | Reporte OWASP Top 10 — 10 categorías × 3 lanes, hallazgos, correcciones, evidencia |
+| [`docs/security/server-hardening.md`](../docs/security/server-hardening.md) | Documento de endurecimiento del servidor con comandos de verificación |
+| [`tests/security/`](../tests/security/) | 5 archivos de test: CORS, agent auth, env perms, Redis, JWT (9 tests) |
+
+### Vulnerabilidades Críticas Corregidas
+
+| # | OWASP | Vulnerabilidad | Antes | Después |
+|---|-------|---------------|-------|---------|
+| 1 | A01/A07 | Agent endpoints sin auth | `POST /agent/query`, `GET /agent/trace`, `GET /agent/traces` sin protección | `Depends(get_current_user)` en los 3 endpoints |
+| 2 | A02 | JWT hardcodeado | `"dev-secret-key-change-in-production"` en `chat_ws.py` | `os.getenv("JWT_SECRET_KEY")` — None si no está |
+| 3 | A02 | `.env` world-readable | Permisos 666 | Permisos 600 |
+| 4 | A05 | CORS `*` | `allow_origins=["*"]` con `allow_credentials=True` | Whitelist: localhost:3000/3001/8000 + healthcore.app |
+| 5 | A05 | Redis expuesto | `0.0.0.0:6379` sin auth | `ports: !reset []` + `docker stop` |
+
+### Endurecimiento del Servidor
+
+| Medida | Estado |
+|--------|--------|
+| `PermitRootLogin no` | ✅ Aplicado en `/etc/ssh/sshd_config` |
+| Usuario `healthcore-ops` (uid=999) | ✅ Creado |
+| Firewall iptables: solo SSH:2222 desde internet | ✅ Activo |
+| SSH rate limiting: 6 conexiones/60s | ✅ Activo |
+| Project root permisos 750 (era 777) | ✅ Aplicado |
+| Redis no expuesto (contenedor detenido) | ✅ Verificado |
+
+### Tests
+
+| Suite | Resultado |
+|-------|-----------|
+| Tests de seguridad (9 nuevos) | ✅ 9/9 pass |
+| Suite completa (477 tests) | ✅ 477 pass, 0 fail, 7 skipped |
+
+---
+
 ## WebSocket Chat en Tiempo Real — Compliance Assistant (2026-11-27)
 
 **Estado: ✅ IMPLEMENTADO — 35/35 tests WebSocket + 16/16 tests SSE + 16/16 tests RFP = 67 tests PASS (todos pasan)**
