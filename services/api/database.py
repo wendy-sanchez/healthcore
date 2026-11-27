@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Generator
 
 from dotenv import load_dotenv
+from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine
 from tinydb import TinyDB
 from tinydb.table import Table

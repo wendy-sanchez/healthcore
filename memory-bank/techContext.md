@@ -148,6 +148,112 @@
 5. Priorizar funciones puras para lógica de negocio en src/utils.
 6. Validar en el borde con Pydantic: las reglas de negocio del CONTEXT (moneda por país, tarifa positiva, enums de estado y categoría) se rechazan con 422 antes de tocar TinyDB.
 7. Baja lógica en el directorio de proveedores: DELETE no borra, marca `archived_at`. `status` conserva únicamente los valores del CONTEXT.
+### Part 3 — Checkpointer Dual
+
+Part 3 usa un sistema de persistencia dual:
+
+1. **SQLite (checkpointer interno)**: Namespacing `rfp-{ticket_id}:{department_id}` para estado interno de cada departamento (checkpoints, approval_history, arbitrage_history). Rápido, sin dependencias externas. Persiste en disco, sobrevive reinicios.
+2. **PostgreSQL vía `Session(engine)` (persistencia oficial)**: `DepartmentSectionDB.approval_status/approver/approved_at` registran aprobaciones, `TicketDB.status/final_document_path/part3_completed_at` trackean el estado del ticket.
+
+### Flujo de estados del ticket (completo)
+
+```
+upload → analizando → clasificado → generando_borrador → en_evaluacion → 
+analisis_completo → needs_human_review → arbitrando → esperando_aprobacion →
+parcialmente_aprobado → needs_revision → produciendo → terminado
+```
+
+### Pipeline de 9 nodos (graph.py)
+
+1. Convert PDF → 2. Extract Metadata → 3. Classify → 4. Orchestrate → 5. Worker Loop → 6. Synthesize → 7. Part 2 (cycle) → 8. Final DB Commit → **9. Part 3 (conflict/arbitrage/approval/synthesis)**
+
+### Nodo 9 en graph.py
+
+El Nodo 9 se ejecuta solo cuando `final_status == "needs_human_review"`:
+- Importa `create_part3_pipeline` de `agentic_workflows_part3.graph`
+- Crea checkpoint scoped por ticket: `checkpoint_dir = Path('/workspaces/healthcore/data/checkpoints')` + `checkpoint_db_path = str(checkpoint_dir / f'{ticket_id}.db')`
+- Ejecuta `run_part3_pipeline()` con el handoff de Part 2
+- Transiciona estados: `needs_human_review` → `arbitrando` → `esperando_aprobacion` / `parcialmente_aprobado` → `produciendo` → `terminado`
+- Persiste resultados en PostgreSQL (`TicketDB.status`, `final_document_path`, `part3_completed_at`)
+
+### Endpoints FastAPI — Part 3
+
+- `POST /api/rfp/tickets/{ticket_id}/approve` — Registra aprobación/rechazo de departamento (body: `ApproveRequest` con `@field_validator` para `requested_changes`)
+- `GET /api/rfp/tickets/{ticket_id}/approvals` — Historial de aprobaciones (desde `DepartmentSectionDB`)
+- `GET /api/rfp/tickets/{ticket_id}/pending-approvals` — Payload estructurado de interrupt para UI (`section_summary`, `evaluation_snapshot`, `actions`)
+
+### Módulos de Parte 3
+
+- `agentic_workflows_part3/models_part3.py` — 7 estados lifecycle, 4 enums, 6 modelos Pydantic + `add_trace()` helper
+- `agentic_workflows_part3/checkpointer.py` — `Part3SQLiteCheckpointer` con 3 tablas (checkpoints, approval_history, arbitrage_history)
+- `agentic_workflows_part3/graph_nodes.py` — 5 nodos LangGraph + routing function, 3 fixed arbiters del CONTEXT
+- `agentic_workflows_part3/graph.py` — `Part3Pipeline` class con `_build_graph()`, `run_part3_pipeline()`, `handle_approval_response()`
+- `agentic_workflows_part3/arbitration.py` — Reglas deterministas, fixed arbiters (nunca LLM consensus)
+## Patrones de Persistencia (PostgreSQL via SQLModel)
+
+### Sesión con Context Manager
+En la pipeline RFP Parte 2, cada helper de persistencia abre su propia conexión:
+
+```python
+from sqlmodel import Session, select
+
+def _persist_example(engine, ticket_id, dept_id):
+    with Session(engine) as session:
+        stmt = select(DepartmentSectionDB).where(
+            DepartmentSectionDB.ticket_id == ticket_id,
+            DepartmentSectionDB.department_id == dept_id
+        )
+        dept_db = session.exec(stmt).first()
+        if dept_db:
+            dept_db.generation_status = "generando"
+            session.add(dept_db)
+            session.commit()
+```
+
+Cada helper hace `session.commit()` inmediato, asegurando que el cambio sea visible en DB sin depender de la transacción del llamante.
+
+### Mock de Session en Tests (unittest.mock)
+Para testear los helpers sin DB real, se usa el patrón de class context manager:
+
+```python
+from unittest.mock import MagicMock, patch
+import pytest
+
+@pytest.fixture
+def mock_session():
+    session = MagicMock(name="session")
+    session.__enter__.return_value = session  # Context manager
+    return session
+
+@pytest.fixture
+def session_factory(mock_session):
+    session_instance = MagicMock(name="session_instance")
+    session_instance.__enter__.return_value = mock_session
+    mock_session_cls = MagicMock(return_value=session_instance)
+    with patch("data.pipelines.rfp_intake.cycle.Session", mock_session_cls) as p:
+        yield p
+```
+
+**Puntos clave**:
+- `Session` se parchea como clase, su `return_value` es `session_instance`
+- `session_instance.__enter__` retorna el mock principal (donde se llama `exec`, `add`, `commit`)
+- `mock_session.exec(select(...)).first()` se configura con `return_value` para el objeto DB esperado
+- Para múltiples queries, usar `side_effect` o resetear `side_effect = None` antes de asignar `return_value`
+
+### Patrón de 4 Helpers (Parte 2)
+Cada helper en `cycle.py` sigue la misma estructura:
+1. `with Session(engine) as session:` (abrir conexión)
+2. `session.exec(select(...)).first()` (obtener registro)
+3. Modificar campos (ej: `dept_db.draft_content = draft`)
+4. `session.add(dept_db)` (opcional si se modifica in-place)
+5. `session.commit()` (persistir inmediatamente)
+
+Los helpers son: `_persist_generation_started`, `_persist_draft_complete`, `_persist_evaluation_started`, `_persist_evaluation_complete`.
+
+### Dónde se usa
+- `data/pipelines/rfp_intake/cycle.py` — 4 helpers con Session(engine)
+- `data/pipelines/rfp_intake/graph.py` — Session(engine) para operaciones CRUD en nodos
+- `services/api/database.py` — `get_sql_engine()` que crea el engine compartido desde `DATABASE_URL`
 8. No cargar datos en useEffect en el backoffice: la carga inicial es server-side y evita la regla react-hooks/set-state-in-effect.
 9. **Arquitectura dual de BD**: TinyDB para usuarios/auth/proveedores, Supabase PostgreSQL para inventario. El modelo User NO existe en SQLModel.
 10. **Dos APIs separadas**: API principal (puerto 8000) para proveedores, auth, inventario. API de incidencias (puerto 8010) independiente.
@@ -278,6 +384,17 @@ La API principal (`services/api/main.py`) no arranca en Python 3.14 por incompat
 - **Contexto de build**: siempre `.` (raíz), con `.dockerignore` para filtrar.
 - **Montajes**: bind mounts de código fuente + volúmenes anónimos para `node_modules`.
 - **Variables de entorno**: via `env_file: .env`.
+
+## Async Patterns (RFP Pipeline Part 2)
+
+El pipeline de generación y evaluación de borradores usa `asyncio` para paralelismo real:
+
+- **Evaluadores en paralelo**: `asyncio.gather(readability, relevance, compliance)` en `evaluate_section()` — los 3 corren concurrentemente.
+- **Departamentos concurrentes**: `asyncio.gather(dept_tasks)` en `run_part2_pipeline()` — revenue, clinical, compliance sin orden secuencial.
+- **LLM calls no bloqueantes**: `await asyncio.to_thread(client.chat.completions.create, ...)` para evitar bloquear el event loop.
+- **Configuración de tests**: `pytest-asyncio>=1.5.0` con `asyncio_default_fixture_loop_scope = "function"` en pyproject.toml. `pytestmark = pytest.mark.asyncio` a nivel de módulo.
+- **Comando de tests**: `uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py tests/pipelines/test_rfp_generators.py tests/pipelines/test_rfp_evaluators.py -v --tb=short`
+- **Resultado**: 43/43 tests pasan.
 - **Comunicación**: por nombre de servicio Docker (`http://backend:8000`, `http://incidents-backend:8010`, `redis://redis:6379/0`).
 
 ## RAG Knowledge Base — Stack y configuración
@@ -700,6 +817,114 @@ uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "memory"
 
 # Tests de PHI específicamente
 uv run python -m pytest tests/pipelines/test_agent_graph.py -v -k "phi"
+```
+
+## RFP Intake Pipeline — Hito 9 · Parte 1 (data/pipelines/rfp_intake/)
+
+### Stack técnico
+- **Python 3.14+**, gestionado con `uv` (pyproject.toml raíz).
+- **Dependencias**: `markitdown[pdf]>=0.1.9` (PDF→Markdown con pdfminer para parsing semántico), `py-readability-metrics>=1.4.5` (5 métricas de legibilidad), `nltk>=3.9.0` (syllable counting fallback), `openai>=1.70.0` (clasificador y workers), `langgraph>=0.3.0` (pipeline graph), `langchain-openai>=0.3.0`.
+- **PostgreSQL/Supabase**: 3 tablas SQLModel — `rfp_tickets`, `rfp_metadata`, `rfp_department_sections`.
+- **Celery**: Tarea `process_rfp_pipeline` en `services/celery_app.py`, bound to `rfp.process_pipeline`, `autoretry_for=(Exception,)`.
+
+### Estructura de archivos
+
+```
+data/pipelines/rfp_intake/
+├── __init__.py          # Paquete
+├── models.py            # Enums (TicketStatus, DepartmentId, ProgramType), modelos (ReadabilityMetrics, RfpMetadata, etc.)
+├── converter.py         # PDF → Markdown (MarkItDown con pdfminer, sin fallback PyPDF2)
+├── readability.py       # 5 métricas de legibilidad (Flesch, Kincaid, Gunning Fog, Coleman-Liau, ARI)
+├── classifier.py        # Two-stage: reglas pre-filter → OpenAI gpt-4o-mini (json response_format)
+├── orchestrator.py      # Descompone documento en 3 secciones por departamento (regex patterns)
+├── workers.py           # Workers LLM con fallback rule-based. NUNCA inventa cifras.
+├── synthesizer.py       # Consolidación: executive summary, conflict detection, alerts, handoff
+├── graph.py             # run_rfp_pipeline(): 6 nodos secuenciales, cada uno persiste a PostgreSQL
+└── tasks.py             # Celery task wrapper (asyncio.run(run_rfp_pipeline(...)))
+
+services/api/
+├── models_rfp.py        # 3 tablas SQLModel (TicketDB, RfpMetadataDB, DepartmentSectionDB)
+└── routes/rfp.py        # 4 endpoints FastAPI
+
+uis/backoffice/app/
+├── rfp/page.tsx             # Upload + ticket list (polling 5s)
+├── rfp/[ticket_id]/page.tsx # Detail con metadata, readability, departments, PHI alerts
+└── api/rfp/                 # 4 proxy routes Next.js
+
+scripts/
+├── rerun_rfp_ticket.py      # CLI reprocess sin Celery
+└── smoke_test_rfp.py        # Smoke test rápido
+
+tests/pipelines/
+├── test_rfp_classifier.py   # 8 tests
+└── test_rfp_workers.py      # 8 tests
+```
+
+### Pipeline Graph (6 nodos secuenciales)
+
+| Nodo | Función | Descripción |
+|---|---|---|
+| N1 | `convert_pdf_to_markdown(pdf_path)` | PDF → Markdown vía MarkItDown con pdfminer |
+| N2 | `extract_metadata_and_readability(content)` | 5 métricas de legibilidad + metadatos del cliente |
+| N3 | `classify_document(content)` | Two-stage: reglas pre-filter + LLM gpt-4o-mini |
+| N4 | `orchestrate(content, metadata)` | Descompone en 3 secciones por departamento |
+| N5 | `workers(departments, metadata)` | Enriquecimiento con key_aspects + open_questions |
+| N6 | `synthesize(departments, metadata, ticket_id)` | Consolidación, conflict detection, handoff |
+
+### Endpoints API (rutas reales: `/rfp/*`)
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `POST` | `/rfp/upload` | Sube PDF, crea ticket, encola Celery. Responde 202 |
+| `GET` | `/rfp/tickets` | Lista tickets con client_name |
+| `GET` | `/rfp/tickets/{ticket_id}` | Detalle con metadata + department_sections |
+| `POST` | `/rfp/tickets/{ticket_id}/reprocess` | Reabre ticket fallido/descartado |
+
+### Proxy Routes (Next.js → Backend)
+
+| Navegador | Backend |
+|---|---|
+| `POST /api/rfp/upload` | `POST /rfp/upload` |
+| `GET /api/rfp/tickets` | `GET /rfp/tickets` |
+| `GET /api/rfp/tickets/{id}` | `GET /rfp/tickets/{id}` |
+| `POST /api/rfp/tickets/{id}/reprocess` | `POST /rfp/tickets/{id}/reprocess` |
+
+### Clasificador (classifier.py)
+- **Two-stage**: (1) reglas pre-filter sin LLM → detecta NO-RFP obvios (pitch, CV, newsletter), (2) OpenAI via 4Geeks AI (`deepseek-v4-flash`) con `response_format={"type": "json_object"}` para clasificación fina.
+- **Configuración LLM**: Lee `API_KEY` y `HOST` del `.env` (variables de 4Geeks AI). `OpenAI(api_key=LLM_API_KEY, base_url=LLM_HOST)`. Modelo definido en `RFP_CLASSIFIER_MODEL`.
+- **Early return**: Si las reglas pre-filter detectan YES-RFP con alta confianza, se retorna inmediatamente sin invocar LLM (con intento opcional de enriquecimiento en try/except).
+- **Patrones NO-RFP**: pitch de ventas ("cutting-edge", "revolutionize"), CV/currículum ("objective", "professional summary"), newsletter/artículo genérico, EHR vendor pitch ("our platform was built for", "unified ehr", "modernize your").
+- **Patrones YES-RFP**: "request for proposal", "solicitud de propuesta", HealthCore + programa de salud, referral partnership, student health, partnership enquiry.
+- **PHI detection**: si el clasificador detecta PHI en el documento, lo registra como alarma.
+
+### Workers (workers.py)
+- Cada worker recibe `(department_id, metadata, raw_extract)`.
+- **Configuración LLM**: Misma que classifier — `API_KEY`/`HOST` desde `.env`, modelo `RFP_WORKER_MODEL` (`deepseek-v4-flash`).
+- **Revenue worker**: extrae términos financieros, presupuesto, moneda. Fallback: asigna moneda según `client_country`.
+- **Clinical worker**: extrae capacidad operativa, clínicas, personal, volúmenes. Detecta PHI.
+- **Compliance worker**: extrae requisitos regulatorios, tipo de datos, cláusulas. Fallback: BAA (US) o DPA (UK) según `client_country`.
+- **Regla inquebrantable**: NUNCA inventa cifras, volúmenes, headcount ni PHI. Si falta información → se registra como `open_questions`.
+
+### DB Tables (SQLModel)
+
+- **`rfp_tickets`**: `ticket_id` (UUID, PK), `status` (analizando/descartado/analisis_completo/error), `raw_pdf_path`, `classification_reason`, `synthesis`, `handoff_payload` (JSONB), `error_detail`, `created_at`, `updated_at`.
+- **`rfp_metadata`**: `ticket_id` (FK unique), `client_name`, `client_country` (US/UK), `program_type`, `covered_population`, `deadline`, `budget_range`, `currency`, `departments_needed` (JSONB), `extra_departments_mentioned` (JSONB), `readability` (JSONB), `word_count`, `estimated_complexity`.
+- **`rfp_department_sections`**: `ticket_id` (FK indexed), `department_id`, `key_aspects` (JSONB), `open_questions` (JSONB), `contains_phi`, `draft_content`, `evaluation_results` (JSONB para Parte 2), `approval_status` (para Parte 3), `approver`, `approved_at`.
+
+### Comandos
+
+```bash
+# Tests (16/16)
+uv run python -m pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v
+
+# Verificar API
+curl http://localhost:8000/rfp/tickets
+
+# Reprocesar ticket desde CLI
+uv run python scripts/rerun_rfp_ticket.py <ticket_id>
+
+# Smoke test
+uv run python scripts/smoke_test_rfp.py
 ```
 
 ### Decisiones técnicas clave

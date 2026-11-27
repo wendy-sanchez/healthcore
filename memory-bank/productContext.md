@@ -147,7 +147,18 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Consistencia de datos**: los valores derivados (denial rates, no-show costs) se calculan una sola vez por render (useMemo) y no cambian durante la vida de la página, incluso si hay re-renders parciales.
 - **Frescura de datos en dashboards**: el resumen de incidencias y la lista de productos pueden tener hasta 30-60 segundos de desfase (caché). Esto es aceptable para dashboards operativos donde la inmediatez no es crítica.
 
-12. **RAG Knowledge Base — HealthCore Knowledge Q&A (Nov 2026)**
+13. **RFP Pipeline — Partes 1, 2 y 3: Clasificación, Generación de Borradores y Aprobación Humana (Nov 2026)**
+- **Pipeline completo de 9 nodos LangGraph** que procesa solicitudes RFP (Request for Proposal) desde PDF hasta documento final aprobado:
+  - **Parte 1**: Conversión PDF→Markdown (con markitdown[pdf]), extracción de metadatos, clasificación, descomposición por departamento, workers por departamento y síntesis.
+  - **Parte 2**: Ciclo generador-evaluador de borradores por departamento con LLM real (DeepSeek v4 Flash via 4Geeks AI). Evaluadores async en paralelo (readability, relevance, compliance).
+  - **Parte 3**: Aprobación humana con checkpoints scoped por ticket, arbitraje (PHI, BAA/DPA, Capacity), síntesis final y generación de documento completo.
+- **Estados del ticket**: `nuevo → analizandose → analisis_completo → generando_borrador → en_evaluacion → needs_human_review → arbitrando → esperando_aprobacion / parcialmente_aprobado → produciendo → terminado`
+- **Persistencia dual**: SQLite para checkpoints de Part 3 (en `data/checkpoints/{ticket_id}.db`) + PostgreSQL (Supabase) para estado oficial (TicketDB, DepartmentSectionDB).
+- **3 endpoints Part 3**: `POST /approve`, `GET /approvals`, `GET /pending-approvals`
+- **Tests**: 21 tests E2E que cubren Part 1, 2, 3, persistencia y edge cases. **21/21 ALL PASS** con LLM real.
+- **Bugs corregidos en producción**: migración de columnas PG (`final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`), checkpoint scoped por ticket, markitdown[pdf] instalado.
+
+## Usuarios clave
 - **Sistema de preguntas y respuestas** basado en Retrieval-Augmented Generation (RAG) que permite al equipo de HealthCore consultar en lenguaje natural las políticas documentadas de la clínica.
 - **Documentos fuente**: 4 archivos Markdown en `docs/company-knowledge-base/` (cobertura de seguros, política de citas, proceso de referencias internas, checklist de pacientes nuevos), todos en español.
 - **Arquitectura**: chunking semántico por párrafos → embedding con `pplx-embed-v1-0.6b` → indexado en Qdrant (vector DB) → recuperación por similitud coseno → generación de respuesta con `deepseek-v4-flash`.
@@ -181,3 +192,19 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Auditoría completa**: 8 tipos de eventos auditables (`created`, `rejected`, `edited`, `phi_blocked`, `discarded`, `consolidated`, `expired`, `proposal_skipped`). Cada decisión del usuario queda registrada con timestamp, propuesta original, contenido final (si aplica) y resultado de validación PHI.
 - **Tests**: 32 nuevos tests específicos de memoria + 32 tests originales = 64 tests total. PHI tests cubren los 8 patrones individualmente. Tests de integración verifican el flujo completo en el grafo.
 - **Ciclos de evidencia documentados**: 4 ciclos completos en `agent-memory-harness-guard.md`: (1) propuesta aprobada, (2) propuesta rechazada, (3) propuesta editada por el usuario, (4) propuesta bloqueada por PHI.
+
+15. **RFP Intake Pipeline — Automatización de recepción y clasificación de RFP (Dec 2026)**
+- **Pipeline automático** que recibe documentos PDF de solicitudes de propuesta (RFP), los clasifica, extrae metadatos, descompone por departamento, y genera un payload estructurado para el equipo de Ventas de HealthCore.
+- **¿Qué problema resuelve?**: El equipo de Ventas recibe documentos RFP de potenciales clientes (planes de salud, gobiernos, empleadores) y actualmente debe leerlos manualmente, determinar si realmente es una RFP o un pitch comercial/CV genérico, extraer fechas, presupuestos y población cubierta, y distribuir secciones a los departamentos de Revenue, Clinical y Compliance para análisis. Este pipeline automatiza todo ese proceso de principio a fin.
+- **Pipeline de 6 nodos secuenciales** (LangGraph):
+  1. **Convertir PDF a Markdown** — MarkItDown con fallback PyPDF2.
+  2. **Extraer metadata y legibilidad** — 5 métricas (Flesch, Kincaid, Fog, Coleman-Liau, ARI).
+  3. **Clasificar documento** — Two-stage: reglas pre-filter (descarta pitches/CV/newsletters/EHR vendor pitches) → LLM deepseek-v4-flash vía 4Geeks AI. Early return cuando las reglas ya determinan YES-RFP con alta confianza.
+  4. **Orquestar por departamento** — Descompone el documento en 3 secciones (Revenue, Clinical, Compliance) usando patrones regex.
+  5. **Workers departamentales** — Cada worker enriquece su sección con aspectos clave y preguntas abiertas. Reglas de negocio: moneda según país del cliente; cláusulas BAA/DPA según país. NUNCA inventa cifras.
+  6. **Sintetizar** — Consolidación: executive summary, análisis por departamento, detección de conflictos entre secciones, alertas (PHI, fechas próximas), y payload de handoff para la Parte 2.
+- **4 estados de ticket**: `analizando` → `descartado` (si no es RFP legítima), `analisis_completo` (éxito), `error` (fallo técnico).
+- **Handoff para Parte 2 (Hito 9)**: El payload `handoff_payload` (JSONB en `rfp_tickets`) contiene `executive_summary`, `departments_analysis`, `conflicts_detected`, `alerts`, y `handoff_instructions`. Esta estructura será consumida por el pipeline de Parte 2 para la evaluación técnica por departamento.
+- **Interfaz de Backoffice**: Dos páginas en `uis/backoffice/app/rfp/` — listado con upload (polling 5s) y detalle con metadata, legibilidad, secciones departamentales, alertas PHI, y botón de reproceso.
+- **API asíncrona**: `POST /rfp/upload` responde 202 Accepted con `ticket_id`, el procesamiento continúa en background via Celery. El frontend polling detecta la transición a `analisis_completo`.
+- **Arquitectura de proxy**: Next.js sirve rutas `/api/rfp/*` que redirigen al backend en `/rfp/*`, solucionando la diferencia de paths entre navegador y servidor FastAPI.

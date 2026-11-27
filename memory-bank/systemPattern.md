@@ -59,7 +59,26 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Supplier para la respuesta, con los campos que genera el sistema (id, updated_at, archived_at).
 - Los campos generados por el sistema se ignoran si el cliente los envía.
 
-### 10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
+### ### 9) Persistencia Inmediata (Session-Query-Commit)
+
+En la pipeline RFP Parte 2, cada operación de persistencia sigue el patrón:
+
+```python
+with Session(engine) as session:
+    obj = session.exec(select(Model).where(...)).first()
+    if obj:
+        obj.field = value
+        session.commit()
+```
+
+**Características**:
+- Cada helper abre su propia conexión (`with Session(engine)`)
+- Cada helper hace commit inmediato (`session.commit()`)
+- No hay transacciones largas ni dependencia del ciclo de vida del llamante
+- 4 helpers en `cycle.py`: `_persist_generation_started`, `_persist_draft_complete`, `_persist_evaluation_started`, `_persist_evaluation_complete`
+- El engine se recibe como parámetro (opcional — `None` salta persistencia)
+
+10) Guardrails — Harness System Prompt + Content/Output Guardraisls (Hito 8·2)
 
 **Ubicación**: `services/agent/guardrails/`, `services/agent/graph.py`, `data/pipelines/rag.py`
 
@@ -290,7 +309,42 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - Aunque tienen importancia combinada del ~49,8 %, no son conocibles en `t−1` para un forecast real — si se usan, el modelo necesita sus valores pronosticados por separado.
 - El análisis de justificación se integra como paso 9 del pipeline y se exporta a `metrics.json` bajo `features_justification`.
 
-### 41) Patrón: comparativa antes/después como herramienta de auditoría
+### 42) Patrón RFP: metadata upsert con merge (evita INSERT/UPDATE manual)
+
+La tabla `rfp_metadata` se actualiza en dos momentos del pipeline:
+
+1. **Tras convert + readability** (graph.py líneas 100-143): se guardan métricas de legibilidad con `session.merge()` — si la fila no existe (primer run) la crea, si existe (reprocess) la actualiza. Esto evita tener que distinguir entre INSERT y UPDATE.
+
+2. **Tras clasificación LLM** (graph.py líneas 182-198): los metadatos enriquecidos (`client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency`) se persisten con otro `session.merge()`.
+
+La API (routes/rfp.py) transforma los campos planos de DB a la estructura anidada que espera la UI:
+
+```python
+readability_data = {
+    "flesch_reading_ease": meta.flesch_reading_ease,
+    "flesch_kincaid_grade": meta.flesch_kincaid_grade,
+    "gunning_fog": meta.gunning_fog,
+    "coleman_liau_index": meta.readability_cl_score,
+    "automated_readability_index": meta.readability_ari_score,
+    "word_count": meta.word_count,
+}
+return {"metadata": {..., "readability": readability_data}, ...}
+```
+
+### 43) Patrón RFP: estructura de campo plana en DB → anidada en API
+
+Por limitaciones de SQLModel (no soporta nested models directamente), los campos de legibilidad se almacenan planos en la tabla `rfp_metadata`:
+
+| Campo DB | Tipo | Mapeo API |
+|----------|------|-----------|
+| `flesch_reading_ease` | Float | `readability.flesch_reading_ease` |
+| `flesch_kincaid_grade` | Float | `readability.flesch_kincaid_grade` |
+| `gunning_fog` | Float | `readability.gunning_fog` |
+| `readability_cl_score` | Float | `readability.coleman_liau_index` |
+| `readability_ari_score` | Float | `readability.automated_readability_index` |
+| `word_count` | Integer | `readability.word_count` |
+
+La transformación se hace en `routes/rfp.py` al serializar la respuesta del endpoint `GET /rfp/tickets/{ticket_id}`.
 - `scripts/sales_forecast/compare_before_after.py` replica intencionalmente el bug (`_add_causal_features_with_fuga()`) y entrena un segundo modelo con la corrección, generando una gráfica de 2 paneles:
   - **Panel superior**: predicciones de ambos modelos solapadas sobre los datos reales.
   - **Panel inferior**: diferencia de error absoluto mes a mes, con media discontinua para cada modelo.
@@ -307,6 +361,52 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - **`max_retries = 3`** y **`default_retry_delay = 10`**: valores por defecto para reintentos.
 - **`on_failure()`**: sobrescrito para persistir el fallo en TinyDB (`task_id`, `attempt=max_retries`, `error`, `exc_type`, `task_name`, `args`, `kwargs`, `timestamp`) antes de delegar en `super().on_failure()`. Esto garantiza que toda tarea que herede de `HealthCoreTask` tenga registro en DLQ automáticamente.
 - **Uso**: decorar la tarea con `@celery_app.task(bind=True, base=HealthCoreTask, ...)`.
+
+## Patrones del RFP Intake Pipeline (Hito 9 · Parte 1)
+
+### 42) Patrón: Pipeline multi-agente secuencial con persistencia atómica por nodo
+- **`data/pipelines/rfp_intake/graph.py`**: 6 nodos LangGraph secuenciales (sin bifurcaciones en el grafo — los 3 workers se ejecutan dentro del mismo nodo).
+- Cada nodo es una función async que:
+  1. Recibe el estado compartido (`RfpPipelineState`)
+  2. Ejecuta su lógica específica
+  3. **Persiste su resultado en PostgreSQL** (via models_rfp.py) antes de retornar el nuevo estado
+- Esto garantiza que si el pipeline falla en el nodo N, los nodos 1..N-1 ya están persistidos y no se pierde trabajo.
+- El estado `RfpPipelineState` es un TypedDict con: `ticket_id`, `status`, `classification_reason`, `error_detail`, `metadata` (RfpMetadata), `departments` (list[DepartmentSection]), `synthesis`, `handoff_payload`.
+
+### 43) Patrón: Clasificador two-stage (reglas + LLM)
+- **`classifier.py`**: dos etapas secuenciales:
+  1. **Reglas pre-filter** (rápido, sin LLM): detecta patrones de NO-RFP (pitch de ventas, CV, newsletter, contenido genérico) con regex. Si matchea, retorna `is_rfp=False` inmediatamente sin llamar al LLM.
+  2. **LLM classifier** (gpt-4o-mini): si pasa el pre-filter, envía el Markdown completo con un system prompt estructurado que pide clasificación JSON `{is_rfp, confidence, reason, departments_mentioned}`.
+- Esto ahorra costos de API: el 100% de los no-RFP obvios se descartan sin llamar al LLM.
+
+### 44) Patrón: Workers con fallback rule-based
+- **`workers.py`**: cada worker intenta primero una llamada LLM (gpt-4o-mini) para extraer key_aspects. Si falla (timeout, error, o el LLM devuelve datos incompletos), cae a un **fallback rule-based** que:
+  - **Revenue**: asigna moneda según `client_country` (US→USD, UK→GBP).
+  - **Compliance**: determina si necesita BAA o DPA según `client_country`.
+  - **Clinical**: detecta PHI en el extracto usando patrones regex (nombres, MRN, emails, direcciones).
+  - **Nunca inventa cifras**: si no encuentra datos financieros, los registra como `open_questions` en lugar de inventar defaults.
+
+### 45) Patrón: Synthesizer con detección de conflictos
+- **`synthesizer.py`**: después de recibir los 3 department sections, el synthesizer:
+  1. Genera un **executive summary** consolidado.
+  2. Detecta **contradicciones** entre departamentos (misma cifra con distinto valor, currency vs client_country, capacidad vs población).
+  3. Registra **alertas** con severidad (low/medium/high) para revisión humana.
+  4. Calcula la **complejidad estimada** basada en población, deadlines, número de departamentos.
+  5. Produce el **handoff payload** para la Parte 2.
+
+### 46) Patrón: Celery task como wrapper del grafo async
+- **`tasks.py`**: la tarea Celery `process_rfp_pipeline` es un wrapper que usa `asyncio.run()` para ejecutar la función async `run_rfp_pipeline()`.
+- Configurada con: `bind=True`, `autoretry_for=(Exception,)`, `max_retries=2`, `default_retry_delay=10`, `acks_late=True`.
+- La tarea recibe solo `ticket_id` (no el PDF entero) — el converter lee el PDF desde disco usando la ruta almacenada en el ticket. Esto mantiene los mensajes de la cola ligeros.
+
+### 47) Patrón: API routes con respuesta 202 Accepted
+- **`routes/rfp.py`**: `POST /rfp/upload` valida el PDF (tamaño, tipo), genera UUID, guarda en disco, crea fila en PostgreSQL, encola la tarea Celery, y responde inmediatamente con **HTTP 202 Accepted** y `{"ticket_id": "...", "status": "analizando"}`.
+- El cliente (Next.js UI) hace polling cada 5s al detalle del ticket hasta que el estado cambia de `analizando` a `descartado`, `analisis_completo` o `error`.
+
+### 48) Patrón: Next.js proxy routes para RFP API
+- Las rutas del navegador usan prefijo `/api/rfp/*` pero el backend registra las rutas sin prefijo `/api` (directamente `/rfp/*`). Los route handlers de Next.js (`app/api/rfp/*`) actúan como proxy, reenviando requests a `http://localhost:8000/rfp/*`.
+- Esto mantiene la convención de Next.js (prefijo `/api`) sin obligar al backend a usar ese prefijo.
+- El route handler de upload deshabilita `bodyParser` para permitir el multipart/form-data del PDF.
 
 ### 39) Patrón: Reintentos con backoff exponencial y jitter
 - **`autoretry_for=(Exception,)`**: reintenta automáticamente ante cualquier excepción.
@@ -504,3 +604,14 @@ Monorepo de aprendizaje orientado a hitos, con separación por dominios:
 - **Auditoría completa**: `_record_audit()` escribe eventos con timestamp ISO, event_type (8 tipos: fact_added, fact_deleted, proposal_made, proposal_approved, proposal_rejected, proposal_edited, proposal_discarded, memory_consolidated, phi_blocked), contenido ofuscado (solo primeros 100 chars si es texto sensible), y metadatos adicionales. `get_audit_log()` soporta paginación por limit y filtro por event_type.
 - **Consolidación automática**: `consolidate_memory(force=False)` se dispara cuando `count_facts() >= 50` (threshold configurable) O cada 90 días (TTL). `add_fact()` auto-asigna `expires_at` (90 días vía `_now_plus_days`) si no se proporciona. `_build_summary()` genera resumen determinista agrupando facts por categoría. `_purge_expired()` elimina facts con `expires_at < now`. El resumen se escribe como nuevo fact con categoría `consolidated_summary`. Los facts originales se mantienen pero se marcan como consolidados.
 - **6 principios de diseño** (documentados en `__init__.py`): (1) PHI nunca se almacena ni se propone, (2) Toda decisión de memoria se audita, (3) Memoria nunca se escribe sin confirmación explícita del usuario, (4) Nunca se asume aprobación por silencio o ambigüedad, (5) Máximo una propuesta pendiente a la vez, (6) PHI se valida dos veces: antes de proponer y antes de escribir.
+
+### 60) Patrón RFP Pipeline — Configuración LLM unificada vía 4Geeks AI
+- **Problema original**: OpenAI() buscaba OPENAI_API_KEY por defecto. El proyecto usa API_KEY/HOST de 4Geeks AI (endpoint OpenAI-compatible). El pipeline RFP crasheaba si no había OPENAI_API_KEY, incluso cuando las reglas ya clasificaban el documento.
+- **Solución**: Cada módulo que usa LLM (classifier.py, workers.py) lee `API_KEY` + `HOST` del `.env` y los pasa explícitamente a `OpenAI(api_key=..., base_url=...)`. Variables de entorno: `RFP_CLASSIFIER_MODEL`, `RFP_WORKER_MODEL`.
+- **Early return pattern**: El clasificador ejecuta primero las reglas. Si determinan YES-RFP con `confidence="high"`, retorna inmediatamente (con intento opcional de enriquecimiento LLM en try/except). Esto hace que el pipeline funcione **sin LLM** para todos los casos cubiertos por reglas.
+- **Modelos disponibles**: 5 modelos OpenAI-compatibles en 4Geeks AI — deepseek-v4-flash (generación + RFP), pplx-embed-v1-0.6b (embeddings), mimo-v2.5 (chat), gpt-6-luna (chat), glm-5.3-flash (chat).
+
+### 61) Patrón RFP Pipeline — Rule expansion por auditoría real
+- **Problema**: Los PDFs de muestra revelaron patrones que las reglas originales no cubrían: (1) EHR vendor pitch ("our platform was built for", "unified ehr") — falso positivo como RFP, (2) Referral partnership informal ("referral partnership", "student health") — falso negativo como NO-RFP.
+- **Solución**: Auditoría con PDFs reales → expansión de reglas. Los patrones se añaden como regex en `_YES_RFP_PATTERNS` y `_NO_RFP_PATTERNS`. Cada nuevo patrón incluye su `reason` en español para trazabilidad.
+- **Verificación**: Después de añadir cada patrón, se ejecuta `_rule_based_classification()` contra el documento real para confirmar el resultado esperado. Luego se ejecuta el pipeline completo y se verifica el estado final en la API.

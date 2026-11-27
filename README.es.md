@@ -31,6 +31,7 @@
 | 13 | **Agente LangGraph — Tools Externas** — Añadidas herramientas de consulta en tiempo real a incidencias e inventario. Enrutamiento automático entre RAG, tools o ambos mediante clasificación regex (sin LLM). Timeout 5s, fallback honesto. 32 tests. | LangGraph, httpx, regex | ✅ Completado |
 | 14 | **Servidor MCP — Tools Protegidas con OAuth** — Servidor Model Context Protocol que expone Incidencias (5 tools) e Inventario (5 tools) como herramientas MCP, protegidas con OAuth 2.1 Resource Server vía mcpauth. Operaciones de escritura en inventario explícitamente rechazadas (RETO 2). Agente LangGraph integrado vía langchain-mcp-adapters. 9/9 criterios de aceptación. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Completado |
 | 15 | **Agente LangGraph — Memoria Persistente + Guardrails** — El agente aprende de la interacción sin acumular basura. Memoria TinyDB (separada de RAG), validación PHI dual (8 patrones HIPAA+UK GDPR), aprobación explícita del usuario requerida (nunca asumida), clasificador léxico (sin LLM), máximo una propuesta pendiente, trazabilidad completa (8 eventos), consolidación automática (threshold 50 facts, TTL 90 días). **Además**: 3 capas de guardrails deterministas (regex, sin LLM): hardening de system prompt (5 reglas), clasificación de entrada (6 categorías, ~100 patrones), validación de salida (PHI/filtración instrucciones/formato). Aislamiento de contenido RAG con marcadores. Integración en grafo con 2 nodos + observabilidad. 62 tests de guardrail + 94 tests agente/grafo = 286 total. 11/11 criterios de aceptación. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Completado |
+| 16 | **Pipeline RFP** — Pipeline completo multi-etapa para procesar RFPs desde carga de PDF hasta documento final aprobado. Ingesta de PDF (MarkItDown), métricas de legibilidad, clasificador de dos etapas (regex + DeepSeek-v4 LLM), orquestación multi-agente (orquestador→3 workers paralelos→sintetizador), generación de borradores por departamento con ciclo evaluador LLM (legibilidad, relevancia, cumplimiento), detección de conflictos (PHI, BAA/DPA, Capacity), arbitraje determinista, aprobación humana con checkpoints SQLite scoped por ticket, y síntesis de documento final. Pipeline LangGraph de 9 nodos. 21/21 tests E2E con LLM real. | FastAPI, Celery, LangGraph, SQLModel/PostgreSQL, DeepSeek-v4 | ✅ Completado |
 
 ---
 
@@ -55,20 +56,27 @@ services/                   # Servicios backend
 mcps/                       # Servidor MCP (puerto 9100) — FastMCP + OAuth 2.1
                             #   10 tools (incidencias + inventario) protegidas vía mcpauth
 
+agentic_workflows_part3/    # Parte 3: Pipeline LangGraph — aprobación humana, detección de
+                            #   conflictos, arbitraje, checkpointing, síntesis de documento final
+
 data/                       # Capa de datos
 ├── raw/                    #   Datos crudos (CSV)
 ├── process/                #   Datos procesados, bases TinyDB
-├── pipelines/              #   Pipeline RAG, pipeline ETL
+├── pipelines/              #   Pipeline RAG, pipeline RFP, pipeline ETL
+│   └── rfp_intake/         #   Pipeline RFP en LangGraph: converter, classifier, workers,
+│                           #     orquestador, ciclo Parte 2, grafo de 9 nodos
+├── checkpoints/            #   Bases de datos SQLite de checkpoint por ticket (Parte 3)
 ├── eval/                   #   Consultas de prueba, informes de evaluación
 └── migrations/             #   Migraciones SQL
 
 agents/                     # Plantillas de agentes y documentación de herramientas
-docs/                       # Arquitectura, diseño RAG, plan de telemetría
-scripts/                    # Herramientas CLI: pronóstico ventas, evaluación modelo, exportación nocturna, seed
-tests/                      # Suites de tests: pipelines, nightly, agente, RAG, evaluación
+docs/                       # Arquitectura, diseño RAG, plan de telemetría, auditoría de serialización
+scripts/                    # Herramientas CLI: pronóstico ventas, evaluación modelo, exportación nocturna,
+                            #   seed, test E2E, smoke test, reprocesamiento de tickets RFP
+tests/                      # Suites de tests: pipelines, nightly, agente, RAG, evaluación, RFP
 ```
 
-**Arquitectura backend:** La mayoría de las APIs usan TinyDB para auth y datos operativos. Inventario y reporting usan Supabase PostgreSQL. Un servidor auth standalone evita la incompatibilidad SQLModel/Python 3.14. El servidor MCP (`mcps/`) expone herramientas de incidencias e inventario mediante Model Context Protocol con protección OAuth 2.1.
+**Arquitectura backend:** La mayoría de las APIs usan TinyDB para auth y datos operativos. Inventario y reporting usan Supabase PostgreSQL. Un servidor auth standalone evita la incompatibilidad SQLModel/Python 3.14. El servidor MCP (`mcps/`) expone herramientas de incidencias e inventario mediante Model Context Protocol con protección OAuth 2.1. El **Pipeline RFP** (`data/pipelines/rfp_intake/`) usa LangGraph con 9 nodos en 3 etapas integradas (ingesta, generación de borradores, aprobación humana + síntesis), con checkpointing en SQLite (`data/checkpoints/`) y estado oficial persistido en PostgreSQL. El **módulo Parte 3** (`agentic_workflows_part3/`) maneja detección de conflictos, arbitraje, aprobación con interrupt y síntesis de documento final.
 
 **Docker:** Los servicios se comunican mediante Docker Compose bajo la red `healthcore-net`. Ver [`docker-compose.yml`](./docker-compose.yml).
 
@@ -203,6 +211,21 @@ Generación Aumentada por Recuperación sobre 4 documentos de políticas de Heal
 
 ---
 
+## 🗃️ Pipeline RFP — Detalles Clave
+
+Pipeline completo multi-etapa para procesar RFPs (Solicitudes de Propuesta) desde la carga de PDF hasta el documento final aprobado. Construido como un **pipeline LangGraph de 9 nodos** con tres etapas integradas: ingesta, generación de borradores y aprobación humana.
+
+**Flujo:** `Carga PDF → Clasificador de dos etapas (regex + LLM) → Orquestador → 3 workers paralelos (Revenue, Clinical, Compliance) → Sintetizador → Generación de borradores con ciclo evaluador LLM → Detección de conflictos → Arbitraje → Aprobación humana con checkpoints → Síntesis final`
+
+**Características principales:**
+- **Arquitectura asíncrona:** `POST /rfp/upload` → `202 Accepted` con UUID de ticket. Tarea Celery ejecuta el pipeline. El frontend consulta `GET /rfp/tickets/{ticket_id}`.
+- **LangGraph de 9 nodos** integrando ingesta, generación de borradores, ciclo generador-evaluador por departamento (3 evaluadores async en paralelo: legibilidad, relevancia, cumplimiento), detección de conflictos, aprobación humana con interrupt y checkpoints SQLite, y síntesis final.
+- **Ciclo de vida:** 11 estados desde `nuevo` → `terminado` (ver [`agentic-workflows.md`](./agentic-workflows.md) para detalles).
+- **Tests:** **21/21 tests E2E** con LLM real (DeepSeek v4 Flash via 4Geeks AI) cubriendo todas las etapas, persistencia en DB y casos borde.
+- **Documentación:** [`agentic-workflows.md`](./agentic-workflows.md) (diseño completo), [`data/pipelines/rfp_intake/`](./data/pipelines/rfp_intake/), [`agentic_workflows_part3/`](./agentic_workflows_part3/)
+
+---
+
 ## 📁 Documentación Clave
 
 | Archivo | Contenido |
@@ -216,6 +239,7 @@ Generación Aumentada por Recuperación sobre 4 documentos de políticas de Heal
 | [`docs/ARCHITECTURE_PROPOSAL.md`](./docs/ARCHITECTURE_PROPOSAL.md) | Propuesta de arquitectura general |
 | [`mcp-server.md`](./mcp-server.md) | Servidor MCP — tools protegidas con OAuth, arquitectura, configuración |
 | [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | Memoria Persistente del Agente LangGraph + Harness y Guardrails — arquitectura, hardening del system prompt, seguridad determinista de 3 capas, diagramas de flujo |
+| [`agentic-workflows.md`](./agentic-workflows.md) | Pipeline RFP (Hito 9, Partes 1+2+3) — diseño completo desde ingesta de PDF hasta generación de borradores, aprobación humana y síntesis de documento final |
 | [`memory-bank/`](./memory-bank/) | Progreso del desarrollo, contexto activo, patrones del sistema, decisiones técnicas |
 
 ---

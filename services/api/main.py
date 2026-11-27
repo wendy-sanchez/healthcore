@@ -23,6 +23,7 @@ from routes.rag import router as rag_router
 from routes.suppliers import router as suppliers_router
 from routes.tasks import router as tasks_router
 from routes.telemetry import router as telemetry_router
+from routes.rfp import router as rfp_router
 from routes.users import router as users_router
 from services.agent.routes import router as agent_router
 from services.celery_app import analyze_incidents_csv as celery_analyze_task
@@ -106,6 +107,7 @@ app.include_router(inventory_router)
 app.include_router(knowledge_router)
 app.include_router(rag_router)
 app.include_router(agent_router)
+app.include_router(rfp_router)
 app.include_router(telemetry_router)
 
 

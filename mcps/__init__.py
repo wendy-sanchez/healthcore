@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """HealthCore MCP (Model Context Protocol) server package.
 
 Expone las capacidades de los gestores de incidentes e inventario de

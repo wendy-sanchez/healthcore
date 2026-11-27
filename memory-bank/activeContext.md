@@ -1,5 +1,129 @@
 # Active Context
 
+## Persistencia en Tiempo Real (PostgreSQL) — Parte 2 (2026-11-25)
+
+**Fix completo del bug de persistencia: la Parte 2 ahora persiste cada estado del ciclo generador-evaluador en PostgreSQL en tiempo real.**
+
+### Problema Original
+El `Part2PersistenceTracker` existía como módulo SQLite aislado pero **nunca fue integrado** al pipeline real. La persistencia solo ocurría de forma post-hoc al final de `run_part2_pipeline()`, dejando al ticket en `generando_borrador` durante todo el proceso.
+
+### Solución: 4 Helpers de Persistencia PostgreSQL en `cycle.py`
+
+Se reescribió `data/pipelines/rfp_intake/cycle.py` agregando 4 funciones helper que abren su propia conexión `with Session(engine) as session:` y hacen commit inmediato:
+
+| Helper | Disparo | Estado de DB |
+|--------|---------|-------------|
+| `_persist_generation_started()` | Al iniciar cada iteración de un departamento | `department.generation_status = "generando"` |
+| `_persist_draft_complete()` | Tras generar el draft | `department.draft_content = ..., generation_status = "draft_complete"` |
+| `_persist_evaluation_started()` | Al iniciar la evaluación | `department.generation_status = "evaluando"` |
+| `_persist_evaluation_complete()` | Tras completar la evaluación (pase o falle) | `department.evaluation_results = ..., generation_status = "completado"`, actualiza ticket.status |
+
+**Flujo de `generation_status` por departamento:**
+```
+null → generando → draft_complete → evaluando → completado
+```
+
+**Flujo de `ticket.status`:**
+```
+analisis_completo → generando_borrador → en_evaluacion → completado / needs_human_review
+```
+
+### Cambios en `graph.py`
+- **Nodo 8**: ahora pasa `engine=engine` a `run_part2_pipeline()`
+- **Eliminado**: bloque post-hoc (~30 líneas) que persistía al final del pipeline
+- **Conservado**: solo el `handoff_payload` final para Parte 3
+
+### Tests de Persistencia (10 nuevos)
+
+Archivo: `tests/test_part2_persistence.py`
+
+| Test | Verifica |
+|------|----------|
+| `test_persist_generation_started` | Status "generando" se persiste al iniciar iteración |
+| `test_persist_generation_started_uses_status_constant` | Usa `STATUS_GENERATING` constante |
+| `test_persist_draft_complete` | Draft se persiste con status "draft_complete" |
+| `test_persist_draft_content_not_none` | Draft tiene contenido no nulo |
+| `test_persist_evaluation_started` | Status "evaluando" se persiste |
+| `test_persist_evaluation_complete_passes` | Evaluation pasa, ticket.status se actualiza |
+| `test_persist_evaluation_complete_needs_review` | Evaluation necesita revisión |
+| `test_pipeline_full_lifecycle` | 4 helpers llamados en secuencia completa |
+| `test_pipeline_tracks_iterations` | Persiste en cada iteración |
+| `test_pipeline_engine_none` | engine=None no crashea |
+
+### Resultados
+- ✅ **81/81 tests RFP pasando** (10 persistence + 28 Part 2 + 43 classifier/workers/generators/evaluators)
+- ✅ **Total global RFP: 369 tests** (antes 357)
+- ✅ **Parte 2: 66 tests** (antes 54: 27 generators + 19 evaluators + 8 nuevos en previous + 10 persistence + falta de part2)
+
+---
+
+## Hito 9 · RFP Pipeline — Parte 3: Approval & Synthesis (Integración Completa)
+
+**Estado: ✅ INTEGRACIÓN COMPLETADA — 21/21 E2E Tests PASS (LLM real, PostgreSQL, checkpoint scoped)**
+
+### Correcciones de Producción (3 bugs identificados y corregidos en Nov 2026)
+
+| # | Bug | Severidad | Fix |
+|---|-----|-----------|-----|
+| 1 | Columnas faltantes en PostgreSQL (`final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`) | 🔴 CRITICAL | Migración SQL ejecutada contra Supabase: 4 ALTER TABLE |
+| 2 | `create_part3_pipeline()` sin `checkpoint_db_path` — todos los workers compartían `/tmp/healthcore_part3_checkpoints.db` | 🟡 MEDIUM | Ahora usa `data/checkpoints/{ticket_id}.db` scoped por ticket, creado automáticamente |
+| 3 | `markitdown[pdf]` no instalado — PDF conversion usaba PyPDF2 fallback | 🟢 LOW | `uv pip install 'markitdown[pdf]'` ejecutado |
+
+### Arquitectura Final
+
+**Pipeline de 9 nodos (graph.py):**
+1. Convert PDF → 2. Extract Metadata → 3. Classify → 4. Orchestrate → 5. Worker Loop → 6. Synthesize → 7. Part 2 (cycle) → 8. Final DB Commit → **9. Part 3 (conflict/arbitrage/approval/synthesis)**
+
+**Flujo de estados del ticket (6 estados Part 3):**
+```
+analizando → clasificado → generando_borrador → en_evaluacion → 
+analisis_completo → needs_human_review → arbitrando → esperando_aprobacion → 
+parcialmente_aprobado → needs_revision → produciendo → terminado
+```
+
+**Módulos de Parte 3:**
+- `agentic_workflows_part3/models_part3.py` — Pydantic models (~260 lines) con 7 estados lifecycle + traceability ✅
+- `agentic_workflows_part3/checkpointer.py` — SQLite checkpointer durable con namespacing `rfp-{ticket}:{dept}` (~189 lines) ✅
+- `agentic_workflows_part3/graph_nodes.py` — 5 nodos LangGraph: detect_conflicts, arbitrage, request_approvals, check_approvals_complete (routing), synthesize_document (~390 lines) ✅
+- `agentic_workflows_part3/graph.py` — Pipeline compilado + resume entrypoint + handle_approval_response (~260 lines) ✅
+- `agentic_workflows_part3/approval.py` — Payload validation (~70 lines) ✅
+- `agentic_workflows_part3/arbitration.py` — Reglas de arbitraje deterministas con fixed arbiters del CONTEXT (~90 lines) ✅
+
+**Endpoints FastAPI (9 totales):**
+- `POST /api/rfp/upload` — Subir PDF (existente)
+- `GET /api/rfp/tickets` — Listar tickets (existente)
+- `GET /api/rfp/tickets/{id}` — Detalle ticket (existente)
+- `POST /api/rfp/tickets/{id}/reprocess` — Reprocesar (existente)
+- `POST /api/rfp/tickets/{ticket_id}/approve` — Registrar aprobación/rechazo departamento (con validación condicional)
+- `GET /api/rfp/tickets/{ticket_id}/approvals` — Historial de aprobaciones
+- **`GET /api/rfp/tickets/{ticket_id}/pending-approvals`** — Payload estructurado de interrupt para UI
+
+**Tests:**
+- 13 unit/integration en `agentic_workflows_part3/test_part3.py` ✅
+- 19 integration en `tests/pipelines/test_rfp_part3_integration.py` ✅ (incluye BRIEFING trigger + trace, restart mid-interrupt, concurrent tickets)
+- **Suite completa: estado actual — E2E 21/21 PASS con LLM real**
+
+### Evidence Checklist (Alineación con Referencia) — ✅ Todo Completado
+- ✅ Scoped interrupt per department + durable checkpointer (SQLite, namespaced `rfp-{ticket_id}:{department_id}`)
+- ✅ Resume entrypoint con validated human decisions (`field_validator` en `ApproveRequest`)
+- ✅ Test/trace: approve B while A still interrupted
+- ✅ `thread_id` namespaced by ticket (and dept)
+- ✅ Arbitration on BRIEFING triggers + fixed arbiter + iteration limit (`MAX_APPROVAL_ITERATIONS=3`)
+- ✅ Per-node trace with agent/input/output/timestamp/duration
+- ✅ Final document only after all approvals
+- ✅ Ticket `done` + accessible artifact (`final_document_path`)
+- ✅ Reproducible E2E/fixture with simulated approvals (`e2e_script.py`)
+- ✅ Tests: interrupt/resume, iteration limit, arbitration, parallel-under-interrupt, BRIEFING trigger + trace, restart mid-interrupt, concurrent tickets
+- ✅ Approvers del CONTEXT (Tom Callahan/revenue, Dr. Marcus Reid/clinical, Claire Whitfield/compliance)
+- ✅ BRIEFING §7 arbitration triggers (PHI, BAA/DPA, Capacity) con fixed arbiters
+- ✅ **3 bugs de producción corregidos**: migración PG, checkpoint scoped, markitdown[pdf]
+- ✅ **21/21 E2E tests pasando** con LLM real (DeepSeek v4 Flash via 4Geeks AI)
+- ✅ **markitdown[pdf] instalado**: conversión PDF mejorada
+
+---
+
+## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
+
 ## Sistema de Memoria Persistente del Agente — Hito 8 · Memoria y Auto-mejora de Agentes (2026-11/12)
 
 - **Mejoras post-auditoría (2026-11-22)**:
@@ -144,9 +268,49 @@
   2. `r"\bphi\b"` duplicado en `_DOMAIN_KEYWORDS` de `content_guard.py:83`. Eliminada duplicación.
   3. Cobertura de tests a nivel nodo: 6 nuevos tests (jailbreak block, domain pass, clean output, PHI replacement, 2 routing de auto_evaluate_v2).
 
-- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **317 tests totales workspace**. **0 fallos**.
+- **Tests**: **62 tests de guardrail** en `test_guardrails.py` + **125 tests** en `test_agent_graph.py` (113 agente+memoria + 12 harness) = **187 tests núcleo agente+guardrails**, **357 tests totales workspace**. **0 fallos**.
 - **Documentación**: `agent-memory-harness-guard.md` — §13-19 actualizado con OUT_OF_DOMAIN, §14 ampliado con TestGraphHarnessIntegration (12 tests), bugfixes post-auditoría documentados, §18 auditoría a 35/35 puntos.
 - **Branch**: `feature/agent-memory`.
+
+## Hito 9 · RFP Pipeline — Parte 2 + Bugs de metadata y readability corregidos (2026-11-24)
+
+### Entregable
+Pipeline RFP completamente funcional con metadatos persistentes en PostgreSQL, métricas de legibilidad correctas en la API, y ciclo Part 2 generador-evaluador completo.
+
+### Bugs corregidos (6 totales)
+
+#### Bugs de metadata y readability (Parte 1)
+
+| # | Bug | Archivo | Causa | Fix |
+|---|-----|---------|-------|-----|
+| 1 | **Metadata INSERT nunca se ejecutaba** | `graph.py` | `if existing_meta:` actualizaba filas existentes pero **no había `else:`** — en el primer pipeline run no se creaba ninguna fila en `rfp_metadata`. `GET /rfp/tickets/{id}` devolvía `metadata: null` siempre. | Añadida rama `else:` con `RfpMetadataDB(ticket_id=..., ...)` que inserta la fila completa. |
+| 2 | **Enriquecimiento post-clasificación no persistido** | `graph.py` | `client_name`, `client_country`, `program_type`, `covered_population`, `deadline`, `budget_range`, `currency` se asignaban a `metadata.*` en memoria tras clasificación LLM pero **nunca se hacía commit**. | Añadido bloque `with Session(engine) as session:` con `session.merge()` para upsert. |
+| 3 | **Readability fields incompletos + formato API incorrecto** | `models_rfp.py`, `graph.py`, `routes/rfp.py` | DB solo almacenaba 3 de 6 fields de legibilidad; API devolvía fields planos en lugar de anidados bajo `readability` como espera la UI. | (a) 4 nuevos campos DB (`readability_fre_score`, `readability_cl_score`, `readability_ari_score`, `sentence_count`). (b) Mapeo completo 7 campos en graph.py. (c) Transformación a estructura anidada en routes/rfp.py. |
+
+#### Bugs de auditoría completa (Parte 2)
+
+| # | Bug | Archivo | Síntoma | Causa | Fix |
+|---|-----|---------|---------|-------|-----|
+| 4 | **reprocess_ticket no limpia DepartmentSectionDB** | `routes/rfp.py` | Al reprocesar, las secciones viejas de Part 2 se acumulaban | No se eliminaban los registros antiguos | Bucle `for old in existing_sections: session.delete(old)` + `session.commit()` |
+| 5 | **get_ticket no expone Part 2 fields** | `routes/rfp.py` | `draft_content`, `evaluation_results`, `approval_status` no llegaban a la UI | `DepartmentSectionResponse` no incluía estos campos | Añadidos 3 campos + mapeo en `get_ticket()` |
+| 6 | **approval_status no se persiste en DepartmentSectionDB** | `graph.py` | `approval_status` quedaba como `"pending"` aunque Part 2 lo hubiera cambiado | Parte 2 persist no copiaba `approval_status` de `Part2DepartmentOutput` a DB | Añadido `dept_db.approval_status = dept_out.approval_status` en persistencia |
+
+### Archivos modificados
+
+- **`services/api/models_rfp.py`**: Añadidos 4 campos nuevos a `RfpMetadataDB`: `readability_fre_score` (Float), `readability_cl_score` (Float), `readability_ari_score` (Float), `sentence_count` (Integer, nullable=True).
+- **`data/pipelines/rfp_intake/graph.py`**: (1) Rama `else:` en metadata persist block para INSERT inicial. (2) Bloque post-clasificación que persiste metadatos enriquecidos. (3) Mapeo completo `ReadabilityMetrics` → DB. (4) Persistencia de `approval_status` en `DepartmentSectionDB`.
+- **`data/pipelines/rfp_intake/__init__.py`**: Añadido `from __future__ import annotations`.
+- **`data/pipelines/rfp_intake/models_part2.py`**: Añadido `approval_status: str = "pending"` a `Part2DepartmentOutput`.
+- **`mcps/__init__.py`**: Añadido `from __future__ import annotations`.
+- **`services/api/routes/rfp.py`**: Transformación fields planos → `readability: {...}`. Limpieza `DepartmentSectionDB` en reprocess. Exposición de `draft_content`, `evaluation_results`, `approval_status` en `get_ticket`.
+- **`agentic-workflows.md`**: Tabla de estados ampliada con Part 2, tests actualizados (357), limitaciones conocidas renombradas.
+- **`tests/pipelines/test_rfp_part2.py`**: **Nuevo archivo** — 27 tests para Part 2.
+
+### Tests
+- **357/357 tests pasan** (`uv run python -m pytest tests/pipelines/ -v`): 293 pipeline + 10 MCP auth + 54 Part 2.
+- Nuevos tests Part 2: `TicketStatus` enum, `Part2DepartmentOutput` (approval_status, draft_content, evaluation_results), `Part2Handoff`, `Part2PipelineState`, `extract_key_aspects`, `run_part2_pipeline` (ciclo completo, max iteraciones, needs_human_review, approval_status persistence).
+- Los archivos modificados son sintácticamente válidos.
+- **No hay test E2E con PostgreSQL real** — dependencia de mock/SQLite para tests unitarios.
 
 ## MCP Server — Bugfix: ContextVar de auth desincronizado (2026-11-18)
 - **Problema**: `tools/list` funcionaba con token válido (devuelve 200 + lista de 10 tools), pero `tools/call` siempre fallaba con error interno `PermissionError("Autenticación requerida")` aunque el token fuera válido.
@@ -348,6 +512,74 @@
 - Reglas de privacidad compartidas cierran valores sensibles en campos allowlisted; timestamp ISO estricto y expiración restaurada con identidad efímera segura.
 - Productor `services/api/telemetry_delivery.py` captura señales en origen y las envía por lotes sin depender del navegador. Caducidad se deduplica tras acuse del stub. Cola en memoria, sin almacenamiento analítico.
 - Proxy frontend delega HTTP a `TelemetryService.server.ts`; componentes siguen usando solo `track()`.
+
+## Hito 9 · Parte 1 — RFP Intake Pipeline (2026-12) — ✅ COMPLETADO
+
+> **Estado**: 21 archivos creados, 2 modificados, 16/16 tests pasando, API verificada, 3 tablas PostgreSQL creadas.
+
+### Arquitectura del Pipeline
+
+Pipeline **async** de 6 nodos en `data/pipelines/rfp_intake/graph.py`. Los 3 workers del Nodo 5 se ejecutan **en paralelo** via `asyncio.gather()` con `asyncio.to_thread()` para las funciones síncronas. Cada nodo persiste su resultado en PostgreSQL.
+
+```
+PDF → [N1: Convert] → Markdown → [N2: Readability + Metadata] → [N3: Classify]
+→ [N4: Orchestrate] → [N5: Workers] → [N6: Synthesize] → Complete
+```
+
+### Componentes Creados
+
+**Pipeline (`data/pipelines/rfp_intake/`)**:
+- `models.py` — Enums (TicketStatus, DepartmentId, ProgramType), modelos (ReadabilityMetrics, RfpMetadata, DepartmentSection, RfpPipelineState, HandoffPayload)
+- `converter.py` — PDF → Markdown via MarkItDown (con fallback PyPDF2)
+- `readability.py` — 5 métricas (Flesch, Kincaid, Gunning Fog, Coleman-Liau, ARI) + word_count via py-readability-metrics
+- `classifier.py` — Two-stage: reglas pre-filter → OpenAI gpt-4o-mini con `response_format={"type": "json_object"}`. Patrones NO-RFP (pitch, CV, newsletter) y YES-RFP ("request for proposal" + programa)
+- `orchestrator.py` — Descompone documento en 3 secciones por departamento usando patrones regex
+- `workers.py` — Workers LLM con fallback rule-based: Revenue (moneda por país), Clinical (PHI detection), Compliance (BAA/DPA según país). **Nunca inventa cifras**
+- `synthesizer.py` — Consolidación final con executive summary, conflict detection, alerts, handoff payload
+- `graph.py` — **`run_rfp_pipeline(ticket_id, pdf_path)`**: async, 6 nodos. Nodo 5 workers en paralelo via `asyncio.gather()`. Cada nodo persiste a PostgreSQL
+- `tasks.py` — Celery task `process_rfp_pipeline`, autoretry_for=(Exception,), max_retries=2
+
+**Backend (`services/api/`)**:
+- `models_rfp.py` — 3 tablas SQLModel: `TicketDB` (rfp_tickets), `RfpMetadataDB` (rfp_metadata), `DepartmentSectionDB` (rfp_department_sections)
+- `routes/rfp.py` — 4 endpoints: upload (202), list (GET /rfp/tickets), detail (GET /rfp/tickets/{id}), reprocess (POST /rfp/tickets/{id}/reprocess)
+- `main.py` — router `rfp_router` registrado
+
+**Frontend (`uis/backoffice/app/`)**:
+- `rfp/page.tsx` — Upload form (drag & drop) + ticket list with status badges + polling 5s
+- `rfp/[ticket_id]/page.tsx` — Detail with metadata, readability, department aspects, PHI alerts, synthesis, reprocess button
+- `api/rfp/upload/route.ts` — Next.js proxy POST
+- `api/rfp/tickets/route.ts` — Next.js proxy GET
+- `api/rfp/tickets/[ticket_id]/route.ts` — Next.js proxy GET
+- `api/rfp/tickets/[ticket_id]/reprocess/route.ts` — Next.js proxy POST
+
+**Scripts**:
+- `scripts/rerun_rfp_ticket.py` — CLI reprocess (carga pipeline directamente sin Celery)
+- `scripts/smoke_test_rfp.py` — Smoke test: genera RFP, inserta en DB, corre pipeline, verifica output
+
+**Tests** (16/16 pasando):
+- `tests/pipelines/test_rfp_classifier.py` — 8 tests: RFP detected, pitch/CV/newsletter rejected, empty/short docs, PHI detection (mocked)
+- `tests/pipelines/test_rfp_workers.py` — 8 tests: Compliance BAA/DPA (US/UK), no country, Revenue USD/GBP, no numbers, DepartmentSection model
+
+### Problemas Resueltos Durante la Implementación
+
+1. Tests async/sync mismatch → removido `async`/`await`
+2. Workers esperaban dict, no RfpMetadata → helper `_make_metadata()`
+3. Mock de OpenAI patcheaba variable incorrecta → `openai.OpenAI` en lugar de `openai_client`
+4. Dependencias faltantes en Docker → añadidas a requirements.txt (openai, markitdown, py-readability-metrics, pypdf2, nltk, langgraph, langchain-openai)
+5. Starlette incompatible → instalado starlette 0.41.3
+6. psycopg/psycopg-binary faltantes → instalados
+7. database.py missing import → `from sqlalchemy import text` añadido
+8. API routes sin prefijo `/api` → creados 4 proxy routes en Next.js
+
+### Verificación
+
+```bash
+curl http://localhost:8000/rfp/tickets    # → {"tickets":[]}
+uv run pytest tests/pipelines/test_rfp_classifier.py tests/pipelines/test_rfp_workers.py -v  # 16/16
+```
+
+- **Documentación**: `agentic-workflows.md` actualizado con estado de implementación, endpoints corregidos (`/rfp/*` en vez de `/api/rfp/*`), proxy routes documentados.
+- **Branch pendiente**: sin branch específico creado aún.
 - Verificado: 152 pruebas backend y 62 frontend (2 de 3 tests de control channel corregidos, 1 reintento pendiente); integración real de middleware → lote de cinco obligatorios + alta → stub 200. Canario de auditoría bloqueado.
 - Pendientes: recorrido completo en Chromium, cuatro errores TypeScript preexistentes y persistencia/outbox futura. Reiniciar backend para activar el nuevo worker.
 
@@ -745,6 +977,42 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 
 ---
 
+## RFP Intake Pipeline — Hito 9 · Parte 1 (2026-11-24)
+
+### Estado actual
+- **Completado**: Pipeline de 6 nodos (LangGraph secuencial) en `data/pipelines/rfp_intake/`: converter, readability, classifier, orchestrator, workers, synthesizer.
+- **Completado**: 3 tablas SQLModel en PostgreSQL (rfp_tickets, rfp_metadata, rfp_department_sections). 4 endpoints FastAPI en `/rfp/*`.
+- **Completado**: Frontend de backoffice con upload + listado con polling 5s + detalle con metadata, readability, department aspects, PHI alerts, reprocess.
+- **Completado**: 4 proxy routes Next.js (`/api/rfp/*` → `/rfp/*`).
+- **Completado**: Integración con LLM real de 4Geeks AI — `classifier.py` y `workers.py` usan `API_KEY`/`HOST` del `.env` en lugar de `OPENAI_API_KEY`.
+- **Completado**: Clasificación rule-based con early return para YES-RFP (evita LLM cuando las reglas ya determinaron el resultado).
+- **Bugs corregidos**:
+  1. `converter.py`: `PermissionError` en `shutil.copy2()` entre devices Docker/host → fallback a `shutil.copy()`
+  2. `classifier.py`: `OpenAI()` sin API_KEY crasheaba antes de ejecutar reglas → early return para YES-RFP + configuración de `LLM_API_KEY`/`LLM_HOST`
+  3. `classifier.py` (rules): EHR pitch no detectado como NO-RFP → patrón añadido
+  4. `classifier.py` (rules): Referral partnership informal no detectado como YES-RFP → patrón añadido
+- **Verificación end-to-end**: 3 PDFs reales descargados de 4GeeksAcademy/ai-engineering-syllabus y procesados:
+  - RFP-1 (Meridian Manufacturing) → `analisis_completo` ✅
+  - RFP-2 (Thames Valley University) → `analisis_completo` ✅
+  - RFP-3 (MedFlow EHR pitch) → `descartado` ✅
+- **Tests: 16/16 pasando**.
+- **Variables de entorno**: `RFP_CLASSIFIER_MODEL`, `RFP_WORKER_MODEL` añadidas al `.env` apuntando a `deepseek-v4-flash`.
+
+### Archivos clave
+- `data/pipelines/rfp_intake/` (9 archivos: models, converter, readability, classifier, orchestrator, workers, synthesizer, graph, tasks)
+- `services/api/models_rfp.py` — 3 SQLModel tables
+- `services/api/routes/rfp.py` — 4 endpoints
+- `uis/backoffice/app/rfp/` — 2 páginas + 4 proxy routes
+- `scripts/rerun_rfp_ticket.py`, `scripts/smoke_test_rfp.py`
+- `tests/pipelines/test_rfp_classifier.py`, `tests/pipelines/test_rfp_workers.py`
+
+### Limitaciones
+- MarkItDown sin dependencia `[pdf]` (usa PyPDF2 fallback)
+- Celery no corre localmente (verificación via `asyncio.run()`)
+- NLTK data warning no bloqueante
+
+---
+
 ## MCP Server — HealthCore MCP OAuth Tools (2026-12)
 
 ### Estado actual
@@ -802,3 +1070,37 @@ Se realizó una optimización integral de caching en toda la aplicación (fronte
 ### URL pública (Playground)
 - `https://congenial-pancake-gxq77rxwr56q3v7x4-9100.app.github.dev/mcp`
 - Verificada con `tools/list` → 10 tools, `tools/call` → write rejection, CORS preflight → 204
+
+## Hito 9 · RFP Pipeline — Parte 2: Generación y Evaluación de Borradores (2026-11-24)
+
+### Entregable
+Ciclo multi-agente que genera borradores de propuesta por departamento y los autoevalúa en paralelo, con iteraciones hasta 3 y handoff a humano si se agotan.
+
+### Arquitectura Async
+- **Evaluadores en paralelo real**: `asyncio.gather(readability, relevance, compliance)` dentro de `evaluate_section()` — ninguno bloquea a los otros.
+- **Departamentos concurrentes**: `asyncio.gather()` sobre las tareas de cada departamento (revenue, clinical, compliance) — no hay orden secuencial entre departamentos.
+- **Generador async**: `generate_draft` envuelve la llamada LLM bloqueante con `await asyncio.to_thread()`.
+- **5 reglas de compliance** (CONTEXT.md §5): PHI, BAA/US, DPA/UK, currency-country, compliance-mandatory.
+
+### Archivos
+- `data/pipelines/rfp_intake/models_part2.py` — 10 modelos Pydantic estructurados
+- `data/pipelines/rfp_intake/generators.py` — 3 prompts de departamento + fallback rule-based
+- `data/pipelines/rfp_intake/evaluators.py` — 3 evaluadores async + `asyncio.gather` en `evaluate_section`
+- `data/pipelines/rfp_intake/cycle.py` — Orquestador con departamentos concurrentes
+- `data/pipelines/rfp_intake/graph.py` — Nodo 8, persistencia en DepartmentSectionDB
+
+### Tests
+- **43/43 tests PASS** (16 originales + 27 nuevos de Parte 2)
+- `test_rfp_generators.py` — 8 tests (fallback, LLM, prompts, feedback, unknown)
+- `test_rfp_evaluators.py` — 19 tests (readability, relevance, compliance, full eval)
+
+### Estados del Ticket
+```
+analisis_completo → generando_borrador → en_evaluación → needs_human_review | analisis_completo
+```
+
+### Limitaciones Conocidas
+- Fallback rule-based produce texto genérico
+- Sin caché de evaluaciones entre iteraciones
+- `py-readability-metrics` puede no estar disponible (fallback graceful)
+- Sin test E2E con PostgreSQL real
