@@ -3,7 +3,7 @@
 > **Parte 1 + Parte 2** del Hito 9 — Flujos de Trabajo Agénticos.
 > Sistema de recepción, clasificación y descomposición de RFPs mediante un pipeline multi-agente, con ciclo generador-evaluador de borradores por departamento.
 >
-> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, 357/357 tests pasando (320 pipeline + 10 MCP auth + 27 Part 2), API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end, metadata persistence, readability metrics, y ciclo Part 2 generador-evaluador corregidos y auditados.
+> **Estado: ✅ COMPLETADO** — Todos los componentes implementados, API verificada en `/rfp/tickets`, LLM real conectado vía 4Geeks AI, 3 PDFs de muestra verificados end-to-end. Persistencia en tiempo real de Part 2 implementada en PostgreSQL (no SQLite), con 4 puntos de persistencia por departamento y tests verificando el flujo completo.
 
 ---
 
@@ -565,11 +565,53 @@ class Part2Handoff(BaseModel):
 
 ### Estados del Ticket (Parte 2)
 
-| Estado | Descripción | Transición desde |
+| Estado | Descripcion | Transicion desde |
 |--------|-------------|------------------|
 | `generando_borrador` | Generadores escribiendo secciones | `analisis_completo` |
-| `en_evaluación` | Evaluadores en paralelo mediante `asyncio.gather()` / ciclo generador-evaluador | `generando_borrador` |
-| `needs_human_review` | Límite de iteraciones agotado; último borrador + EvaluationResult pasan a Parte 3 | `en_evaluación` |
+| `en_evaluacion` | Evaluadores en paralelo mediante `asyncio.gather()` / ciclo generador-evaluador | `generando_borrador` |
+| `needs_human_review` | Limite de iteraciones agotado; ultimo borrador + EvaluationResult pasan a Parte 3 | `en_evaluacion` |
+
+### Persistencia en Tiempo Real (PostgreSQL)
+
+Cada departamento persiste su progreso **inmediatamente** en PostgreSQL (mismo engine SQLModel que el resto del pipeline) ANTES de continuar con la siguiente fase. Esto asegura que cualquier consulta concurrente al ticket vea el progreso en tiempo real.
+
+**Flujo de generation_status por departamento:**
+
+```
+null -> generando -> draft_complete -> evaluando -> completado
+        |                |                |              |
+        |                |                |              +-- persistir evaluation_results + status=completado
+        |                |                +-- ticket.status = en_evaluacion
+        |                +-- persistir draft_content + status=draft_complete
+        +-- ticket.status = generando_borrador + incrementar iteration
+```
+
+**4 puntos de persistencia en `data/pipelines/rfp_intake/cycle.py`:**
+
+| Funcion | Cuando se llama | Que persiste |
+|---------|----------------|--------------|
+| `_persist_generation_started()` | ANTES de `generate_draft()` | `generation_status="generando"`, `generation_iteration=N`, ticket `GENERANDO_BORRADOR` |
+| `_persist_draft_complete()` | DESPUES de `generate_draft()`, ANTES de `evaluate_section()` | `draft_content`, `generation_status="draft_complete"` |
+| `_persist_evaluation_started()` | ANTES de `evaluate_section()` | `generation_status="evaluando"`, ticket `EN_EVALUACION` |
+| `_persist_evaluation_complete()` | DESPUES de `evaluate_section()` | `evaluation_results` (diccionario), `generation_status="completado"` |
+
+**Arquitectura:**
+
+```python
+# Cada funcion abre su propia transaccion:
+with Session(engine) as session:
+    dept_db = session.exec(select(...)).first()
+    if dept_db:
+        dept_db.generation_status = "generando"  # o "draft_complete", etc.
+        session.add(dept_db)
+    session.commit()  # INMEDIATO - visible a otros lectores
+```
+
+**Cambios en `data/pipelines/rfp_intake/graph.py`:**
+
+El Nodo 8 ahora pasa `engine=engine` a `run_part2_pipeline()`. El bloque post-hoc de persistencia (que antes seteaba `EN_EVALUACION`, persistia drafts/evaluations, y actualizaba `generation_status="completado"` al final) fue eliminado porque `cycle.py` ya lo hace en tiempo real. Solo se conserva la actualizacion final del `handoff_payload`.
+
+**Tests de persistencia:** `tests/test_part2_persistence.py` (12 tests) - usa `unittest.mock` para simular el engine SQLModel y verificar que cada llamada persiste los estados correctos.
 
 ### Tests
 
@@ -577,9 +619,10 @@ class Part2Handoff(BaseModel):
 |---------|-------|-----------|
 | `tests/pipelines/test_rfp_generators.py` | 8 | Fallback por departamento, LLM fallback, prompts, feedback, departamento desconocido |
 | `tests/pipelines/test_rfp_evaluators.py` | 19 | Readability (corto/largo), Relevance (cliente ausente/aspectos faltantes), Compliance (PHI, BAA, DPA, currency, mandatory), evaluación completa |
-| `tests/pipelines/test_rfp_part2.py` | 27 | `TicketStatus` enum, `Part2DepartmentOutput` (approval_status, draft_content, evaluation_results), `Part2Handoff`, `Part2PipelineState`, `extract_key_aspects`, `run_part2_pipeline` (ciclo completo, max iteraciones, needs_human_review, approval_status persistence) |
+| `tests/pipelines/test_rfp_part2.py` | 27 | `TicketStatus` enum, `Part2DepartmentOutput`, `Part2Handoff`, `Part2PipelineState`, `extract_key_aspects`, `run_part2_pipeline` (ciclo completo, max iteraciones, needs_human_review) |
+| `tests/test_part2_persistence.py` | 12 | Persistencia PostgreSQL: `_persist_generation_started`, `_persist_draft_complete`, `_persist_evaluation_started`, `_persist_evaluation_complete`, ciclo completo por departamento, casos borde (engine=None, iteraciones multiples) |
 
-**Total Parte 2: 54 tests** (8 + 19 + 27).
+**Total Parte 2: 66 tests** (8 + 19 + 27 + 12 persistence).
 **Total global RFP: 357 tests** (320 pipeline + 10 MCP auth + 27 Part 2).
 
 **Caso de compliance anclado a CONTEXT.md (§5):** `test_baa_missing_for_us_fails` verifica que un borrador para cliente US sin cláusula BAA dispara la regla `baa-us` con violación explícita.
@@ -619,7 +662,7 @@ needs_human_review → (detect_conflicts) → (arbitrage) → (request_approvals
 
 **Estado de Tests:** 13/13 ✅ PASS (conflict detection, arbitrage, checkpointing, parallel approvals, synthesis)
 
-### Respuestas a Preguntas de Diseño (Parte 3)
+### Preguntas de Diseño (Parte 3)
 
 #### 1. ¿Qué pasa si un departamento rechaza su sección después de la interrupción? ¿El flujo vuelve al generador de la Parte 2 o requiere una nueva ejecución?
 

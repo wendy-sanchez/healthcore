@@ -319,39 +319,13 @@ async def run_rfp_pipeline(ticket_id: str, pdf_path: str | None = None) -> dict[
                 session.add(ticket)
             session.commit()
 
-        part2_handoff = await run_part2_pipeline(handoff, max_iterations=3)
-
-        # Transición: GENERANDO_BORRADOR → EN_EVALUACION (ciclo internamente)
-        # El estado EN_EVALUACION refleja que el ciclo generador-evaluador está en progreso
-        with Session(engine) as session:
-            stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
-            ticket = session.exec(stmt).first()
-            if ticket:
-                ticket.status = TicketStatus.EN_EVALUACION.value
-                session.add(ticket)
-            session.commit()
-
-        # Persistir resultados de Parte 2 en DepartmentSectionDB
-        with Session(engine) as session:
-            for dept_out in part2_handoff.departments:
-                stmt = select(DepartmentSectionDB).where(
-                    DepartmentSectionDB.ticket_id == ticket_id,
-                    DepartmentSectionDB.department_id == dept_out.department_id,
-                )
-                dept_db = session.exec(stmt).first()
-                if dept_db:
-                    dept_db.evaluation_results = (
-                        dept_out.evaluation.model_dump(mode="json", by_alias=True)
-                        if dept_out.evaluation else None
-                    )
-                    dept_db.generation_status = "completado"
-                    dept_db.generation_iteration = dept_out.iteration_count
-                    dept_db.draft_content = dept_out.finalized_draft
-                    dept_db.approval_status = dept_out.approval_status
-                    session.add(dept_db)
-            session.commit()
+        part2_handoff = await run_part2_pipeline(
+            handoff, max_iterations=3, engine=engine,
+        )
 
         # Actualizar ticket con resultados de Parte 2
+        # (La persistencia intermedia en DepartmentSectionDB y TicketDB
+        #  se realiza en tiempo real dentro de cycle.py)
         final_status = part2_handoff.overall_status  # "needs_human_review" or "analisis_completo"
         with Session(engine) as session:
             stmt = select(TicketDB).where(TicketDB.ticket_id == ticket_id)
