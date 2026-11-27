@@ -18,6 +18,29 @@
 - **Tests**: `tests/pipelines/test_chat_websocket.py` — 35 tests.
 - **Límite conocido**: Sesiones in-memory (se pierden al reiniciar el servidor).
 
+### NIST AI Security Framework Audit — Prácticas Seguras en IA (2026-11-27)
+- **Stack**: NIST AI RMF 1.0, NIST CSF 2.0, HIPAA, UK GDPR, FastAPI, LangGraph, OWASP methodology.
+- **Documento de auditoría**: `nist-security-practices.md` en raíz — reporte NIST AI RMF completo (6 funciones, inventario 7 IA, plan priorizado).
+- **Rate Limiting**: 3 mecanismos implementados:
+  - **Login** (POST /auth/login): 10 intentos por IP cada 60 segundos. In-memory via `_InMemoryRateLimiter`. Telemetría `auth_login_failed` en evento rate_limited.
+  - **Agent** (POST /agent/query): 30 queries por usuario (fallback a IP) cada 60 segundos. In-memory via singleton `_agent_rate_limiter`. HTTP 429 cuando se excede.
+  - **Password reset** (POST /auth/forgot-password): 5 solicitudes por email cada 60 minutos. TinyDB persistente. Existente previamente.
+  - **SSH** (puerto 2222): 6 conexiones/60s. iptables. Existente previamente.
+- **Arquitectura de rate limiter** (`services/api/rate_limiter.py`):
+  - `_InMemoryRateLimiter` — clase con `defaultdict(list)` de timestamps, limpieza perezosa, fail-open en error.
+  - `check_agent_rate_limit(user_id, ip)` — usa user_id si disponible, fallback a IP.
+  - `check_login_ip_rate_limit(ip)` — usa IP como key.
+  - `check_rate_limit(email)` — TinyDB persistente para password reset.
+  - `_get_table_or_log(table_name)` — helper fail-open para tablas TinyDB.
+  - Configurable via env vars: `LOGIN_RATE_LIMIT_MAX_ATTEMPTS` (default 10), `LOGIN_RATE_LIMIT_WINDOW_SECONDS` (60), `AGENT_RATE_LIMIT_MAX_REQUESTS` (30), `AGENT_RATE_LIMIT_WINDOW_SECONDS` (60).
+- **Prompt injection test cases**: 4 casos documentados en nist-security-practices.md §11:
+  - Jailbreak directo ("Ignora tus instrucciones...") — bloqueado por content guardrail
+  - Indirecto via RAG (instrucción oculta en documento) — aislado por `wrap_rag_context()`
+  - PHI en query (nombre, edad, diagnóstico, ubicación) — bloqueado por `check_phi_in_input()`
+  - Extracción gradual (turno 1: tiempo notificación, turno 2: clínica específica, turno 3: registros involucrados) — bloqueado por system prompt
+- **Inventario de sistemas de IA**: 7 componentes documentados con riesgo, responsable, BAA/DPA requerido.
+- **Plan de mejora priorizado**: 11 ítems mapeados a funciones NIST con matriz esfuerzo vs. impacto.
+
 ### OWASP Top 10 Security Audit & Server Hardening (2026-11-27)
 - **Stack**: iptables, fail2ban (rate limiting), OpenSSH, FastAPI, python-jose, Docker, OWASP methodology.
 - **Python 3.14**, gestionado con `uv` (pyproject.toml raíz, `.venv` raíz).

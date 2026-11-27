@@ -218,6 +218,29 @@ self._sessions[session_id] = session
 - updated_at sella exclusivamente los cambios de tarifa (auditorías de coste).
 - archived_at sella la baja del proveedor. No se mezclan semánticas en un mismo campo.
 
+### 13) Rate Limiting Pattern — In-Memory Sliding Window + TinyDB Persistente (NIST AI RMF Protect)
+
+**Ubicación**: `services/api/rate_limiter.py`, `services/api/routes/auth.py`, `services/agent/routes.py`
+
+**Propósito**: Prevenir abuso de endpoints sensibles (login, agent query, password reset) mediante tres rate limiters independientes. Cumple con NIST AI RMF PR.AI-2 (uso indebido), PR.AI-3 (integridad del operador humano), PR.AI-5 (control de acceso) y OWASP A04 (Insecure Design).
+
+**Arquitectura**:
+- `_InMemoryRateLimiter` — clase con `defaultdict(list)` de timestamps monotónicos. Método `check(key, max_requests, window_seconds)` → True si permite, False si bloquea. Limpieza perezosa en cada invocación. Sin persistencia (se pierde al reiniciar).
+- `_get_table_or_log(table_name)` — helper fail-open para TinyDB: retorna None si la DB falla, evitando que un error en TinyDB bloquee el login.
+- Tres singletons: `_agent_rate_limiter`, `_login_ip_limiter` (ambos in-memory), y TinyDB persistente (password reset).
+
+**Rate limiters activos**:
+
+| Endpoint | Key | Límite | Ventana | Backend | Telemetría |
+|---|---|---|---|---|---|
+| POST /auth/login | IP | 10 | 60s | In-memory | `auth_login_failed` reason=`ip_rate_limit` |
+| POST /agent/query | user_id → IP | 30 | 60s | In-memory | No |
+| POST /auth/forgot-password | email | 5 | 60min | TinyDB | No |
+
+**Patrón fail-open**: Si el rate limiter no puede operar (error de DB, excepción inesperada), permite el paso (`return True`) y registra el error en log. El sistema degrada su seguridad pero no se bloquea a sí mismo.
+
+**Configuración por entorno**: 4 variables de entorno con defaults sensatos: `LOGIN_RATE_LIMIT_MAX_ATTEMPTS=10`, `LOGIN_RATE_LIMIT_WINDOW_SECONDS=60`, `AGENT_RATE_LIMIT_MAX_REQUESTS=30`, `AGENT_RATE_LIMIT_WINDOW_SECONDS=60`.
+
 ### 9) Seeder idempotente
 - Comprueba existencia por nombre antes de insertar y reporta insertados/omitidos/total por consola.
 

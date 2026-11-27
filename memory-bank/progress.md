@@ -2,6 +2,35 @@
 
 ## Estado actual del desarrollo
 
+### NIST AI Security Framework Audit — Prácticas Seguras en IA (2026-11-27)
+
+**✅ COMPLETADO — Auditoría NIST AI RMF 1.0 + CSF 2.0, 6 funciones auditadas, inventario de 7 sistemas de IA, rate limiting implementado en login y agente**
+
+**Resumen**: Se realizó una auditoría completa basada en el NIST AI Risk Management Framework (AI RMF 1.0) y NIST Cybersecurity Framework (CSF 2.0) sobre todos los sistemas de IA de HealthCore. La auditoría cubre las 6 funciones NIST (Govern, Identify, Protect, Detect, Respond, Recover), el inventario completo de 7 sistemas de IA, el mapeo regulatorio HIPAA (EE. UU.) vs UK GDPR (Reino Unido), y 4 casos de prueba de prompt injection documentados.
+
+**Documentos generados:**
+| Documento | Contenido |
+|-----------|-----------|
+| `nist-security-practices.md` | ✅ NIST AI RMF completo — 6 funciones, inventario 7 IA, plan priorizado, prompt injection test cases, verificación PHI |
+
+**Correcciones nuevas implementadas:**
+| # | Corrección | Función NIST | Archivos |
+|---|-----------|-------------|----------|
+| 1 | Rate limiting en `POST /auth/login` (10 intentos/60s por IP) | Protect/Detect | `rate_limiter.py`, `routes/auth.py` |
+| 2 | Rate limiting en `POST /agent/query` (30 queries/min por usuario) | Protect/Detect | `rate_limiter.py`, `routes.py` |
+| 3 | Refactor `_get_table_or_log()` fail-open helper | Protect | `rate_limiter.py` |
+| 4 | `signal()` como import global en rate_limiter | Detect | `rate_limiter.py` |
+
+**Rate limiting implementado:**
+- **Login:** 10 intentos por IP cada 60 segundos, in-memory, con telemetría `auth_login_failed` cuando se excede
+- **Agent:** 30 queries por usuario (con fallback a IP) cada 60 segundos, in-memory
+- **Password reset:** 5 solicitudes por email cada 60 minutos (existente, vía TinyDB)
+- **SSH:** 6 conexiones/60s (existente, vía iptables)
+
+**Tests:** 477 pass, 0 fail, 7 skipped — sin regresiones tras cambios.
+
+---
+
 ### WebSocket Chat en Tiempo Real — Compliance Assistant (2026-11-27)
 
 **✅ COMPLETADO — Chat bidireccional en tiempo real con el agente LangGraph de Compliance, streaming token-by-token vía WebSocket**

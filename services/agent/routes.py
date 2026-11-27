@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from services.agent.graph import run_agent, get_trace, list_traces
+from services.api import rate_limiter
 from services.api.security import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -89,19 +90,30 @@ class TracesListResponse(BaseModel):
 @router.post("/query", response_model=QueryResponse)
 async def agent_query(
     req: QueryRequest,
+    request: Request,
     current_user: dict = Depends(get_current_user),
 ) -> QueryResponse:
     """Ejecuta el agente de soporte LangGraph para responder una pregunta.
 
     El flujo completo:
       1. Recibe y valida la pregunta.
-      2. Recupera contexto relevante de la base de conocimiento (Qdrant).
-      3. Genera una respuesta usando el contexto recuperado.
-      4. Persiste la traza completa de la corrida.
+      2. Rate limiting por usuario (30 queries/min).
+      3. Recupera contexto relevante de la base de conocimiento (Qdrant).
+      4. Genera una respuesta usando el contexto recuperado.
+      5. Persiste la traza completa de la corrida.
 
     El endpoint no contiene lógica de negocio — solo invoca el grafo.
     Si el grafo falla en cualquier nodo, responde con un mensaje de error claro.
     """
+    # Rate limiting por user_id (o IP como fallback)
+    user_id = current_user.get("id") if isinstance(current_user, dict) else getattr(current_user, "id", None)
+    ip_address = request.client.host if request.client else None
+    if not rate_limiter.check_agent_rate_limit(user_id=user_id, ip=ip_address):
+        raise HTTPException(
+            status_code=429,
+            detail="Demasiadas consultas al agente. Intenta de nuevo en un momento.",
+        )
+
     import uuid
     run_id = str(uuid.uuid4())
 
