@@ -2428,9 +2428,9 @@ data: { "ticket_id": "tkt_0508", "rfp_id": "rfp_0193", "client_name": "Westbrook
 
 No necesitas incluir el contenido completo del documento ni las secciones por departamento — solo lo suficiente para que quien mire el dashboard sepa qué llegó y decida si necesita su atención ahora.
 
-### 4. Caso Opcional, con Datos Reales de HealthCore
+### 4. Caso Adicional, con Datos Reales de HealthCore
 
-Si decides implementar el caso opcional, aquí tienes un punto de partida ya definido para tu empresa — no necesitas inventar el umbral:
+Si decides implementar el caso adicional, aquí tienes un punto de partida ya definido para tu empresa — no necesitas inventar el umbral:
 
 - **Alerta de umbral de negocio**: HealthCore ya tiene esta regla definida a nivel ejecutivo — si la tasa de inasistencia (no-show) de una ubicación supera el 25%, o si la tasa de rechazo de facturación sube por encima del 10% en cualquier ubicación, se notifica de inmediato a Sandra (CEO) y al jefe de departamento correspondiente. Puedes emitir un evento `kpi_threshold_alert` cuando tu pipeline de reporting detecte esta condición — el payload solo necesita el identificador de la ubicación, el KPI y el valor, nunca datos de un paciente individual.
 
