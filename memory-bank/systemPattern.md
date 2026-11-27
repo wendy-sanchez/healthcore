@@ -98,6 +98,79 @@ with Session(engine) as session:
 
 **3 capas** se orquestan en orden: `content_guard (input) → LLM (harness system prompt) → output_guard (response)`.
 
+### 12) WebSocket Chat Pattern — Pub/Sub + Asyncio + LangGraph Streaming (Parte 2 Tiempo Real)
+
+**Ubicación**: `services/agent/chat/{manager,models,pubsub}.py`, `services/api/routes/chat_ws.py`, `uis/backoffice/lib/wsClient.ts`
+
+**Propósito**: Chat bidireccional en tiempo real con streaming token-by-token del agente LangGraph de Compliance, interrupción y reconexión con historial completo.
+
+**Componentes**:
+
+- **Models** (`chat/models.py`): `ChatMessage(user_input, text, role, timestamp)`, `ChatSessionState(messages, status, session_id, created_at, updated_at)`, `EventPayload(event, data)` con `make_token_chunk()`, `make_generation_completed()`, `make_session_snapshot()`, `make_error()`.
+- **Pub/Sub** (`chat/pubsub.py`): `ChatSessionPubSub` — `subscribe()` devuelve `asyncio.Queue`, `unsubscribe()` remueve de `set()`, `publish(event_dict)` serializa a JSON y encola en todos los subscribers bajo `asyncio.Lock`.
+- **Manager** (`chat/manager.py`): `ChatSessionManager` (singleton `_instance`) — 4 dicts paralelos: `_sessions: dict[session_id→ChatSessionState]`, `_hubs: dict[session_id→ChatSessionPubSub]`, `_tasks: dict[session_id→asyncio.Task]`, `_cancel_events: dict[session_id→asyncio.Event]`.
+  - `_run_agent_stream(state, pub_sub, cancel_event)` — bucle principal: `build_initial_state(question, run_id=session_id)` → `agent_graph.astream_events(initial_state, config=config(session_id), version="v2")` → filtra `on_chain_end` (nodo `generate_answer`) y `on_chat_model_stream` → publica en pub_sub. Chequea `cancel_event.is_set()` por iteración. Fallback a `ainvoke()` si no hay tokens vía eventos.
+  - `get_or_create_session(session_id)` — si existe retorna, si no crea `ChatSessionState` + hub + task para generación.
+  - `handle_interrupt(session_id)` — setea cancel_event y cancela la task.
+  - `close_session(session_id)` — cancela task, cierra hub, limpia dicts.
+- **WebSocket endpoint** (`routes/chat_ws.py`): `@router.websocket("/ws/chat")` — JWT via `?token=`, session via `?session_id=`. `websocket.accept()` tras verificar token. Drain task consume websocket en paralelo a la escucha de eventos pub/sub. Loop recibe mensajes JSON y los reenvía al manager.
+
+**Patrón de streaming**:
+
+```python
+# Manager — _run_agent_stream
+config = {"configurable": {"thread_id": session_id}}
+async for event in agent_graph.astream_events(initial_state, config=config, version="v2"):
+    kind = event["event"]
+    if kind == "on_chain_end" and event["name"] == "generate_answer":
+        full_text = event["data"]["output"].get("messages", [{}])[0].get("content", "")
+    elif kind == "on_chat_model_stream":
+        chunk = event["data"]["chunk"].content
+        if chunk:
+            await pub_sub.publish(make_token_chunk(session_id, chunk))
+            aggregated_text.append(chunk)
+```
+
+**Patrón de interrupción**:
+
+```python
+# Manager
+async def handle_interrupt(session_id):
+    cancel_event = self._cancel_events.get(session_id)
+    cancel_event.set()           # señaliza al bucle de streaming
+    task = self._tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()             # fuerza CancelledError
+    # interrupt_message en estado preserva contenido parcial
+```
+
+**Patrón de reconexión**:
+
+```python
+# Manager — get_or_create_session
+session = self._sessions.get(session_id)
+if session:
+    session.status = "connected"
+    return session
+# Si no existe: crear nueva
+session = ChatSessionState(session_id=session_id)
+self._sessions[session_id] = session
+```
+
+**Contrato WebSocket**:
+- Frame de conexión: `?token=<JWT>&session_id=<uuid>` en query string
+- Servidor → Cliente: `{"event": "token_chunk", "data": {"text": "...", "session_id": "..."}}`
+- Cliente → Servidor: `{"event": "user_message", "data": {"text": "..."}}`
+- Cliente → Servidor: `{"event": "interrupt_requested", "data": {}}`
+- Servidor → Cliente: `{"event": "session_snapshot", "data": {"messages": [...], "status": "..."}}`
+
+**Frontend** (`wsClient.ts`):
+- `WSClient` con constructor `(token, sessionId, callbacks)`.
+- `connect()` crea `new WebSocket(url + "?token=..." + "&session_id=...")` con protocolo no-securo para desarrollo.
+- Reconexión exponencial: `1s * min(2**attempt, 30)`.
+- `onMessage` handler parsea JSON, invoca callback según event type.
+- `useWsChat` hook React: `connect()`, `disconnect()`, `sendMessage(text)`, `interrupt()`, expone `messages`, `status`, `isConnected`.
+
 ### 11) LangGraph Agent Pattern (Parte 2 — Tools externas) — Grafo de decisión con consultas a servicios reales
 
 **UbicaciÃ³n**: `services/agent/graph.py`, `services/agent/tools/`, `services/agent/routes.py`

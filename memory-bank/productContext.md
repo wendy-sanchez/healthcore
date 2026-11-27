@@ -147,6 +147,21 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Consistencia de datos**: los valores derivados (denial rates, no-show costs) se calculan una sola vez por render (useMemo) y no cambian durante la vida de la página, incluso si hay re-renders parciales.
 - **Frescura de datos en dashboards**: el resumen de incidencias y la lista de productos pueden tener hasta 30-60 segundos de desfase (caché). Esto es aceptable para dashboards operativos donde la inmediatez no es crítica.
 
+12. **WebSocket Chat en Tiempo Real — Compliance Assistant (Nov 2026)**
+- **Qué entrega**: Chat bidireccional en tiempo real con el agente LangGraph de Compliance, usando WebSocket para streaming token-by-token, interrupción de generación y reconexión con historial.
+- **Componentes**:
+  - `services/agent/chat/models.py` — `ChatMessage`, `ChatSessionState`, `EventPayload` y builders de eventos.
+  - `services/agent/chat/pubsub.py` — `ChatSessionPubSub`: `asyncio.Queue` por suscriptor, broadcast O(n) por sesión.
+  - `services/agent/chat/manager.py` — `ChatSessionManager` singleton: orquesta sesiones in-memory, streaming con `agent_graph.astream_events(version="v2")`, interrupción vía `asyncio.Task.cancel()`, thread_id = session_id para checkpoint LangGraph.
+  - `services/api/routes/chat_ws.py` — `@router.websocket("/ws/chat")` con JWT via `?token=`, ligadura a `session_id`, mensajería bidireccional JSON.
+  - `uis/backoffice/lib/wsClient.ts` — `WSClient` con backoff exponencial (1s→2s→...→30s). `useWsChat` React hook.
+  - `uis/backoffice/app/compliance/page.tsx` — UI de chat con token streaming en vivo, interrupt, badge de reconexión.
+- **Protocolo**: 7 eventos JSON `{"event": "...", "data": {...}}`. Cliente envía `user_message` e `interrupt_requested`. Servidor envía `token_chunk`, `generation_completed`, `generation_interrupted`, `session_snapshot`, `error`.
+- **Interrupción**: `asyncio.Event` señaliza cancelación → `CancelledError` → contenido parcial preservado con `status="interrupted"` → nuevo input → nuevo turno.
+- **Reconexión**: Mismo `session_id` → `get_or_create_session` retorna misma instancia → `session_snapshot` con historial completo.
+- **Tests**: 35 tests WebSocket (wire format, session state, pub/sub, manager, interrupt, reconnection, auth, user flow, singleton). Todos pasan.
+- **Auditoría**: 6/7 criteria cumplidos (el séptimo parcial por checkpointing LangGraph que depende de persistencia futura).
+
 13. **RFP Pipeline — Partes 1, 2 y 3: Clasificación, Generación de Borradores y Aprobación Humana (Nov 2026)**
 - **Pipeline completo de 9 nodos LangGraph** que procesa solicitudes RFP (Request for Proposal) desde PDF hasta documento final aprobado:
   - **Parte 1**: Conversión PDF→Markdown (con markitdown[pdf]), extracción de metadatos, clasificación, descomposición por departamento, workers por departamento y síntesis.

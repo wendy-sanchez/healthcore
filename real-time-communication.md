@@ -228,3 +228,244 @@ data: {"location_id":"clinic-001","location_name":"Central — Austin Main Clini
 - **SSEManager en memoria:** Si el servidor FastAPI se reinicia, todas las conexiones SSE se pierden (los clientes reconectan automáticamente). El buffer circular también se pierde. Para un sistema crítico, migrar a Redis Pub/Sub.
 - **Escalabilidad vertical:** El broadcast O(n) funciona para decenas de conexiones. Para cientos, considerar worker dedicado con Redis.
 - **Sin compresión:** El payload SSE es pequeño (~200 bytes), no se justifica compresión. Si creciera, habilitar gzip a nivel de reverse proxy.
+
+---
+
+## Streaming de Chat por WebSocket — Parte 2
+
+> **Proyecto:** Chat en tiempo real del Compliance Assistant (Claire Whitfield) — respuesta token a token vía WebSocket con interrupción de generación y recuperación de sesión.
+> **Fecha:** 2026-11-27
+> **Estado:** ✅ Implementado — 35 tests WebSocket, 16 tests SSE, 16 tests RFP, todos PASS
+
+### 1. Preguntas de Diseño (Respondidas)
+
+#### 1.1 ¿Por qué esta funcionalidad necesita WebSockets y no te alcanza con lo que construiste en la Parte 1?
+
+**SSE no es suficiente porque la comunicación es unidireccional — servidor → cliente.**
+
+La Parte 1 (SSE para notificaciones RFP) funciona porque:
+- El servidor publica eventos (`rfp_ticket_created`, `kpi_threshold_alert`) y el cliente solo los consume.
+- El cliente nunca necesita enviar datos al servidor por ese canal.
+
+El chat del Compliance Assistant, en cambio, exige **bidireccionalidad**:
+1. **El servidor envía tokens** conforme el LLM los genera (igual que SSE, pero no es el único flujo).
+2. **El cliente envía un mensaje de interrupción** (`interrupt_requested`) mientras el servidor aún está generando, para abortar la respuesta en curso y redirigir al agente.
+3. **El servidor confirma la interrupción** y arranca un nuevo turno — todo en la misma conexión persistente.
+
+Con SSE no podríamos enviar la interrupción del cliente en el mismo canal. Habría que hacerlo vía un `POST` HTTP aparte, lo que añade complejidad, latencia y la pregunta de qué pasa si el POST llega después de que el servidor terminó de generar.
+
+**WebSocket** resuelve esto de forma natural: ambos lados pueden enviar frames JSON en cualquier momento, sobre la misma conexión TCP, sin handshake HTTP adicional.
+
+#### 1.2 Si más de un cliente está suscrito a la misma sesión de chat (por ejemplo, un supervisor observando la conversación en vivo), ¿cómo te aseguras de que todos reciban los mismos eventos sin duplicar las llamadas al agente?
+
+**Arquitectura pub/sub con un Hub por sesión:**
+
+```
+                  ┌──────────────────────────────┐
+                  │   ChatSessionPubSub Hub      │
+                  │   (por sesión)               │
+                  │                              │
+                  │   canales:                   │
+                  │     chat.<session_id>        │
+                  │                              │
+                  │   suscriptores: [ws1, ws2]   │
+                  └──────┬───────────────────────┘
+                         │ broadcast(token_chunk)
+            ┌────────────┴────────────┐
+            ▼                         ▼
+        WebSocket 1              WebSocket 2
+        (operador staff)          (supervisor compliance)
+```
+
+El `ChatSessionManager` mantiene un mapa de sesiones activas. Cada sesión tiene un `ChatSessionPubSub` con:
+- **Un canal `chat.<session_id>`** al que se suscriben todas las conexiones WebSocket.
+- **Un único producer** que ejecuta el agente LangGraph y publica eventos (tokens, completion, interruption) en el canal.
+- **Broadcast O(n)** a todos los suscriptores del canal.
+
+Esto asegura que:
+- El agente se ejecuta **una sola vez**, sin importar cuántos clientes estén conectados.
+- Todos los clientes ven exactamente los mismos eventos de agente (tokens, interrupciones, completado).
+- Si un cliente se desconecta y reconecta, se re-suscribe al mismo canal y recibe todo desde ese momento.
+
+#### 1.3 ¿Cómo separaste el abort del stream (parar tokens) de LangGraph HITL interrupt() (pausa de grafo), si usaste lo segundo? ¿Qué pasa con el mensaje parcial del asistente y con el siguiente turno?
+
+No usé `interrupt()` de LangGraph HITL para el abort.
+
+La separación es:
+
+| Mecanismo | Propósito | Implementación |
+|-----------|-----------|----------------|
+| **Abort del stream** | Detener la generación de tokens en curso porque el usuario quiere redirigir | Se señaliza `asyncio.Event` de cancelación y se cancela la `asyncio.Task` que ejecuta `agent_graph.astream_events(version="v2")`. El generador asíncrono lanza `asyncio.CancelledError`, que se captura limpiamente. |
+| **LangGraph interrupt()** | Pausar el grafo en un punto determinado para esperar una entrada humana (ej. aprobación de un departamento en RFP Parte 3) | No se usa en este flujo de chat. Si en el futuro el Compliance Assistant necesitara una pausa de grafo (esperar una confirmación), se añadiría como nodo `interrupt()` independiente del stream de tokens. |
+
+**Flujo de abort:**
+
+1. Cliente envía `{"event": "interrupt_requested", "data": {"new_input": "..."}}`.
+2. Backend recibe el frame, **cancela la tarea** actual (`self._generation_task.cancel()`) y captura `asyncio.CancelledError`.
+3. El mensaje parcial del asistente se marca como `status: "interrupted"` y se persiste en el historial de la sesión — los tokens ya mostrados **no se pierden**.
+4. El backend envía `{"event": "generation_interrupted", "data": {"message_id": "...", "status": "interrupted"}}` al cliente.
+5. El nuevo input del usuario se encola como un nuevo mensaje en el historial (`role: "user"`).
+6. Se arranca **un nuevo turno** del asistente: se invoca de nuevo `agent_graph.astream_events(version="v2")` con el estado actualizado (que incluye el mensaje interrumpido como parte del historial y el nuevo input del usuario como pregunta).
+
+### 2. Arquitectura del Sistema
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     Frontend (Next.js)                           │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Compliance Chat (app/compliance/page.tsx)                  │ │
+│  │  ┌──────────────────┐  ┌──────────────────────────────┐     │ │
+│  │  │ Historial        │  │ WebSocket Client             │     │ │
+│  │  │ de mensajes      │  │ (wsClient.ts)                │     │ │
+│  │  │ con tokens       │  │ reconnect + backoff          │     │ │
+│  │  │ en vivo          │  │ interrupt + rehidratación    │     │ │
+│  │  └──────────────────┘  └──────────────────────────────┘     │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+                      │ WebSocket ws://host/ws/chat
+                      │ ?token=JWT&session_id=chat_xxx
+                      ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                  Backend (FastAPI + WebSocket)                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  WebSocket Handler (routes/chat_ws.py)                      │ │
+│  │  ┌──────────────┐ ┌────────────────┐ ┌──────────────────┐   │ │
+│  │  │ Auth (JWT    │ │ ChatSession    │ │ Streaming Agent  │   │ │
+│  │  │ query string)│ │ Manager        │ │ (pub/sub)        │   │ │
+│  │  │ + frame auth │ │ (session store)│ │                  │   │ │
+│  │  └──────────────┘ └────────────────┘ └──────────────────┘   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│              │                                                   │
+│              ▼                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  ChatSessionPubSub Hub (por sesión)                         │ │
+│  │  Canal: chat.<session_id>                                   │ │
+│  │  - 1 producer: tarea asyncio que ejecuta agent.astream      │ │
+│  │  - N consumers: WebSockets suscritos al canal               │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│              │                                                   │
+│              ▼                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Agente LangGraph (services/agent/graph.py)                 │ │
+│  │  astream_events(version="v2") → token_chunk                 │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Componentes Implementados
+
+#### 3.1 Modelo de Datos — ChatSession (`services/agent/chat/models.py`)
+
+```python
+class ChatMessage(BaseModel):
+    message_id: str          # msg_0162
+    role: str                # "user" | "assistant" | "system"
+    content: str             # Texto completo (para user) o parcial (para assistant)
+    status: str              # "streaming" | "completed" | "interrupted"
+    created_at: str          # ISO timestamp
+
+class ChatSessionState(BaseModel):
+    session_id: str          # chat_0076
+    agent_id: str            # "compliance_assistant"
+    user_id: str             # ID del staff (nunca paciente)
+    status: str              # "active" | "interrupted" | "closed"
+    messages: list[ChatMessage]
+    current_message_id: str | None  # ID del mensaje que se está generando
+    created_at: str
+    updated_at: str
+```
+
+#### 3.2 ChatSessionPubSub — Hub por sesión (`services/agent/chat/pubsub.py`)
+
+- `subscribe(websocket)`: registra un consumidor para recibir eventos broadcast.
+- `unsubscribe(websocket)`: elimina un consumidor.
+- `publish(event_type, data)`: envía el evento serializado a todos los suscriptores.
+- Canal identificado por `chat.<session_id>`.
+
+#### 3.3 ChatSessionManager — Gestor de sesiones (`services/agent/chat/manager.py`)
+
+- Singleton (mismo patrón que `SSEManager` de la Parte 1).
+- `get_or_create_session(session_id, user_id)`: crea o recupera una sesión.
+- `handle_user_message(session_id, text)`: añade el mensaje del usuario al historial y arranca una tarea asyncio que ejecuta el agente LangGraph en modo streaming (vía `astream_events(version="v2")`) y publica tokens en el pub/sub.
+- `handle_interrupt(session_id, new_input)`: cancela la tarea actual y arranca un nuevo turno.
+- `get_snapshot(session_id)`: devuelve el historial completo de mensajes (para rehidratación).
+
+#### 3.4 WebSocket Handler (`services/api/routes/chat_ws.py`)
+
+- `GET /ws/chat`: endpoint WebSocket.
+- **Handshake**: extrae `?token=` de query string, valida JWT con `jose.decode` y `JWT_SECRET_KEY`/`JWT_ALGORITHM`. Rechaza con código `WS_1008_POLICY_VIOLATION` antes de `accept()` si falta/es inválido.
+- **Ligadura a sesión**: query param `session_id` para ligar el socket a un hilo de conversación. El mismo valor se usa como `thread_id` de LangGraph para habilitar rehidratación del checkpoint al reconectar.
+- **Mensajes entrantes**:
+  - `user_message`: encola un nuevo mensaje de usuario y arranca generación.
+  - `interrupt_requested`: cancela generación actual, marca mensaje parcial como `interrupted`, arranca nuevo turno.
+- **Eventos salientes** (formato JSON, misma disciplina de nombres que el BRIEFING):
+  - `token_chunk`: un token del asistente.
+  - `generation_completed`: fin de generación exitosa.
+  - `generation_interrupted`: generación abortada por usuario.
+  - `session_snapshot`: historial completo para rehidratación.
+  - `error`: error del servidor.
+
+#### 3.5 Frontend — WebSocket Client (`uis/backoffice/lib/wsClient.ts`)
+
+- Clase `WSClient` con:
+  - `connect()`: establece conexión WebSocket. El `session_id` y `token` (opcional, lee de localStorage si se omite) se pasan en el constructor y se codifican en la URL `ws://host/ws/chat?token=...&session_id=...`.
+  - `sendUserMessage(text)`: envía `{"event": "user_message", "data": {"session_id": ..., "text": ...}}`.
+  - `sendInterrupt(new_input)`: envía `{"event": "interrupt_requested", "data": {"session_id": ..., "new_input": ...}}`.
+  - `disconnect()`: cierra la conexión.
+  - Callbacks: `onToken`, `onCompleted`, `onInterrupted`, `onSnapshot`, `onError`, `onStatusChange`.
+- **Reconexión**: backoff exponencial 1s→2s→...→30s. Al reconectar, envía el mismo `session_id` y recibe `session_snapshot` para rehidratar el historial antes de aceptar nuevos tokens.
+
+#### 3.6 Frontend — Compliance Chat UI (`uis/backoffice/app/compliance/page.tsx`)
+
+- Página protegida con AuthGuard.
+- Input de texto + botón de enviar.
+- Historial de mensajes con:
+  - Mensajes del usuario (alineados a la derecha).
+  - Mensajes del asistente (alineados a la izquierda) con tokens renderizados en vivo.
+  - Mensajes interrumpidos marcados con badge "⏹ Interrumpido" y contenido parcial visible.
+- Botón de interrupción: al enviar un nuevo mensaje mientras el agente está respondiendo, se dispara `interrupt_requested` automáticamente.
+- Conexión indicador verde/rojo (conectado/reconectando).
+
+### 4. Eventos WebSocket
+
+| Evento | Dirección | Descripción |
+|--------|-----------|-------------|
+| `user_message` | Cliente → Servidor | Nuevo mensaje del usuario. `data: {session_id, text}` |
+| `interrupt_requested` | Cliente → Servidor | Solicitud de interrupción. `data: {session_id, new_input}` |
+| `token_chunk` | Servidor → Cliente | Token del asistente. `data: {session_id, token, sequence, message_id}` |
+| `generation_completed` | Servidor → Cliente | Generación terminada. `data: {session_id, message_id}` |
+| `generation_interrupted` | Servidor → Cliente | Generación abortada. `data: {session_id, message_id, status: "interrupted"}` |
+| `session_snapshot` | Servidor → Cliente | Historial completo. `data: {session_id, messages: [...]}` |
+| `error` | Servidor → Cliente | Error. `data: {session_id, message}` |
+
+### 5. Estrategia de Reconexión y Recuperación
+
+| Evento | Mecanismo |
+|--------|-----------|
+| Conexión inicial | `ws://host/ws/chat?token=JWT&session_id=chat_xxx` |
+| Desconexión abrupta | Backoff exponencial 1s→2s→4s...→30s max, reconexión automática |
+| Rehidratación | Al reconectar, servidor envía `session_snapshot` con el historial completo. El `thread_id` de LangGraph es el mismo `session_id`, lo que permite reanudar checkpoints al reconectar |
+| Interrupción | Cliente envía `interrupt_requested`, servidor cancela tarea y arranca nuevo turno |
+| Error de red prolongado | Backoff continúa; al reconectar, rehidratación completa |
+
+### 6. Archivos Creados/Modificados
+
+| Archivo | Acción | Descripción |
+|---------|--------|-------------|
+| `services/agent/chat/__init__.py` | ✅ Creado | Init del paquete chat |
+| `services/agent/chat/models.py` | ✅ Creado | Modelos ChatMessage, ChatSessionState, payloads de eventos |
+| `services/agent/chat/pubsub.py` | ✅ Creado | ChatSessionPubSub — hub pub/sub por sesión |
+| `services/agent/chat/manager.py` | ✅ Creado | ChatSessionManager — singleton gestor de sesiones con streaming agent |
+| `services/api/routes/chat_ws.py` | ✅ Creado | Endpoint WebSocket `/ws/chat` con JWT auth y streaming |
+| `services/api/routes/__init__.py` | ✅ Modificado | Registro del router chat_ws |
+| `services/api/main.py` | ✅ Modificado | Montaje del WebSocket endpoint |
+| `uis/backoffice/lib/wsClient.ts` | ✅ Creado | Cliente WebSocket con backoff, interrupt, rehidratación |
+| `uis/backoffice/app/compliance/page.tsx` | ✅ Creado | Página de chat compliance con tokens en vivo |
+| `uis/backoffice/components/BackofficeHeader.tsx` | ✅ Modificado | Enlace a Compliance Chat |
+| `tests/pipelines/test_chat_websocket.py` | ✅ Creado | Tests de contrato WebSocket, interrupción, reconexión |
+
+### 7. Limitaciones Conocidas
+
+- **ChatSessionManager en memoria:** Si el servidor se reinicia, las sesiones activas se pierden. Para un sistema crítico, migrar a Redis.
+- **Escalabilidad:** El broadcast O(n) funciona para pocos suscriptores por sesión (supervisor + staff). Para decenas de observadores, considerar Redis Pub/Sub.
+- **Sin persistencia de historial:** El historial de mensajes vive en memoria dentro de `ChatSessionState`. Para producción, persistir en base de datos (PostgreSQL).

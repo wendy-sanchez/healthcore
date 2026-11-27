@@ -7,6 +7,17 @@
 - Configuración estricta en tsconfig.json (strict, noImplicitAny, noUnusedLocals, noUnusedParameters).
 - Script de validación: npm run typecheck.
 
+### WebSocket Chat en Tiempo Real — Compliance Assistant (2026-11-27)
+- **Backend WebSocket**: FastAPI `@router.websocket("/ws/chat")` en `services/api/routes/chat_ws.py`. JWT via query param `?token=` validado con `jose.decode` + `JWT_SECRET_KEY`/`JWT_ALGORITHM`.
+- **Streaming**: `agent_graph.astream_events(version="v2")` con filtros `on_chain_end` (nodo `generate_answer`) y `on_chat_model_stream`. Fallback a `ainvoke()`.
+- **Thread ID**: Se usa `session_id` como `thread_id` de LangGraph para permitir rehidratación del checkpoint al reconectar.
+- **ChatSessionManager**: Singleton en `services/agent/chat/manager.py` — orquesta sesiones in-memory con `asyncio.Task` para generación y `asyncio.Event` para cancelación.
+- **ChatSessionPubSub**: `services/agent/chat/pubsub.py` — `asyncio.Queue` por suscriptor, `asyncio.Lock` para broadcast O(n).
+- **Protocolo**: JSON con eventos nombrados (`token_chunk`, `generation_completed`, `generation_interrupted`, `session_snapshot`, `user_message`, `interrupt_requested`, `error`).
+- **Frontend**: `uis/backoffice/lib/wsClient.ts` — `WSClient` con backoff exponencial 1s→2s→...→30s. `useWsChat` React hook. Página en `uis/backoffice/app/compliance/page.tsx`.
+- **Tests**: `tests/pipelines/test_chat_websocket.py` — 35 tests.
+- **Límite conocido**: Sesiones in-memory (se pierden al reiniciar el servidor).
+
 ### Notificaciones SSE en Tiempo Real (2026-11-27)
 - **Backend**: SSE raw sobre FastAPI `StreamingResponse(text/event-stream)` — sin dependencias externas (no `sse-starlette`). Formato `event:`/`data:`/`id:` con `\n\n` delimitador.
 - **SSEManager**: `services/api/sse/manager.py` — Singleton con `asyncio.Queue` por suscriptor, buffer circular `deque(maxlen=50)`, `asyncio.Lock` para lista de suscriptores, keep-alive cada 30s con `asyncio.wait_for`. `subscribe()` acepta `request` opcional para `await request.is_disconnected()`.

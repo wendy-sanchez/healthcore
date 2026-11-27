@@ -32,6 +32,7 @@
 | 14 | **MCP Server — OAuth-Protected Tools** — Model Context Protocol server exposing Incidents (5 tools) and Inventory (5 tools) as MCP tools, protected with OAuth 2.1 Resource Server via mcpauth. Inventory write operations explicitly rejected (RETO 2). LangGraph agent integrated via langchain-mcp-adapters. 9/9 acceptance criteria. | FastMCP, mcpauth, langchain-mcp-adapters, Streamable HTTP | ✅ Complete |
 | 15 | **LangGraph Agent — Persistent Memory + Guardrails** — Agent learns from interaction without accumulating junk forever. TinyDB-backed memory (separate from RAG), dual PHI validation (8 HIPAA+UK GDPR patterns), explicit user approval required (never assumed), lexical intent classifier (no LLM), single pending proposal, full audit trail (8 event types), automatic consolidation (threshold 50 facts, TTL 90 days). **Plus**: 3-layer deterministic guardrails (regex, no LLM): system prompt hardening (5 rules), input classification (6 categories, ~100 patterns), output validation (PHI/instruction leak/format). RAG content isolation markers. Graph integration with 2 guardrail nodes + observability. 62 guardrail tests + 94 agent/graph tests = 286 total. 11/11 acceptance criteria. | TinyDB, LangGraph, regex, Python 3.14 | ✅ Complete |
 | 16 | **RFP Pipeline** — Complete multi-stage pipeline for ingesting RFPs, generating draft proposals per department, and managing human approval workflows. PDF ingestion (MarkItDown), readability metrics, two-stage classifier (regex + DeepSeek-v4 LLM), multi-agent orchestration (orchestrator→3 parallel workers→synthesizer), per-department draft generation with LLM evaluator cycles (readability, relevance, compliance), conflict detection (PHI, BAA/DPA, Capacity), deterministic arbitration, interrupt-based human approval with checkpointed SQLite persistence scoped per ticket, and final document synthesis. 9-node LangGraph pipeline. 21/21 E2E tests with real LLM. | FastAPI, Celery, LangGraph, SQLModel/PostgreSQL, DeepSeek-v4 | ✅ Complete |
+| 17 | **Real-Time Communication** — Unified notification & chat system: SSE (Server-Sent Events) for unidirectional RFP ticket alerts and KPI threshold broadcasts with auto-reconnect, exponential backoff, Last-Event-ID replay, and circular buffer recovery; WebSocket for bidirectional compliance assistant chat with token-by-token streaming, generation abort, session recovery, and multi-client pub/sub fan-out. Single codebase, two complementary protocols. 51 real-time tests (16 SSE + 35 WebSocket). | FastAPI, LangGraph 1.2, asyncio, Next.js | ✅ Complete |
 
 ---
 
@@ -40,15 +41,19 @@
 ```text
 uis/                        # User interfaces
 ├── website/                #   Public website (Next.js) + RAG Q&A page
-├── backoffice/             #   Admin panel (Next.js): suppliers, inventory, incidents, telemetry, reporting
+├── backoffice/             #   Admin panel (Next.js): suppliers, inventory, incidents, telemetry, reporting, RFP dashboard, compliance chat
+│   └── lib/                #     SSE client (sseClient.ts), WebSocket client (wsClient.ts)
 └── talent-pipeline-tracker/#   Candidate tracker (Next.js)
 
 services/                   # Backend services
 ├── api/                    #   Main FastAPI (port 8000) — auth, suppliers, inventory, agent endpoint
+│   ├── routes/chat_ws.py   #     WebSocket chat endpoint /ws/chat
+│   └── sse/                #     SSE manager (pub/sub, circular buffer, keep-alive)
 ├── incidents-api/          #   Incidents FastAPI (port 8010) — standalone
 ├── reporting/              #   Reporting FastAPI (port 8001) — monthly KPIs
 ├── telemetry/              #   Telemetry analysis + standalone auth server
 ├── agent/                  #   LangGraph agent — graph, tools, memory, guardrails
+│   └── chat/               #     Chat session manager, pub/sub hub, models
 ├── celery_app.py           #   Celery app — async task definitions
 ├── nightly/                #   Nightly export job — background process
 └── job_runner.py           #   State machine for job orchestration
@@ -58,6 +63,9 @@ mcps/                       # MCP Server (port 9100) — FastMCP + OAuth 2.1
 
 agentic_workflows_part3/    # Part 3: LangGraph pipeline — human approval, conflict detection,
                             #   arbitration, checkpointing, final document synthesis
+
+real-time-communication.md  # Real-time systems design doc — SSE notifications + WebSocket chat
+                            #   architecture, wire protocol, recovery strategies, invariants
 
 data/                       # Data layer
 ├── raw/                    #   Raw data (CSV)
@@ -141,6 +149,9 @@ uv run python -m pytest tests/pipelines/test_sales_forecast_split.py -v
 
 # MCP Server auth (10 tests)
 uv run pytest tests/test_mcp_server_auth.py -v
+
+# Real-Time tests — SSE notifications (16) + WebSocket chat (35)
+uv run python -m pytest tests/pipelines/test_sse_events.py tests/pipelines/test_chat_websocket.py -v
 
 # Nightly job (30 tests)
 .venv-nightly/bin/python -m pytest tests/nightly -q
@@ -240,6 +251,7 @@ Complete multi-stage pipeline for processing RFPs (Requests for Proposals) from 
 | [`mcp-server.md`](./mcp-server.md) | MCP Server — OAuth-protected tools, architecture, setup |
 | [`agent-memory-harness-guard.md`](./agent-memory-harness-guard.md) | LangGraph Agent Persistent Memory + Harness & Guardrails — architecture, system prompt hardening, 3-layer deterministic safety, flow diagrams |
 | [`agentic-workflows.md`](./agentic-workflows.md) | RFP Pipeline (Hito 9, Parts 1+2+3) — complete design from PDF ingestion through draft generation, human approval, and final document synthesis |
+| [`real-time-communication.md`](./real-time-communication.md) | Real-Time Communication System — SSE notifications (RFP tickets, KPI alerts) + WebSocket chat (Compliance Assistant): architecture, wire protocol, pub/sub, recovery strategies, design invariants |
 | [`memory-bank/`](./memory-bank/) | Development progress, active context, system patterns, tech decisions |
 
 ---

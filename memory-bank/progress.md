@@ -2,6 +2,81 @@
 
 ## Estado actual del desarrollo
 
+### WebSocket Chat en Tiempo Real — Compliance Assistant (2026-11-27)
+
+**✅ COMPLETADO — Chat bidireccional en tiempo real con el agente LangGraph de Compliance, streaming token-by-token vía WebSocket**
+
+**Arquitectura**: `ChatSessionManager` singleton con sesiones in-memory, `ChatSessionPubSub` por sesión (colas `asyncio.Queue` por suscriptor, broadcast O(n) bajo `asyncio.Lock`), streaming con `agent_graph.astream_events(version="v2")`.
+
+**Componentes backend**:
+- `services/agent/chat/models.py` — `ChatMessage`, `ChatSessionState`, `EventPayload`, builders `make_token_chunk()`, `make_generation_completed()`, `make_session_snapshot()`, `make_error()`.
+- `services/agent/chat/pubsub.py` — `ChatSessionPubSub` con `subscribe()`/`unsubscribe()`/`publish()`. Serialización JSON antes de encolar.
+- `services/agent/chat/manager.py` — `ChatSessionManager` singleton: 4 dicts paralelos (`_sessions`, `_hubs`, `_tasks`, `_cancel_events`). `get_or_create_session()`, `handle_user_message()`, `handle_interrupt()`, `close_session()`. `_run_agent_stream()` ejecuta `agent_graph.astream_events(initial_state, config=config(session_id), version="v2")` con `thread_id = session_id`, filtra `on_chain_end` (nodo `generate_answer`) y `on_chat_model_stream`. Fallback `ainvoke()`. Chequeo de `cancel_event.is_set()` por iteración.
+- `services/api/routes/chat_ws.py` — `@router.websocket("/ws/chat")` con JWT via `?token=` (validación con `jose.decode`, `JWT_SECRET_KEY`, `JWT_ALGORITHM`). Rechaza con `WS_1008_POLICY_VIOLATION` antes de `accept()`. Drain task para escuchar pub/sub en paralelo.
+- `services/api/routes/__init__.py` — registro del router chat_ws.
+- `services/api/main.py` — montaje del endpoint WebSocket.
+
+**Componentes frontend**:
+- `uis/backoffice/lib/wsClient.ts` — Clase `WSClient` con constructor `(token, sessionId, callbacks)`. `connect()` crea `WebSocket` con `?token=&session_id=` en URL. Reconexión con backoff exponencial (1s→2s→...→30s). `sendUserMessage()`, `sendInterrupt()`, `disconnect()`. Callbacks: `onToken`, `onCompleted`, `onInterrupted`, `onSnapshot`, `onError`, `onStatusChange`.
+- `uis/backoffice/lib/wsClient.ts` — `useWsChat` React hook: expone `messages`, `status`, `isConnected`, `sendMessage(text)`, `interrupt()`.
+- `uis/backoffice/app/compliance/page.tsx` — Página protegida con AuthGuard. Input + botón enviar. Historial de mensajes: usuario derecha, asistente izquierda con tokens renderizados en vivo. Interrupción automática al enviar nuevo mensaje mientras el agente responde. Badge "⏹ Interrumpido" con contenido parcial visible. Indicador verde/rojo de conexión.
+- `uis/backoffice/components/BackofficeHeader.tsx` — Enlace "Compliance Chat" añadido.
+
+**Protocolo WebSocket** (7 eventos nombrados, JSON bidireccional):
+| Evento | Dirección | Descripción |
+|--------|-----------|-------------|
+| `user_message` | Cliente → Servidor | Nuevo mensaje del usuario: `data: {session_id, text}` |
+| `interrupt_requested` | Cliente → Servidor | Solicitud de interrupción: `data: {session_id, new_input}` |
+| `token_chunk` | Servidor → Cliente | Token del asistente: `data: {session_id, token, sequence, message_id}` |
+| `generation_completed` | Servidor → Cliente | Generación terminada: `data: {session_id, message_id}` |
+| `generation_interrupted` | Servidor → Cliente | Generación abortada: `data: {session_id, message_id, status: "interrupted"}` |
+| `session_snapshot` | Servidor → Cliente | Historial completo para rehidratación: `data: {session_id, messages: [...]}` |
+| `error` | Servidor → Cliente | Error: `data: {session_id, message}` |
+
+**Estrategia de interrupción**: `asyncio.Event` señaliza cancelación → `asyncio.Task.cancel()` fuerza `CancelledError` → contenido parcial preservado con `status="interrupted"` → nuevo input → nuevo turno.
+
+**Reconexión y rehidratación**: Mismo `session_id` → `get_or_create_session()` retorna misma instancia → `session_snapshot` con historial completo. `thread_id = session_id` habilita rehidratación de checkpoint LangGraph al reconectar.
+
+**Tests**: `tests/pipelines/test_chat_websocket.py` — **35 tests** que cubren:
+- `TestWireFormat` (7): payloads de eventos y serialización
+- `TestChatSessionState` (7): creación, add_message, snapshot, orden
+- `TestChatSessionPubSub` (5): publish, múltiples suscriptores, unsubscribe, empty hub, subscriber count
+- `TestChatSessionManager` (4): create/get, subscribe/unsubscribe, snapshot, close
+- `TestInterrupt` (3): status change, partial content preservation, new turn
+- `TestReconnection` (2): session restore, snapshot with history
+- `TestWebSocketAuth` (3): empty token, invalid token, valid JWT
+- `TestUserMessageFlow` (2): add to history, interrupt with new input
+- `TestSingleton` (2): same instance, reset between tests
+
+**Auditoría**: ✅ **6/7 criterios de aceptación cumplidos** totalmente:
+1. ✅ Token streaming en vivo (`token_chunk` → renderizado token por token)
+2. ✅ JWT obligatorio en query param (rechazo con `WS_1008_POLICY_VIOLATION`)
+3. ⚠️ Session ID ligado a conversación (`thread_id = session_id` implementado, checkpointing depende de persistencia futura)
+4. ✅ Interrupción medible (cancelación + contenido parcial preservado)
+5. ✅ Reconexión con historial (mismo `session_id` + `session_snapshot`)
+6. ✅ Pub/sub desacoplado (`ChatSessionPubSub` + 7 eventos nombrados)
+7. ✅ Nombres vs CONTEXT.md (todos los campos coinciden)
+
+**Archivos creados/modificados**:
+| Archivo | Acción | Descripción |
+|---------|--------|-------------|
+| `services/agent/chat/__init__.py` | ✅ Creado | Init del paquete chat |
+| `services/agent/chat/models.py` | ✅ Creado | Modelos y builders de eventos |
+| `services/agent/chat/pubsub.py` | ✅ Creado | Hub pub/sub por sesión |
+| `services/agent/chat/manager.py` | ✅ Creado | Singleton gestor de sesiones + streaming agent |
+| `services/api/routes/chat_ws.py` | ✅ Creado | Endpoint WebSocket `/ws/chat` con JWT auth |
+| `services/api/routes/__init__.py` | ✅ Modificado | Registro del router chat_ws |
+| `services/api/main.py` | ✅ Modificado | Montaje del WebSocket endpoint |
+| `uis/backoffice/lib/wsClient.ts` | ✅ Creado | Cliente WebSocket con backoff, interrupt |
+| `uis/backoffice/app/compliance/page.tsx` | ✅ Creado | UI de chat compliance |
+| `uis/backoffice/components/BackofficeHeader.tsx` | ✅ Modificado | Enlace a Compliance Chat |
+| `tests/pipelines/test_chat_websocket.py` | ✅ Creado | 35 tests WebSocket |
+| `scripts/seed_test_user.py` | ✅ Creado | Crea test user para chat |
+
+**Limitaciones conocidas**: `ChatSessionManager` en memoria — las sesiones se pierden al reiniciar el servidor. Broadcast O(n) funciona para pocos suscriptores por sesión (supervisor + staff). Historial sin persistencia en base de datos.
+
+---
+
 ### Notificaciones SSE en Tiempo Real — RFP Dashboard (2026-11-27)
 
 **✅ COMPLETADO — Sistema de notificaciones en tiempo real para tickets RFP vía Server-Sent Events**

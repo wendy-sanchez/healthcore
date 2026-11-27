@@ -1,5 +1,57 @@
 # Active Context
 
+## WebSocket Chat en Tiempo Real — Compliance Assistant (2026-11-27)
+
+**Estado: ✅ IMPLEMENTADO — 35/35 tests WebSocket + 16/16 tests SSE + 16/16 tests RFP = 67 tests PASS (todos pasan)**
+
+### Componentes Implementados
+
+| Componente | Archivo | Descripción |
+|------------|---------|-------------|
+| **Modelos de Chat** | `services/agent/chat/models.py` | `ChatMessage`, `ChatSessionState`, `EventPayload` + builders `make_token_chunk`, `make_generation_completed`, etc. |
+| **Pub/Sub por sesión** | `services/agent/chat/pubsub.py` | `ChatSessionPubSub` — `asyncio.Queue` por suscriptor, `asyncio.Lock`, broadcast O(n) por sesión |
+| **ChatSessionManager** | `services/agent/chat/manager.py` | Singleton que orquesta sesiones, streaming con `agent_graph.astream_events(version="v2")`, interrupción vía `asyncio.Task.cancel()` |
+| **WebSocket Endpoint** | `services/api/routes/chat_ws.py` | `GET /ws/chat` con JWT via `?token=`, ligadura a `session_id`, mensajería bidireccional JSON |
+| **WebSocket Client** | `uis/backoffice/lib/wsClient.ts` | `WSClient` con backoff exponencial (1s→...→30s), `useWsChat` React hook |
+| **Compliance Chat UI** | `uis/backoffice/app/compliance/page.tsx` | Página con token streaming en vivo, interrupt automático, badge "⏹ Interrumpido", reconexión |
+| **Seed test user** | `scripts/seed_test_user.py` | Crea `test@healthcore.local` / `test1234` / admin |
+| **Tests** | `tests/pipelines/test_chat_websocket.py` | 35 tests: wire format (7), session state (7), pub/sub (5), manager (4), interrupt (3), reconnection (2), auth (3), user flow (2), singleton (2) |
+
+### Detalles Técnicos Clave
+
+- **Streaming**: `agent_graph.astream_events(version="v2")` con filtros `on_chain_end` (nodo `generate_answer`) y `on_chat_model_stream`. Fallback a `ainvoke()` si no se acumulan tokens vía eventos.
+- **Thread ID**: Se usa el `session_id` como `thread_id` de LangGraph, permitiendo rehidratación del checkpoint al reconectar (alineado con BRIEFING §3).
+- **Interrupción**: `asyncio.Event` señaliza cancelación → `asyncio.Task.cancel()` fuerza `CancelledError` → contenido parcial preservado con `status="interrupted"` → nuevo input → nuevo turno.
+- **Reconexión**: Mismo `session_id` → `get_or_create_session` retorna misma instancia → `session_snapshot` con historial completo.
+- **Pub/Sub**: `ChatSessionPubSub` por sesión con colas independientes por WebSocket. 7 eventos nombrados: `token_chunk`, `generation_completed`, `generation_interrupted`, `session_snapshot`, `user_message`, `interrupt_requested`, `error`.
+- **Protocolo**: Todos los mensajes son JSON `{"event": "...", "data": {...}}`. Cliente envía `user_message` e `interrupt_requested`. Servidor envía `token_chunk`, `generation_completed`, `generation_interrupted`, `session_snapshot`, `error`.
+- **Límite conocido**: `ChatSessionManager` es in-memory — las sesiones se pierden al reiniciar el servidor.
+
+### Tests
+
+- `TestWireFormat` (7): payloads de eventos y serialización
+- `TestChatSessionState` (7): creación, add_message, snapshot, orden
+- `TestChatSessionPubSub` (5): publish, múltiples suscriptores, unsubscribe, empty hub, subscriber count
+- `TestChatSessionManager` (4): create/get, subscribe/unsubscribe, snapshot, close
+- `TestInterrupt` (3): status change, partial content preservation, new turn
+- `TestReconnection` (2): session restore, snapshot with history
+- `TestWebSocketAuth` (3): empty token, invalid token, valid JWT
+- `TestUserMessageFlow` (2): add to history, interrupt with new input
+- `TestSingleton` (2): same instance, reset between tests
+
+### Auditoría
+
+✅ **6/7 criterios de aceptación cumplidos totalmente**:
+1. ✅ Token streaming en vivo (token_chunk → renderizado token por token)
+2. ✅ JWT obligatorio en query param (rechazo con WS_1008_POLICY_VIOLATION)
+3. ⚠️ Session ID ligado a conversación (thread_id = session_id implementado, checkpointing LangGraph depende de persistencia futura)
+4. ✅ Interrupción medible (cancelación + partial content preservado)
+5. ✅ Reconexión con historial (mismo session_id + session_snapshot)
+6. ✅ Pub/sub desacoplado (ChatSessionPubSub + eventos nombrados)
+7. ✅ Nombres vs CONTEXT.md (todos los campos coinciden)
+
+---
+
 ## Notificaciones SSE en Tiempo Real — RFP Dashboard (2026-11-27)
 
 **Estado: ✅ IMPLEMENTADO — 16/16 tests SSE + 35/35 tests RFP = 51 tests PASS (todos pasan)**

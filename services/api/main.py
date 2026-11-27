@@ -23,6 +23,7 @@ from routes.rag import router as rag_router
 from routes.suppliers import router as suppliers_router
 from routes.tasks import router as tasks_router
 from routes.telemetry import router as telemetry_router
+from routes.chat_ws import router as chat_ws_router
 from routes.rfp import router as rfp_router
 from routes.users import router as users_router
 from services.agent.routes import router as agent_router
@@ -108,6 +109,7 @@ app.include_router(knowledge_router)
 app.include_router(rag_router)
 app.include_router(agent_router)
 app.include_router(rfp_router)
+app.include_router(chat_ws_router)
 app.include_router(telemetry_router)
 
 
