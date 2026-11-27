@@ -48,6 +48,61 @@
 - `TestUserMessageFlow` (2): add to history, interrupt with new input
 - `TestSingleton` (2): same instance, reset between tests
 
+### OWASP Top 10 Security Audit & Server Hardening (2026-11-27)
+
+**✅ COMPLETADO — Auditoría completa de seguridad OWASP Top 10 con endurecimiento del servidor y corrección de vulnerabilidades críticas.**
+
+**Documentos generados:**
+- `secure-ai-applications.md` — Reporte OWASP Top 10 completo con 10 categorías evaluadas × 3 lanes (backend, frontend, agente)
+- `docs/security/server-hardening.md` — Documento de endurecimiento del servidor con evidencia reproducible
+- `tests/security/test_cors.py` — Tests de CORS restringido (A05)
+- `tests/security/test_agent_auth.py` — Tests de auth en endpoints del agente (A01)
+- `tests/security/test_env_permissions.py` — Tests de permisos de archivos (A02)
+- `tests/security/test_redis_not_exposed.py` — Tests de Redis no expuesto (A05)
+- `tests/security/test_jwt_no_fallback.py` — Tests de JWT sin fallback hardcodeado (A02)
+
+**Vulnerabilidades críticas identificadas y corregidas (4):**
+
+| OWASP | Vulnerabilidad | Corrección | Evidencia |
+|-------|---------------|------------|-----------|
+| A01/A07 | Agent endpoints sin autenticación (3 endpoints) | `Depends(get_current_user)` en `services/agent/routes.py` | 468 tests pass |
+| A02 | JWT secret hardcodeado en `chat_ws.py` | Eliminado fallback `"dev-secret-key-change-in-production"` | 468 tests pass |
+| A02 | `.env` world-readable (666) | `chmod 600 .env` | `stat -c '%a' .env` → 600 |
+| A05 | CORS `allow_origins=["*"]` | Whitelist de 4 orígenes | 468 tests pass |
+| A05 | Redis expuesto en `0.0.0.0:6379` | Sin puertos en docker-compose + `docker stop` | `ss -tlnp \| grep 6379` → vacío |
+
+**Endurecimiento del servidor (6 medidas):**
+
+| Medida | Estado | Verificación |
+|--------|--------|-------------|
+| `PermitRootLogin no` | ✅ Aplicado | `grep PermitRootLogin /etc/ssh/sshd_config` → `no` |
+| Usuario `healthcore-ops` (uid=999) | ✅ Creado | `id healthcore-ops` |
+| Firewall iptables (solo SSH:2222 desde internet) | ✅ Activo | `sudo iptables -L INPUT -n` |
+| SSH rate limiting (6 conexiones/60s) | ✅ Activo | Reglas iptables 13-14 |
+| Project root permisos 750 | ✅ Aplicado | `stat -c '%a' .` → 750 |
+| Reglas firewall persistentes | ✅ Guardadas | `/etc/iptables.rules` |
+
+**Tests:** 477 tests pasan, 0 fallan, 7 skipped (9 nuevos tests de seguridad incluidos).
+
+**Archivos creados/modificados:**
+| Archivo | Acción | Descripción |
+|---------|--------|-------------|
+| `secure-ai-applications.md` | ✅ Creado | Reporte OWASP Top 10 + correcciones (724 líneas) |
+| `docs/security/server-hardening.md` | ✅ Creado | Documento de endurecimiento del servidor |
+| `docs/security/__init__.py` | ✅ Creado | Init del paquete security |
+| `tests/security/__init__.py` | ✅ Creado | Init del paquete tests/security |
+| `tests/security/test_cors.py` | ✅ Creado | Tests de CORS (A05) |
+| `tests/security/test_agent_auth.py` | ✅ Creado | Tests de auth en agente (A01) |
+| `tests/security/test_env_permissions.py` | ✅ Creado | Tests de permisos (A02) |
+| `tests/security/test_redis_not_exposed.py` | ✅ Creado | Tests de Redis (A05) |
+| `tests/security/test_jwt_no_fallback.py` | ✅ Creado | Tests de JWT (A02) |
+| `services/api/main.py` | ✅ Modificado | CORS whitelist + docs env-gated |
+| `services/api/routes/chat_ws.py` | ✅ Modificado | JWT sin fallback hardcodeado |
+| `services/agent/routes.py` | ✅ Modificado | Auth JWT en 3 endpoints |
+| `docker-compose.yml` | ✅ Modificado | Redis sin puertos expuestos |
+
+---
+
 **Auditoría**: ✅ **6/7 criterios de aceptación cumplidos** totalmente:
 1. ✅ Token streaming en vivo (`token_chunk` → renderizado token por token)
 2. ✅ JWT obligatorio en query param (rechazo con `WS_1008_POLICY_VIOLATION`)

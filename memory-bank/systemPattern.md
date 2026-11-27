@@ -270,6 +270,33 @@ self._sessions[session_id] = session
 - `jest.config.ts` apunta al `tsconfig.test.json` para que Jest tenga los tipos correctos.
 - Esto evita contaminar el ámbito de producción con tipos de test (@types/jest).
 
+### 21) OWASP Top 10 Security Patterns — Audit, Hardening & Verification
+
+**Ubicación**: `secure-ai-applications.md` (reporte raíz), `docs/security/` (documentación), `tests/security/` (tests), `services/api/main.py` (CORS), `services/api/routes/chat_ws.py` (JWT), `services/agent/routes.py` (auth), `docker-compose.yml` (Redis)
+
+**Propósito**: Garantizar que el sistema cumple con OWASP Top 10 en sus 3 lanes (backend, frontend, sistema agéntico), con correcciones verificables y reproducible hardening del servidor.
+
+**Patrones de seguridad implementados**:
+
+1. **CORS Whitelist (A05)**: Lista explícita de 4 orígenes permitidos en vez de `allow_origins=["*"]`. Frontends separados de la API.
+2. **JWT sin fallback (A02)**: `os.getenv("JWT_SECRET_KEY")` sin valor por defecto. Si la variable no está definida, el endpoint retorna None y falla en producción.
+3. **Auth obligatoria en endpoints agentes (A01/A07)**: Los 3 endpoints del agente LangGraph usan `Depends(get_current_user)` del mismo módulo de seguridad que el resto de la API.
+4. **OpenAPI docs condicionales (A05)**: `/docs` y `/redoc` se exponen solo si `ENABLE_DOCS=true`.
+5. **Redis no expuesto (A05)**: `ports: !reset []` en docker-compose + `--bind redis` — Redis solo accesible por nombre de contenedor en la red interna.
+6. **PHI validation dual (A04)**: 8 patrones HIPAA + UK GDPR en guardrails de salida del agente, sin LLM en hot path.
+7. **Firewall iptables (A08)**: INPUT chain: solo SSH (2222) desde internet, redes Docker + localhost permitidos a puertos 8000/8010, DROP default. SSH rate limiting 6 conexiones/60s.
+8. **Permisos restrictivos**: `.env` en 600, project root en 750, sin world-writable.
+9. **SSH hardening**: `PermitRootLogin no`, usuario dedicado `healthcore-ops` (uid=999).
+
+**Tests de seguridad**: 9 tests en 5 archivos bajo `tests/security/`, todos verificables sin servidor en vivo:
+- `test_cors.py` — Verifica que CORS middleware tiene whitelist (A05, server required)
+- `test_agent_auth.py` — Verifica que endpoints del agente requieren auth (A01, server required)
+- `test_env_permissions.py` — Verifica permisos 600 en `.env` (A02, filesystem)
+- `test_redis_not_exposed.py` — Verifica que Redis no escucha en host (A05, filesystem + iptables)
+- `test_jwt_no_fallback.py` — Verifica ausencia de secret hardcodeado (A02, code audit)
+
+---
+
 ### 20) Schemas de serialización: entrada y salida separados (backend)
 - **Modelos Pydantic de entrada** (`*Create`, `*Update`, `*Replace`): definen exactamente lo que el cliente debe enviar, sin campos generados por el sistema.
 - **Modelos de salida para listado** (`*ListItem`, `*Public`): más ligeros que los de detalle, excluyen campos pesados o claves foráneas internas.

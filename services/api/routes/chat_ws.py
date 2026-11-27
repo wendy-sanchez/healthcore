@@ -34,14 +34,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 
-def _get_jwt_secret() -> str:
-    """Retorna la clave secreta JWT desde las variables de entorno."""
+def _get_jwt_secret() -> str | None:
+    """Retorna la clave secreta JWT desde las variables de entorno.
+
+    Si JWT_SECRET_KEY no está definida, retorna None y la verificación
+    del token fallará (rechazando la conexión).  No usar fallback
+    hardcodeado — en producción esto debe estar siempre configurado.
+    """
     import os
-    secret = os.getenv("JWT_SECRET_KEY")
-    if not secret:
-        # Fallback para desarrollo — no usar en producción
-        secret = "dev-secret-key-change-in-production"
-    return secret
+    return os.getenv("JWT_SECRET_KEY")
 
 
 def _get_jwt_algorithm() -> str:

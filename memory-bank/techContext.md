@@ -18,6 +18,27 @@
 - **Tests**: `tests/pipelines/test_chat_websocket.py` — 35 tests.
 - **Límite conocido**: Sesiones in-memory (se pierden al reiniciar el servidor).
 
+### OWASP Top 10 Security Audit & Server Hardening (2026-11-27)
+- **Stack**: iptables, fail2ban (rate limiting), OpenSSH, FastAPI, python-jose, Docker, OWASP methodology.
+- **Python 3.14**, gestionado con `uv` (pyproject.toml raíz, `.venv` raíz).
+- **Herramientas de seguridad**: `python-jose` (JWT decode/encode), `passlib` + `bcrypt` (password hashing), `iptables` (firewall), `openssh-server` (SSH hardening).
+- **Dependencias de tests**: `pytest>=9.2.0` (existente), sin nuevas dependencias requeridas — los tests de seguridad usan `subprocess`, `os.stat`, `glob`, y `socket`.
+- **Comando de tests de seguridad**: `uv run python -m pytest tests/security/ -v` (9 tests).
+- **Comando de suite completa**: `uv run python -m pytest . -v --tb=short 2>&1 | tail -20` (477 tests).
+- **Documento de auditoría**: `secure-ai-applications.md` en raíz (724 líneas) — reporte OWASP Top 10 completo.
+- **Documento de hardening**: `docs/security/server-hardening.md` (150+ líneas) — guía de endurecimiento reproducible.
+- **Tests de seguridad**: 5 archivos en `tests/security/`:
+  - `test_cors.py` — Verifica CORS whitelist en código fuente (A05)
+  - `test_agent_auth.py` — Verifica `Depends(get_current_user)` en endpoints del agente (A01/A07)
+  - `test_env_permissions.py` — Verifica permisos 600 en `.env` (A02, filesystem)
+  - `test_redis_not_exposed.py` — Verifica Redis sin puertos expuestos (A05)
+  - `test_jwt_no_fallback.py` — Verifica ausencia de secret hardcodeado (A02, code audit)
+- **Firewall iptables**: INPUT chain con política DROP por defecto. SSH (2222) permitido desde internet con rate limiting (6 conexiones/60s). Docker (172.17.0.0/16, 172.18.0.0/16) y localhost permitidos a puertos 8000/8010. Reglas persistentes en `/etc/iptables.rules`.
+- **SSH hardening**: `PermitRootLogin no` en `/etc/ssh/sshd_config`. Puerto 2222 (no 22). Usuario dedicado `healthcore-ops` (uid=999).
+- **Arquitectura de seguridad**: 3 capas deterministas — (1) firewall iptables (red), (2) JWT auth con whitelist CORS (aplicación), (3) guardrails de contenido en agente (aplicación).
+- **Vulnerabilidades corregidas**: agent endpoints sin auth (A01/A07), JWT hardcodeado (A02), `.env` world-readable (A02), CORS `*` (A05), Redis expuesto (A05), certs en `.gitignore` (A05), project root 777 (A02).
+- **Variables de entorno clave**: `JWT_SECRET_KEY` (requerida, sin default), `ENABLE_DOCS` (opcional, controla /docs y /redoc).
+
 ### Notificaciones SSE en Tiempo Real (2026-11-27)
 - **Backend**: SSE raw sobre FastAPI `StreamingResponse(text/event-stream)` — sin dependencias externas (no `sse-starlette`). Formato `event:`/`data:`/`id:` con `\n\n` delimitador.
 - **SSEManager**: `services/api/sse/manager.py` — Singleton con `asyncio.Queue` por suscriptor, buffer circular `deque(maxlen=50)`, `asyncio.Lock` para lista de suscriptores, keep-alive cada 30s con `asyncio.wait_for`. `subscribe()` acepta `request` opcional para `await request.is_disconnected()`.

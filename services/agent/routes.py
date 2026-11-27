@@ -2,9 +2,14 @@
 routes/agent.py — FastAPI router para el agente LangGraph de soporte.
 
 Endpoints:
-  POST /agent/query  — Ejecuta el grafo del agente y devuelve la respuesta.
+  POST /agent/query     — Ejecuta el grafo del agente y devuelve la respuesta.
   GET  /agent/trace/{run_id}  — Recupera la traza de una corrida específica.
-  GET  /agent/traces  — Lista las trazas recientes.
+  GET  /agent/traces    — Lista las trazas recientes.
+
+Seguridad:
+  - Todos los endpoints requieren autenticación JWT vía el mismo esquema
+    que el backoffice (Bearer token).
+  - No se permite PHI en ninguna entrada o salida del agente.
 
 El endpoint NO contiene lógica de negocio — solo invoca el grafo compilado.
 """
@@ -13,10 +18,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from services.agent.graph import run_agent, get_trace, list_traces
+from services.api.security import get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +87,10 @@ class TracesListResponse(BaseModel):
 
 
 @router.post("/query", response_model=QueryResponse)
-async def agent_query(req: QueryRequest) -> QueryResponse:
+async def agent_query(
+    req: QueryRequest,
+    current_user: dict = Depends(get_current_user),
+) -> QueryResponse:
     """Ejecuta el agente de soporte LangGraph para responder una pregunta.
 
     El flujo completo:
@@ -126,7 +135,10 @@ async def agent_query(req: QueryRequest) -> QueryResponse:
 
 
 @router.get("/trace/{run_id}", response_model=TraceResponse)
-def get_agent_trace(run_id: str) -> TraceResponse:
+def get_agent_trace(
+    run_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> TraceResponse:
     """Recupera la traza completa de una corrida del agente.
 
     La traza incluye:
@@ -158,7 +170,10 @@ def get_agent_trace(run_id: str) -> TraceResponse:
 
 
 @router.get("/traces", response_model=TracesListResponse)
-def list_agent_traces(limit: int = 20) -> TracesListResponse:
+def list_agent_traces(
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user),
+) -> TracesListResponse:
     """Lista las trazas más recientes del agente (sin eventos completos).
 
     Args:

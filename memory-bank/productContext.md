@@ -173,6 +173,21 @@ El producto en este repositorio tiene las siguientes superficies:
 - **Tests**: 21 tests E2E que cubren Part 1, 2, 3, persistencia y edge cases. **21/21 ALL PASS** con LLM real.
 - **Bugs corregidos en producción**: migración de columnas PG (`final_document_path`, `part3_completed_at`, `generation_status`, `generation_iteration`), checkpoint scoped por ticket, markitdown[pdf] instalado.
 
+14. **OWASP Top 10 Security Audit & Server Hardening (Nov 2026)**
+- **Qué entrega**: Auditoría completa de seguridad OWASP Top 10 sobre los 3 lanes del sistema (backend FastAPI, frontend Next.js, sistema agéntico LangGraph), con corrección de vulnerabilidades críticas, endurecimiento del servidor, y tests automatizados de seguridad.
+- **Documentos generados**:
+  - `secure-ai-applications.md` — Reporte OWASP Top 10 con 10 categorías evaluadas × 3 lanes, hallazgos, 12 correcciones documentadas y evidencia reproducible.
+  - `docs/security/server-hardening.md` — Documento independiente de endurecimiento del servidor con comandos de verificación.
+  - `tests/security/` — 5 archivos de test (CORS, agent auth, env perms, Redis no expuesto, JWT sin fallback) — 9 tests.
+- **Vulnerabilidades críticas corregidas**:
+  - A01/A07: 3 endpoints del agente LangGraph sin autenticación → `Depends(get_current_user)` añadido.
+  - A02: JWT secret hardcodeado en `chat_ws.py` → eliminado fallback, solo `os.getenv("JWT_SECRET_KEY")`.
+  - A02: `.env` world-readable (permisos 666) → corregido a 600.
+  - A05: CORS `allow_origins=["*"]` → whitelist de 4 orígenes.
+  - A05: Redis expuesto en `0.0.0.0:6379` → puertos eliminados del docker-compose + contenedor detenido.
+- **Endurecimiento del servidor**: `PermitRootLogin no`, usuario `healthcore-ops` (uid=999), firewall iptables (solo SSH:2222 desde internet, DROP resto), SSH rate limiting (6 conexiones/60s), project root permisos 750, reglas firewall persistentes.
+- **Verificación**: 477 tests pass (0 fallos), 9 nuevos tests de seguridad incluidos. Evidencia reproducible para cada corrección.
+
 ## Usuarios clave
 - **Sistema de preguntas y respuestas** basado en Retrieval-Augmented Generation (RAG) que permite al equipo de HealthCore consultar en lenguaje natural las políticas documentadas de la clínica.
 - **Documentos fuente**: 4 archivos Markdown en `docs/company-knowledge-base/` (cobertura de seguros, política de citas, proceso de referencias internas, checklist de pacientes nuevos), todos en español.

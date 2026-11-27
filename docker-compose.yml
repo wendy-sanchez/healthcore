@@ -104,13 +104,23 @@ services:
   # ── Redis (Broker de mensajería para Celery) ────────────────────────
   # Actúa como broker y result backend. Política noeviction para no perder
   # mensajes de la cola aunque se alcance el límite de memoria.
+  #
+  # SEGURIDAD:
+  #   - NO se exponen puertos al host (binding solo a healthcore-net interna).
+  #     Redis solo es accesible desde los contenedores de la misma red Docker
+  #     (backend, incidents-backend, celery-worker, flower).
+  #   - Autenticación requerida vía REDIS_PASSWORD en producción.
+  #   - Requirepass se añade mediante --requirepass cuando se defina la variable.
   redis:
     image: redis:7-alpine
     container_name: healthcore-redis
     hostname: redis
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports: !reset []   # Sin exposición al host — solo accesible vía healthcore-net
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory-policy noeviction
+      --bind redis
     volumes:
       - redis-data:/data
     networks:
