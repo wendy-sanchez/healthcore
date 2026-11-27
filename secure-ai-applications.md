@@ -730,7 +730,7 @@ nc -zv healthcore-server 6379
 | 11 | A02 | Project root permisos 750 | `/workspaces/healthcore` | ✅ Aplicado | `stat -c '%a' .` → 750 |
 | 12 | A05 | Redis container restart | `docker stop healthcore-redis` | ✅ Aplicado | `ss -tlnp \| grep 6379` → vacío |
 
-### PR Evidence Checklist
+### Evidence Checklist
 
 - [x] **OWASP Top 10 report** → [`secure-ai-applications.md`](secure-ai-applications.md)
 - [x] **Server hardening notes** → [`docs/security/server-hardening.md`](docs/security/server-hardening.md)
@@ -738,9 +738,9 @@ nc -zv healthcore-server 6379
 - [x] **SSH root blocked** → `grep PermitRootLogin /etc/ssh/sshd_config` → `PermitRootLogin no`
 - [x] **2+ critical fixes with before/after evidence:**
   - CORS: `["*"]` → `["http://localhost:3000", ...]` (ver código en §4.1)
-  - JWT: `"dev-secret-key-change-in-production"` → `os.getenv("JWT_SECRET_KEY")` (ver código en §4.2)
-  - Redis: `0.0.0.0:6379` → `ports: !reset []` (ver §4.5, 4.10)
-- [x] **BRIEFING scope:** HealthCore — CONTEXT.md § "Prácticas Seguras en la Integración de IA en Sistemas" — 5 sistemas de IA auditados (§6)
+  - JWT: `"dev-secret-key-change-in-production"` → `os.getenv("JWT_SECRET_KEY")` (ver código en 4.2)
+  - Redis: `0.0.0.0:6379` → `ports: !reset []` (ver 4.5, 4.10)
+- [x] **BRIEFING scope:** HealthCore — CONTEXT.md "Prácticas Seguras en la Integración de IA en Sistemas" — 5 sistemas de IA auditados (6)
 - [x] **468 tests pass, 0 fail** — sin regresiones tras remediaciones
 
 ---
