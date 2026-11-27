@@ -1137,3 +1137,5 @@ uv run python scripts/test_full_parts_123_e2e.py
 - `test_edge_concurrent_tickets` — 2 tickets en paralelo sin interferencia de estado
 - `test_edge_invalid_handoff` — Handoff inválido → error graceful sin crash
 - `test_edge_empty_departments` — Lista vacía de departamentos → flujo termina sin error
+
+
